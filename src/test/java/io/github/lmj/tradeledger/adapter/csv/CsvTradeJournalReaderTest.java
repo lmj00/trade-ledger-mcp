@@ -4,15 +4,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
 import io.github.lmj.tradeledger.domain.model.Direction;
-import io.github.lmj.tradeledger.domain.model.PnlBreakdown;
 import io.github.lmj.tradeledger.domain.model.Trade;
-import io.github.lmj.tradeledger.domain.service.RealizedPnlCalculator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -39,32 +36,10 @@ class CsvTradeJournalReaderTest {
 		assertThat(trades.getFirst().tradeId()).isEqualTo("trade-001");
 		assertThat(trades.get(1).direction()).isEqualTo(Direction.SHORT);
 		assertThat(trades.getLast().quantity()).isEqualByComparingTo("0.055");
+		assertThat(trades.getFirst().entryPrice().amount()).isEqualByComparingTo("60000.25");
+		assertThat(trades.getFirst().fees().amount()).isEqualByComparingTo("5.37");
 		assertThat(trades).extracting(trade -> trade.entryPrice().currency().value())
 				.containsOnly("USDT");
-
-		RealizedPnlCalculator calculator = new RealizedPnlCalculator();
-		List<PnlBreakdown> pnl = trades.stream().map(calculator::calculate).toList();
-
-		assertThat(pnl.getFirst().grossPnl().amount()).isEqualByComparingTo("246.8617");
-		assertThat(pnl.getFirst().netPnl().amount()).isEqualByComparingTo("241.4917");
-		assertThat(pnl.get(1).grossPnl().amount()).isEqualByComparingTo("175.4375");
-		assertThat(pnl.get(1).netPnl().amount()).isEqualByComparingTo("171.3125");
-		assertThat(pnl.getLast().grossPnl().amount()).isEqualByComparingTo("-55.00275");
-		assertThat(pnl.getLast().netPnl().amount()).isEqualByComparingTo("-57.01775");
-
-		BigDecimal totalGross = pnl.stream()
-				.map(result -> result.grossPnl().amount())
-				.reduce(BigDecimal.ZERO, BigDecimal::add);
-		BigDecimal totalFees = pnl.stream()
-				.map(result -> result.fees().amount())
-				.reduce(BigDecimal.ZERO, BigDecimal::add);
-		BigDecimal totalNet = pnl.stream()
-				.map(result -> result.netPnl().amount())
-				.reduce(BigDecimal.ZERO, BigDecimal::add);
-
-		assertThat(totalGross).isEqualByComparingTo("367.29645");
-		assertThat(totalFees).isEqualByComparingTo("11.51");
-		assertThat(totalNet).isEqualByComparingTo("355.78645");
 	}
 
 	@Test

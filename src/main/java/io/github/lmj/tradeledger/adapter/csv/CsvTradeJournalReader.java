@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import io.github.lmj.tradeledger.application.port.out.TradeJournalReader;
 import io.github.lmj.tradeledger.domain.model.CurrencyCode;
 import io.github.lmj.tradeledger.domain.model.Trade;
 import org.apache.commons.csv.CSVFormat;
@@ -37,7 +38,7 @@ import org.apache.commons.csv.DuplicateHeaderMode;
 /**
  * Reads a bounded UTF-8 CSV journal from an allowlisted root directory.
  */
-public final class CsvTradeJournalReader {
+public final class CsvTradeJournalReader implements TradeJournalReader {
 
 	public static final long DEFAULT_MAX_FILE_SIZE_BYTES = 5L * 1024 * 1024;
 	public static final int DEFAULT_MAX_TRADES = 10_000;
@@ -78,6 +79,7 @@ public final class CsvTradeJournalReader {
 		this.mapper = new CsvTradeMapper();
 	}
 
+	@Override
 	public List<Trade> read(String journalName) {
 		validateJournalName(journalName);
 		Path journalFile = resolveJournalFile(journalName);
