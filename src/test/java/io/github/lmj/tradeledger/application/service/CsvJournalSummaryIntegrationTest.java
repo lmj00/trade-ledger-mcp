@@ -21,18 +21,20 @@ class CsvJournalSummaryIntegrationTest {
 				"journal test resources must exist").toURI());
 		SummarizeJournalService service = new SummarizeJournalService(
 				new CsvTradeJournalReader(journalRoot),
-				new RealizedPnlCalculator());
+				new AnalyzeTradesService(new RealizedPnlCalculator()));
 
 		JournalSummary result = service.summarize("sample-trades");
 
 		assertThat(result.journalName()).isEqualTo("sample-trades");
-		assertThat(result.tradeCount()).isEqualTo(3);
-		assertThat(result.winningTrades()).isEqualTo(2);
-		assertThat(result.losingTrades()).isEqualTo(1);
-		assertThat(result.breakEvenTrades()).isZero();
-		assertThat(result.totalGrossPnl().amount()).isEqualByComparingTo("367.29645");
-		assertThat(result.totalFees().amount()).isEqualByComparingTo("11.51");
-		assertThat(result.totalNetPnl().amount()).isEqualByComparingTo("355.78645");
-		assertThat(result.totalNetPnl().currency().value()).isEqualTo("USDT");
+		assertThat(result.analysis().tradeCount()).isEqualTo(3);
+		assertThat(result.analysis().winningTrades()).isEqualTo(2);
+		assertThat(result.analysis().losingTrades()).isEqualTo(1);
+		assertThat(result.analysis().breakEvenTrades()).isZero();
+		assertThat(result.analysis().totalGrossPnl().amount())
+				.isEqualByComparingTo("367.29645");
+		assertThat(result.analysis().totalFees().amount()).isEqualByComparingTo("11.51");
+		assertThat(result.analysis().totalNetPnl().amount())
+				.isEqualByComparingTo("355.78645");
+		assertThat(result.analysis().totalNetPnl().currency().value()).isEqualTo("USDT");
 	}
 }

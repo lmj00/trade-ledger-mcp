@@ -3,6 +3,7 @@ package io.github.lmj.tradeledger.mcp;
 import java.util.Objects;
 
 import io.github.lmj.tradeledger.application.model.JournalSummary;
+import io.github.lmj.tradeledger.application.model.TradeAnalysis;
 
 /**
  * MCP response for a journal summary, with decimal amounts encoded without precision loss.
@@ -20,15 +21,16 @@ public record JournalSummaryResponse(
 
 	public static JournalSummaryResponse from(JournalSummary summary) {
 		Objects.requireNonNull(summary, "journal summary must not be null");
+		TradeAnalysis analysis = summary.analysis();
 		return new JournalSummaryResponse(
 				summary.journalName(),
-				summary.tradeCount(),
-				summary.winningTrades(),
-				summary.losingTrades(),
-				summary.breakEvenTrades(),
-				summary.totalNetPnl().currency().value(),
-				summary.totalGrossPnl().amount().toPlainString(),
-				summary.totalFees().amount().toPlainString(),
-				summary.totalNetPnl().amount().toPlainString());
+				analysis.tradeCount(),
+				analysis.winningTrades(),
+				analysis.losingTrades(),
+				analysis.breakEvenTrades(),
+				analysis.totalNetPnl().currency().value(),
+				analysis.totalGrossPnl().amount().toPlainString(),
+				analysis.totalFees().amount().toPlainString(),
+				analysis.totalNetPnl().amount().toPlainString());
 	}
 }

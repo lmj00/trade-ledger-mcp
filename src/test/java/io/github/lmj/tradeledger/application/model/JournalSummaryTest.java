@@ -1,5 +1,6 @@
 package io.github.lmj.tradeledger.application.model;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
@@ -9,90 +10,37 @@ import org.junit.jupiter.api.Test;
 class JournalSummaryTest {
 
 	@Test
-	void createsConsistentSummary() {
-		new JournalSummary(
-				"sample-trades",
-				3,
-				2,
-				1,
-				0,
-				Money.of("350", "USDT"),
-				Money.of("11", "USDT"),
-				Money.of("339", "USDT"));
-	}
+	void trimsJournalNameAndKeepsAnalysis() {
+		TradeAnalysis analysis = analysis();
 
-	@Test
-	void rejectsCountsThatDoNotAddUpToTradeCount() {
-		assertThatIllegalArgumentException()
-				.isThrownBy(() -> new JournalSummary(
-						"sample-trades",
-						3,
-						1,
-						1,
-						0,
-						Money.of("10", "USDT"),
-						Money.of("1", "USDT"),
-						Money.of("9", "USDT")))
-				.withMessageContaining("add up");
-	}
+		JournalSummary summary = new JournalSummary(" sample-trades ", analysis);
 
-	@Test
-	void rejectsTotalsWithDifferentCurrencies() {
-		assertThatIllegalArgumentException()
-				.isThrownBy(() -> new JournalSummary(
-						"sample-trades",
-						1,
-						1,
-						0,
-						0,
-						Money.of("10", "USDT"),
-						Money.of("1", "USD"),
-						Money.of("9", "USDT")))
-				.withMessageContaining("same currency");
-	}
-
-	@Test
-	void rejectsIncorrectNetTotal() {
-		assertThatIllegalArgumentException()
-				.isThrownBy(() -> new JournalSummary(
-						"sample-trades",
-						1,
-						1,
-						0,
-						0,
-						Money.of("10", "USDT"),
-						Money.of("1", "USDT"),
-						Money.of("8", "USDT")))
-				.withMessageContaining("gross PnL minus total fees");
+		assertThat(summary.journalName()).isEqualTo("sample-trades");
+		assertThat(summary.analysis()).isSameAs(analysis);
 	}
 
 	@Test
 	void rejectsBlankJournalName() {
 		assertThatIllegalArgumentException()
-				.isThrownBy(() -> new JournalSummary(
-						" ",
-						0,
-						0,
-						0,
-						0,
-						Money.of("0", "USDT"),
-						Money.of("0", "USDT"),
-						Money.of("0", "USDT")))
+				.isThrownBy(() -> new JournalSummary(" ", analysis()))
 				.withMessageContaining("journal name");
 	}
 
 	@Test
-	void rejectsNullTotals() {
+	void rejectsNullAnalysis() {
 		assertThatNullPointerException()
-				.isThrownBy(() -> new JournalSummary(
-						"sample-trades",
-						0,
-						0,
-						0,
-						0,
-						null,
-						Money.of("0", "USDT"),
-						Money.of("0", "USDT")))
-				.withMessageContaining("gross");
+				.isThrownBy(() -> new JournalSummary("sample-trades", null))
+				.withMessageContaining("analysis");
+	}
+
+	private static TradeAnalysis analysis() {
+		return new TradeAnalysis(
+				1,
+				1,
+				0,
+				0,
+				Money.of("10", "USDT"),
+				Money.of("1", "USDT"),
+				Money.of("9", "USDT"));
 	}
 }

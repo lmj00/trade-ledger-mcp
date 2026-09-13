@@ -1,7 +1,6 @@
 package io.github.lmj.tradeledger.application.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
@@ -32,25 +31,27 @@ class SummarizeJournalServiceTest {
 			return trades;
 		};
 		SummarizeJournalService service =
-				new SummarizeJournalService(reader, new RealizedPnlCalculator());
+				new SummarizeJournalService(
+						reader,
+						new AnalyzeTradesService(new RealizedPnlCalculator()));
 
 		JournalSummary result = service.summarize("test-journal");
 
 		assertThat(result.journalName()).isEqualTo("test-journal");
-		assertThat(result.tradeCount()).isEqualTo(3);
-		assertThat(result.winningTrades()).isEqualTo(1);
-		assertThat(result.losingTrades()).isEqualTo(1);
-		assertThat(result.breakEvenTrades()).isEqualTo(1);
-		assertThat(result.totalGrossPnl().amount()).isEqualByComparingTo("4");
-		assertThat(result.totalFees().amount()).isEqualByComparingTo("10");
-		assertThat(result.totalNetPnl().amount()).isEqualByComparingTo("-6");
+		assertThat(result.analysis().tradeCount()).isEqualTo(3);
+		assertThat(result.analysis().winningTrades()).isEqualTo(1);
+		assertThat(result.analysis().losingTrades()).isEqualTo(1);
+		assertThat(result.analysis().breakEvenTrades()).isEqualTo(1);
+		assertThat(result.analysis().totalGrossPnl().amount()).isEqualByComparingTo("4");
+		assertThat(result.analysis().totalFees().amount()).isEqualByComparingTo("10");
+		assertThat(result.analysis().totalNetPnl().amount()).isEqualByComparingTo("-6");
 	}
 
 	@Test
 	void rejectsEmptyJournalReturnedByReader() {
 		SummarizeJournalService service = new SummarizeJournalService(
 				journalName -> List.of(),
-				new RealizedPnlCalculator());
+				new AnalyzeTradesService(new RealizedPnlCalculator()));
 
 		assertThatIllegalStateException()
 				.isThrownBy(() -> service.summarize("empty"))
@@ -61,25 +62,11 @@ class SummarizeJournalServiceTest {
 	void rejectsNullReturnedByReader() {
 		SummarizeJournalService service = new SummarizeJournalService(
 				journalName -> null,
-				new RealizedPnlCalculator());
+				new AnalyzeTradesService(new RealizedPnlCalculator()));
 
 		assertThatNullPointerException()
 				.isThrownBy(() -> service.summarize("broken"))
 				.withMessageContaining("must not return null");
-	}
-
-	@Test
-	void refusesToAddPnLFromDifferentCurrencies() {
-		List<Trade> trades = List.of(
-				trade("trade-1", Direction.LONG, "100", "120", "1", "1", "USD"),
-				trade("trade-2", Direction.LONG, "100", "120", "1", "1", "KRW"));
-		SummarizeJournalService service = new SummarizeJournalService(
-				journalName -> trades,
-				new RealizedPnlCalculator());
-
-		assertThatIllegalArgumentException()
-				.isThrownBy(() -> service.summarize("mixed"))
-				.withMessageContaining("currency mismatch");
 	}
 
 	private static Trade trade(

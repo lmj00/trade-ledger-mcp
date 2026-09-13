@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
 import io.github.lmj.tradeledger.application.model.JournalSummary;
+import io.github.lmj.tradeledger.application.model.TradeAnalysis;
 import io.github.lmj.tradeledger.domain.model.Money;
 import org.junit.jupiter.api.Test;
 
@@ -13,13 +14,14 @@ class JournalSummaryResponseTest {
 	void mapsSummaryAmountsToPlainDecimalStrings() {
 		JournalSummary summary = new JournalSummary(
 				"sample-trades",
-				1,
-				1,
-				0,
-				0,
-				Money.of("1000.00", "USDT"),
-				Money.of("0.1250", "USDT"),
-				Money.of("999.8750", "USDT"));
+				new TradeAnalysis(
+						1,
+						1,
+						0,
+						0,
+						Money.of("1000.00", "USDT"),
+						Money.of("0.1250", "USDT"),
+						Money.of("999.8750", "USDT")));
 
 		JournalSummaryResponse result = JournalSummaryResponse.from(summary);
 
