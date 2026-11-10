@@ -86,6 +86,27 @@ class CsvTradeJournalReaderTest {
 				null);
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"quantity", "entry_price", "exit_price", "fees"})
+	void rejectsLongDecimalBelowFileLimitWithoutExposingInput(String field) throws IOException {
+		String value = "+1." + "7".repeat(20_000);
+		String[] values = validRow("trade-002", "USDT").split(",");
+		values[CsvTradeSchema.HEADERS.indexOf(field)] = value;
+		writeJournal("long-decimal", HEADER + "\n" + validRow("trade-001", "USDT") + "\n"
+				+ String.join(",", values) + "\n");
+		assertThat(Files.size(journalRoot.resolve("long-decimal.csv")))
+				.isLessThan(CsvTradeJournalReader.DEFAULT_MAX_FILE_SIZE_BYTES);
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read("long-decimal"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_FIELD);
+					assertThat(exception.lineNumber()).hasValue(3);
+					assertThat(exception.field()).hasValue(field);
+					assertThat(exception).hasMessageContaining("128").hasMessageNotContaining(value);
+					assertThat(exception.getCause()).isNull();
+				});
+	}
+
 	@Test
 	void rejectsDuplicateHeaders() throws IOException {
 		writeJournal("duplicate-header", HEADER.replace("strategy", "symbol") + "\n"

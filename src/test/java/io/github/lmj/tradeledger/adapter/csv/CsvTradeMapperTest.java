@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 
@@ -15,12 +16,57 @@ import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class CsvTradeMapperTest {
 
 	private static final String HEADER = String.join(",", CsvTradeSchema.HEADERS);
 
 	private final CsvTradeMapper mapper = new CsvTradeMapper();
+
+	@ParameterizedTest
+	@ValueSource(strings = {"quantity", "entry_price", "exit_price", "fees"})
+	void maps128CharacterDecimalsExactlyAfterCsvTrimming(String field) throws IOException {
+		for (String value : List.of("1".repeat(128), "+" + "1".repeat(127),
+				"1." + "1".repeat(126), "+1." + "1".repeat(125))) {
+			assertThat(value).hasSize(128);
+			for (String csvValue : List.of(value, "  " + value + "  ", "\"  " + value + "  \"")) {
+				CSVRecord record = recordWithDecimal(field, csvValue);
+				assertThat(record.get(field)).isEqualTo(value);
+
+				Trade trade = mapper.map(record, 2);
+
+				BigDecimal actual = switch (field) {
+					case "quantity" -> trade.quantity();
+					case "entry_price" -> trade.entryPrice().amount();
+					case "exit_price" -> trade.exitPrice().amount();
+					case "fees" -> trade.fees().amount();
+					default -> throw new IllegalArgumentException("unexpected decimal field");
+				};
+				assertThat(actual).isEqualByComparingTo(new BigDecimal(value));
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"quantity", "entry_price", "exit_price", "fees"})
+	void rejects129CharacterDecimalsIncludingSignAndDecimalPoint(String field) throws IOException {
+		for (String value : List.of("1".repeat(129), "+" + "1".repeat(128),
+				"1." + "1".repeat(127), "+1." + "1".repeat(126), "-1." + "1".repeat(126))) {
+			assertThat(value).hasSize(129);
+			CSVRecord record = recordWithDecimal(field, value);
+
+			assertThatThrownBy(() -> mapper.map(record, 7))
+					.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+						assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_FIELD);
+						assertThat(exception.lineNumber()).hasValue(7);
+						assertThat(exception.field()).hasValue(field);
+						assertThat(exception).hasMessageContaining("128").hasMessageNotContaining(value);
+						assertThat(exception.getCause()).isNull();
+					});
+		}
+	}
 
 	@Test
 	void mapsCsvFieldsToTrade() throws IOException {
@@ -101,6 +147,13 @@ class CsvTradeMapperTest {
 					assertThat(exception.field()).hasValue("quantity");
 					assertThat(exception).hasMessageContaining("positive");
 				});
+	}
+
+	private static CSVRecord recordWithDecimal(String field, String value) throws IOException {
+		String[] values = ("trade-001,BTC-USDT,CRYPTO,LONG,0.1,60000,62000,5,USDT,"
+				+ "2026-07-01T01:00:00Z,2026-07-01T03:00:00Z,breakout").split(",");
+		values[CsvTradeSchema.HEADERS.indexOf(field)] = value;
+		return record(String.join(",", values));
 	}
 
 	private static CSVRecord record(String row) throws IOException {
