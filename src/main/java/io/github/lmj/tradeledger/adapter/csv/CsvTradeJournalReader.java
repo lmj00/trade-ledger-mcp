@@ -15,6 +15,8 @@ import static io.github.lmj.tradeledger.adapter.csv.CsvJournalErrorCode.TOO_MANY
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -85,7 +87,18 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 		Path journalFile = resolveJournalFile(journalName);
 		checkFileSize(journalFile, journalName);
 
-		try (BufferedReader reader = Files.newBufferedReader(journalFile, StandardCharsets.UTF_8);
+		try {
+			return read(Files.newInputStream(journalFile), journalName);
+		}
+		catch (IOException exception) {
+			throw readFailure(journalName, exception);
+		}
+	}
+
+	// Owns and closes the input, including when parsing fails.
+	List<Trade> read(InputStream input, String journalName) {
+		try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+				new SizeLimitedInputStream(input, maxFileSizeBytes), StandardCharsets.UTF_8.newDecoder()));
 				CSVParser parser = CSV_FORMAT.parse(reader)) {
 			validateHeaders(parser);
 			return readTrades(parser);
@@ -242,5 +255,49 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 				null,
 				"journal could not be read: " + journalName,
 				cause);
+	}
+
+	private static final class SizeLimitedInputStream extends InputStream {
+
+		private final InputStream input;
+		private long remaining;
+
+		private SizeLimitedInputStream(InputStream input, long limit) {
+			this.input = input;
+			this.remaining = limit;
+		}
+
+		@Override
+		public int read() throws IOException {
+			int value = input.read();
+			if (value != -1) {
+				if (remaining == 0) {
+					throw new CsvJournalException(FILE_TOO_LARGE, "journal exceeds the maximum file size");
+				}
+				remaining--;
+			}
+			return value;
+		}
+
+		@Override
+		public int read(byte[] bytes, int offset, int length) throws IOException {
+			Objects.checkFromIndexSize(offset, length, bytes.length);
+			if (length == 0) {
+				return 0;
+			}
+			if (remaining == 0) {
+				return read(); // Probe for EOF so an input exactly at the limit is accepted.
+			}
+			int count = input.read(bytes, offset, (int) Math.min(length, remaining));
+			if (count > 0) {
+				remaining -= count;
+			}
+			return count;
+		}
+
+		@Override
+		public void close() throws IOException {
+			input.close();
+		}
 	}
 }

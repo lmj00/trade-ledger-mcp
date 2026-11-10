@@ -3,7 +3,10 @@ package io.github.lmj.tradeledger.adapter.csv;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -173,6 +176,85 @@ class CsvTradeJournalReaderTest {
 	}
 
 	@ParameterizedTest
+	@ValueSource(strings = {"breakout", "돌파전략"})
+	void acceptsJournalExactlyAtByteLimit(String strategy) throws IOException {
+		String content = HEADER + "\n"
+				+ validRow("trade-001", "USDT").replace("breakout", strategy) + "\n";
+		byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+		writeJournal("exact-limit", content);
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, bytes.length, 10);
+		TrackingInputStream input = new TrackingInputStream(bytes);
+
+		assertThat(reader.read("exact-limit")).singleElement()
+				.extracting(Trade::strategy).isEqualTo(strategy);
+		assertThat(reader.read(input, "exact-limit")).singleElement()
+				.extracting(Trade::strategy).isEqualTo(strategy);
+		assertThat(input.closed).isTrue();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"breakout", "돌파전략"})
+	void rejectsStreamOneByteOverLimit(String strategy) {
+		String content = HEADER + "\n"
+				+ validRow("trade-001", "USDT").replace("breakout", strategy) + "\n";
+		byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+		TrackingInputStream input = new TrackingInputStream(bytes);
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, bytes.length - 1, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void stopsReadingLargeSingleRecordAtByteLimit() {
+		String content = HEADER + "\n" + validRow("trade-001", "USDT")
+				.replace("breakout", "가".repeat(20_000)) + "\n";
+		TrackingInputStream input = new TrackingInputStream(content.getBytes(StandardCharsets.UTF_8));
+		int limit = 10_000;
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, limit, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.bytesRead).isEqualTo(limit + 1);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamWhenLimitIsExceededWhileReadingHeader() {
+		TrackingInputStream input = new TrackingInputStream(HEADER.getBytes(StandardCharsets.UTF_8));
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, 10, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.bytesRead).isEqualTo(11);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamOnInvalidHeader() {
+		TrackingInputStream input = new TrackingInputStream("invalid\n".getBytes(StandardCharsets.UTF_8));
+
+		assertJournalError(() -> new CsvTradeJournalReader(journalRoot).read(input, "invalid"),
+				CsvJournalErrorCode.INVALID_HEADER, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamOnReadFailure() {
+		TrackingInputStream input = new TrackingInputStream(new byte[0]) {
+			@Override
+			public int read(byte[] bytes, int offset, int length) throws IOException {
+				throw new IOException("read failed");
+			}
+		};
+
+		assertJournalError(() -> new CsvTradeJournalReader(journalRoot).read(input, "unreadable"),
+				CsvJournalErrorCode.JOURNAL_READ_FAILED, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@ParameterizedTest
 	@NullSource
 	@ValueSource(strings = {"", "../private", "/tmp/trades", "trades.csv", "with space"})
 	void rejectsUnsafeJournalName(String journalName) {
@@ -242,5 +324,39 @@ class CsvTradeJournalReaderTest {
 	private interface ThrowingOperation {
 
 		void run() throws Exception;
+	}
+
+	private static class TrackingInputStream extends InputStream {
+
+		private final ByteArrayInputStream input;
+		private int bytesRead;
+		private boolean closed;
+
+		private TrackingInputStream(byte[] bytes) {
+			input = new ByteArrayInputStream(bytes);
+		}
+
+		@Override
+		public int read() {
+			int value = input.read();
+			if (value != -1) {
+				bytesRead++;
+			}
+			return value;
+		}
+
+		@Override
+		public int read(byte[] bytes, int offset, int length) throws IOException {
+			int count = input.read(bytes, offset, length);
+			if (count > 0) {
+				bytesRead += count;
+			}
+			return count;
+		}
+
+		@Override
+		public void close() {
+			closed = true;
+		}
 	}
 }
