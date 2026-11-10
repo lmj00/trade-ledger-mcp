@@ -21,6 +21,8 @@ import io.github.lmj.tradeledger.domain.model.Trade;
 final class TradeInputMapper {
 
 	static final int MAX_TRADES = 100;
+	static final int MAX_STRING_LENGTH = 256;
+	static final int MAX_DECIMAL_LENGTH = 128;
 
 	private static final Pattern PLAIN_DECIMAL = Pattern.compile("[+-]?\\d+(?:\\.\\d+)?");
 
@@ -124,6 +126,13 @@ final class TradeInputMapper {
 	}
 
 	private static String required(String value, int index, String field) {
+		return required(value, index, field, MAX_STRING_LENGTH);
+	}
+
+	private static String required(String value, int index, String field, int maxLength) {
+		if (value != null && value.length() > maxLength) {
+			throw invalid(index, field, "must be at most " + maxLength + " characters", null);
+		}
 		if (value == null || value.trim().isEmpty()) {
 			throw invalid(index, field, "must not be blank", null);
 		}
@@ -131,7 +140,7 @@ final class TradeInputMapper {
 	}
 
 	private static BigDecimal decimal(String rawValue, int index, String field) {
-		String value = required(rawValue, index, field);
+		String value = required(rawValue, index, field, MAX_DECIMAL_LENGTH);
 		if (!PLAIN_DECIMAL.matcher(value).matches()) {
 			throw invalid(index, field, "must be a plain decimal string", null);
 		}
