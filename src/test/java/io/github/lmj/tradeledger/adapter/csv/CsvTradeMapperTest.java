@@ -2,6 +2,7 @@ package io.github.lmj.tradeledger.adapter.csv;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
@@ -39,6 +40,27 @@ class CsvTradeMapperTest {
 	private static final String HEADER = String.join(",", CsvTradeSchema.HEADERS);
 
 	private final CsvTradeMapper mapper = new CsvTradeMapper();
+
+	@ParameterizedTest
+	@ValueSource(strings = { "market", "direction", "opened_at", "closed_at" })
+	void rejectsInvalidParsedFieldsWithoutRetainingInput(String field) throws IOException {
+		String marker = "synthetic-csv-" + field + "-j8z1";
+		assertThat(marker.length()).isLessThanOrEqualTo(256);
+		CSVRecord record = record(rowWithField(field, marker));
+		String description = parsingDescription(field);
+
+		assertThatThrownBy(() -> mapper.map(record, 23))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_FIELD);
+					assertThat(exception.lineNumber()).hasValue(23);
+					assertThat(exception.field()).hasValue(field);
+					assertThat(exception).hasMessage(description);
+					assertThat(exception.getMessage()).doesNotContain(marker, marker.toUpperCase(Locale.ROOT));
+					// No retained parser means no parsedString or nested/suppressed input either.
+					assertThat(exception.getCause()).isNull();
+					assertThat(exception.getSuppressed()).isEmpty();
+				});
+	}
 
 	@Test
 	void rejectsInvalidSymbolWithoutExposingInputInCauseChain() throws IOException {
@@ -195,6 +217,28 @@ class CsvTradeMapperTest {
 		@MockitoBean
 		TradeJournalReader journalReader;
 
+		@ParameterizedTest
+		@ValueSource(strings = { "market", "direction", "opened_at", "closed_at" })
+		void registeredSummaryRejectsInvalidCsvParsedFieldsWithoutExposingInput(String field) {
+			String marker = "synthetic-summary-" + field + "-k9a2";
+			assertThat(marker.length()).isLessThanOrEqualTo(256);
+			String csv = HEADER + "\n" + rowWithField(field, marker) + "\n";
+			CsvTradeJournalReader csvReader = new CsvTradeJournalReader(Path.of("."));
+			// Replace only filesystem access; parsing still uses the real CSV reader and mapper.
+			when(journalReader.read("synthetic-parsing")).thenAnswer(invocation -> csvReader.read(
+					new ByteArrayInputStream(csv.getBytes(StandardCharsets.UTF_8)), "synthetic-parsing"));
+
+			CallToolResult result = callSummary("synthetic-parsing");
+
+			assertAll("registered summarize_journal invalid " + field + " response",
+					() -> assertThat(result.isError()).isTrue(),
+					() -> assertThat(result.content()).isNotEmpty(),
+					() -> assertThat(result.content().toString()).contains(parsingDescription(field))
+							.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)),
+					() -> assertThat(String.valueOf(result.structuredContent()))
+							.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)));
+		}
+
 		@Test
 		void registeredSummaryReturnsCsvSymbolErrorWithoutExposingInput() {
 			String marker = "synthetic-symbol-g5w7";
@@ -227,13 +271,40 @@ class CsvTradeMapperTest {
 			assertThat(String.valueOf(result.structuredContent()))
 					.doesNotContain(marker, marker.toUpperCase(Locale.ROOT));
 		}
+
+		private CallToolResult callSummary(String journalName) {
+			Object bean = applicationContext.getBean("toolSpecs");
+			assertThat(bean).isInstanceOf(List.class);
+			SyncToolSpecification specification = ((List<?>) bean).stream()
+					.filter(SyncToolSpecification.class::isInstance)
+					.map(SyncToolSpecification.class::cast)
+					.filter(candidate -> candidate.tool().name().equals("summarize_journal"))
+					.findFirst()
+					.orElseThrow();
+			return specification.callHandler().apply(null,
+					CallToolRequest.builder("summarize_journal")
+							.arguments(Map.of("journalName", journalName))
+							.build());
+		}
 	}
 
-	private static CSVRecord recordWithDecimal(String field, String value) throws IOException {
+	private static String parsingDescription(String field) {
+		return switch (field) {
+			case "market", "direction" -> "unsupported " + field + " value";
+			case "opened_at", "closed_at" -> "field must be an ISO-8601 timestamp with an offset";
+			default -> throw new AssertionError(field);
+		};
+	}
+
+	private static String rowWithField(String field, String value) {
 		String[] values = ("trade-001,BTC-USDT,CRYPTO,LONG,0.1,60000,62000,5,USDT,"
 				+ "2026-07-01T01:00:00Z,2026-07-01T03:00:00Z,breakout").split(",");
 		values[CsvTradeSchema.HEADERS.indexOf(field)] = value;
-		return record(String.join(",", values));
+		return String.join(",", values);
+	}
+
+	private static CSVRecord recordWithDecimal(String field, String value) throws IOException {
+		return record(rowWithField(field, value));
 	}
 
 	private static CSVRecord record(String row) throws IOException {

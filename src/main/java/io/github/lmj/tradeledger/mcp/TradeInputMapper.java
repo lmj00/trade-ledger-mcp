@@ -162,7 +162,7 @@ final class TradeInputMapper {
 					index,
 					field,
 					"must be an ISO-8601 timestamp with an offset",
-					exception);
+					null);
 		}
 	}
 
@@ -176,7 +176,7 @@ final class TradeInputMapper {
 			return Enum.valueOf(enumType, value);
 		}
 		catch (IllegalArgumentException exception) {
-			throw invalid(index, field, "contains an unsupported value", exception);
+			throw invalid(index, field, "contains an unsupported value", null);
 		}
 	}
 

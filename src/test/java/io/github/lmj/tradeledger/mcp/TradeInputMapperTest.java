@@ -18,10 +18,38 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class TradeInputMapperTest {
 
 	private final TradeInputMapper mapper = new TradeInputMapper();
+
+	@ParameterizedTest
+	@ValueSource(strings = { "market", "direction", "openedAt", "closedAt" })
+	void rejectsInvalidParsedFieldsWithoutRetainingInput(String field) {
+		String marker = "synthetic-structured-" + field + "-h6x8";
+		assertThat(marker.length()).isLessThanOrEqualTo(TradeInputMapper.MAX_STRING_LENGTH);
+		int position = switch (field) {
+			case "market" -> 2;
+			case "direction" -> 3;
+			case "openedAt" -> 9;
+			case "closedAt" -> 10;
+			default -> throw new AssertionError(field);
+		};
+		String description = position < 4 ? "contains an unsupported value"
+				: "must be an ISO-8601 timestamp with an offset";
+
+		assertThatThrownBy(() -> mapper.map(List.of(
+				withField(0, "trade-0"), withField(position, marker))))
+				.isExactlyInstanceOf(IllegalArgumentException.class)
+				.satisfies(exception -> {
+					assertThat(exception).hasMessage("trades[1]." + field + " " + description);
+					assertThat(exception.getMessage()).doesNotContain(marker, marker.toUpperCase(Locale.ROOT));
+					// No retained parser means no parsedString or nested/suppressed input either.
+					assertThat(exception.getCause()).isNull();
+					assertThat(exception.getSuppressed()).isEmpty();
+				});
+	}
 
 	@Test
 	void rejectsInvalidSymbolWithoutExposingInputInCauseChain() {
@@ -142,6 +170,7 @@ class TradeInputMapperTest {
 		assertThat(result.entryPrice().amount()).isEqualByComparingTo("60000.50");
 		assertThat(result.fees().amount()).isEqualByComparingTo("5.125");
 		assertThat(result.openedAt()).isEqualTo(Instant.parse("2026-08-01T00:00:00Z"));
+		assertThat(result.closedAt()).isEqualTo(Instant.parse("2026-08-01T02:00:00Z"));
 	}
 
 	@Test

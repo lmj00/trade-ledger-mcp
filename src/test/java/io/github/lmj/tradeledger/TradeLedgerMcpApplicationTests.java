@@ -107,12 +107,37 @@ class TradeLedgerMcpApplicationTests {
 		CallToolResult result = callAnalyzeTrades(analyzeTradesSpecification(),
 				List.of(structuredTrade("trade-0"), trade));
 
-		// TradeInputMapperTest verifies the field location on the mapper exception.
+		// The mapper wrapper has a location; its innermost symbol exception has only "invalid symbol".
+		// Check that the registered handler selects the innermost message.
 		assertAll("registered analyze_trades invalid symbol response",
 				() -> assertThat(result.isError()).isTrue(),
 				() -> assertThat(result.content()).isNotEmpty(),
-				() -> assertThat(result.content().toString()).contains("invalid symbol"),
+				() -> assertThat(result.content().toString()).contains("invalid symbol")
+						.doesNotContain("trades[1].symbol"),
 				() -> assertThat(result.content().toString())
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)),
+				() -> assertThat(String.valueOf(result.structuredContent()))
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)));
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = { "market", "direction", "openedAt", "closedAt" })
+	void registeredAnalyzeTradesRejectsInvalidParsedFieldsWithoutExposingInput(String field) {
+		String marker = "synthetic-analyze-" + field + "-i7y9";
+		assertThat(marker.length()).isLessThanOrEqualTo(256);
+		Map<String, Object> trade = structuredTrade("trade-1");
+		trade.put(field, marker);
+		String description = Set.of("market", "direction").contains(field)
+				? "contains an unsupported value" : "must be an ISO-8601 timestamp with an offset";
+
+		CallToolResult result = callAnalyzeTrades(analyzeTradesSpecification(),
+				List.of(structuredTrade("trade-0"), trade));
+
+		// Mapper tests assert location; this boundary checks the registered handler's response.
+		assertAll("registered analyze_trades invalid " + field + " response",
+				() -> assertThat(result.isError()).isTrue(),
+				() -> assertThat(result.content()).isNotEmpty(),
+				() -> assertThat(result.content().toString()).contains(description)
 						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)),
 				() -> assertThat(String.valueOf(result.structuredContent()))
 						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)));

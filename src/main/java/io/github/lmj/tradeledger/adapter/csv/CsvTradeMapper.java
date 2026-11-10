@@ -122,7 +122,7 @@ final class CsvTradeMapper {
 					lineNumber,
 					field,
 					"field must be an ISO-8601 timestamp with an offset",
-					exception);
+					null);
 		}
 	}
 
@@ -140,7 +140,7 @@ final class CsvTradeMapper {
 					lineNumber,
 					field,
 					"unsupported %s value".formatted(field),
-					exception);
+					null);
 		}
 	}
 
