@@ -91,7 +91,7 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 			return read(Files.newInputStream(journalFile), journalName);
 		}
 		catch (IOException exception) {
-			throw readFailure(journalName, exception);
+			throw readFailure(journalName);
 		}
 	}
 
@@ -104,21 +104,27 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 			return readTrades(parser);
 		}
 		catch (CsvJournalException exception) {
-			throw exception;
+			if (exception.getSuppressed().length == 0) {
+				throw exception;
+			}
+			// Resource cleanup may attach an unsafe close failure to an otherwise safe error.
+			throw new CsvJournalException(
+					exception.code(),
+					exception.lineNumber().orElse(0),
+					exception.field().orElse(null),
+					exception.getMessage(),
+					null);
 		}
 		catch (IllegalArgumentException exception) {
 			throw new CsvJournalException(
 					INVALID_HEADER,
-					0,
-					null,
-					"journal header is invalid",
-					exception);
+					"journal header is invalid");
 		}
 		catch (UncheckedIOException exception) {
-			throw readFailure(journalName, exception.getCause());
+			throw readFailure(journalName);
 		}
 		catch (IOException exception) {
-			throw readFailure(journalName, exception);
+			throw readFailure(journalName);
 		}
 	}
 
@@ -163,7 +169,7 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 			throw exception;
 		}
 		catch (IOException exception) {
-			throw readFailure(journalName, exception);
+			throw readFailure(journalName);
 		}
 	}
 
@@ -179,7 +185,7 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 			throw exception;
 		}
 		catch (IOException exception) {
-			throw readFailure(journalName, exception);
+			throw readFailure(journalName);
 		}
 	}
 
@@ -248,13 +254,10 @@ public final class CsvTradeJournalReader implements TradeJournalReader {
 		return List.copyOf(trades);
 	}
 
-	private static CsvJournalException readFailure(String journalName, IOException cause) {
+	private static CsvJournalException readFailure(String journalName) {
 		return new CsvJournalException(
 				JOURNAL_READ_FAILED,
-				0,
-				null,
-				"journal could not be read: " + journalName,
-				cause);
+				"journal could not be read: " + journalName);
 	}
 
 	private static final class SizeLimitedInputStream extends InputStream {

@@ -3,6 +3,9 @@ package io.github.lmj.tradeledger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -10,15 +13,19 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.IntStream;
 
+import io.github.lmj.tradeledger.adapter.csv.CsvTradeJournalReader;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
+import io.modelcontextprotocol.spec.McpSchema.TextContent;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 
 @SpringBootTest(properties = "trade-ledger.journal.root=src/test/resources/journals")
@@ -73,6 +80,54 @@ class TradeLedgerMcpApplicationTests {
 						.build());
 
 		assertThat(invalidResult.isError()).isTrue();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"duplicate-header", "missing-root"})
+	void registeredSummaryDiscardsParserAndFilesystemDetails(
+			String failureKind, @TempDir Path temporaryRoot) throws IOException {
+		String marker = "synthetic-summary-c8v2";
+		String rawHeader = marker + ",symbol,market,direction,quantity,entry_price,exit_price,fees,"
+				+ "currency,opened_at,closed_at," + marker;
+		Path root = failureKind.equals("missing-root") ? temporaryRoot.resolve(marker) : temporaryRoot;
+		String description;
+		if (failureKind.equals("duplicate-header")) {
+			Files.writeString(root.resolve("invalid.csv"), rawHeader + "\n");
+			description = "journal header is invalid";
+		}
+		else {
+			assertThat(root).doesNotExist();
+			description = "journal could not be read: invalid";
+		}
+
+		new ApplicationContextRunner()
+				.withUserConfiguration(TradeLedgerMcpApplication.class)
+				.withPropertyValues(
+						"trade-ledger.journal.root=" + root,
+						"spring.ai.mcp.server.type=SYNC",
+						"spring.ai.mcp.server.stdio=true")
+				.run(context -> {
+					assertThat(context).hasNotFailed();
+					assertThat(context.getBean("tradeJournalReader")).isInstanceOf(CsvTradeJournalReader.class);
+					SyncToolSpecification specification = toolSpecifications(context).stream()
+							.filter(candidate -> candidate.tool().name().equals("summarize_journal"))
+							.findFirst()
+							.orElseThrow();
+
+					CallToolResult result = specification.callHandler().apply(null,
+							CallToolRequest.builder("summarize_journal")
+									.arguments(Map.of("journalName", "invalid"))
+									.build());
+
+					assertAll("registered summarize_journal " + failureKind + " response",
+							() -> assertThat(result.isError()).isTrue(),
+							() -> assertThat(result.content()).isNotEmpty().allSatisfy(content ->
+									assertThat(content).isInstanceOfSatisfying(TextContent.class, text ->
+											assertThat(text.text()).contains(description)
+													.doesNotContain(marker, rawHeader, root.toString(), temporaryRoot.toString()))),
+							() -> assertThat(String.valueOf(result.structuredContent()))
+									.doesNotContain(marker, rawHeader, root.toString(), temporaryRoot.toString()));
+				});
 	}
 
 	@Test
@@ -212,7 +267,11 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	private List<SyncToolSpecification> toolSpecifications() {
-		Object bean = applicationContext.getBean("toolSpecs");
+		return toolSpecifications(applicationContext);
+	}
+
+	private static List<SyncToolSpecification> toolSpecifications(ApplicationContext context) {
+		Object bean = context.getBean("toolSpecs");
 		assertThat(bean).isInstanceOf(List.class);
 		return ((List<?>) bean).stream()
 				.filter(SyncToolSpecification.class::isInstance)
