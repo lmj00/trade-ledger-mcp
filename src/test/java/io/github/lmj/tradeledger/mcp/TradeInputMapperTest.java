@@ -2,11 +2,13 @@ package io.github.lmj.tradeledger.mcp;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Stream;
 
 import io.github.lmj.tradeledger.domain.model.Direction;
@@ -20,6 +22,31 @@ import org.junit.jupiter.params.provider.MethodSource;
 class TradeInputMapperTest {
 
 	private final TradeInputMapper mapper = new TradeInputMapper();
+
+	@Test
+	void rejectsInvalidSymbolWithoutExposingInputInCauseChain() {
+		String marker = "synthetic-symbol-c9s3";
+		String raw = marker + "!";
+		assertThat(raw.length()).isLessThanOrEqualTo(32);
+
+		assertThatThrownBy(() -> mapper.map(List.of(
+				withField(1, "BTC-USDT"), withField(1, raw))))
+				.isInstanceOfSatisfying(IllegalArgumentException.class, exception -> {
+					assertThat(exception).hasMessageContaining("trades[1].symbol")
+							.hasMessageContaining("invalid symbol");
+					assertThat(exception.getCause()).isInstanceOf(IllegalArgumentException.class);
+					for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+						assertThat(cause.getMessage()).doesNotContain(marker, marker.toUpperCase(Locale.ROOT));
+					}
+				});
+	}
+
+	@Test
+	void normalizesLowercaseSymbol() {
+		Trade trade = mapper.map(List.of(withField(1, " btc-usdt "))).getFirst();
+
+		assertThat(trade.symbol().value()).isEqualTo("BTC-USDT");
+	}
 
 	@ParameterizedTest
 	@MethodSource("stringFields")

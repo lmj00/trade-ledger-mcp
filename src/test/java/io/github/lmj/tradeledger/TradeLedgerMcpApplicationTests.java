@@ -1,9 +1,11 @@
 package io.github.lmj.tradeledger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.IntStream;
@@ -92,6 +94,45 @@ class TradeLedgerMcpApplicationTests {
 
 		assertThat(invalidResult.isError()).isTrue();
 		assertThat(invalidResult.content().toString()).contains("at most 100");
+	}
+
+	@Test
+	void registeredAnalyzeTradesRejectsInvalidSymbolWithoutExposingInput() {
+		String marker = "synthetic-symbol-e3u5";
+		String raw = marker + "!";
+		assertThat(raw.length()).isLessThanOrEqualTo(32);
+		Map<String, Object> trade = structuredTrade("trade-1");
+		trade.put("symbol", raw);
+
+		CallToolResult result = callAnalyzeTrades(analyzeTradesSpecification(),
+				List.of(structuredTrade("trade-0"), trade));
+
+		// TradeInputMapperTest verifies the field location on the mapper exception.
+		assertAll("registered analyze_trades invalid symbol response",
+				() -> assertThat(result.isError()).isTrue(),
+				() -> assertThat(result.content()).isNotEmpty(),
+				() -> assertThat(result.content().toString()).contains("invalid symbol"),
+				() -> assertThat(result.content().toString())
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)),
+				() -> assertThat(String.valueOf(result.structuredContent()))
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)));
+	}
+
+	@Test
+	void registeredAnalyzeTradesRejectsDuplicateIdWithoutExposingInput() {
+		String marker = "synthetic-id-f4v6";
+
+		CallToolResult result = callAnalyzeTrades(analyzeTradesSpecification(),
+				List.of(structuredTrade(marker), structuredTrade("trade-1"), structuredTrade(marker)));
+
+		assertAll("registered analyze_trades duplicate ID response",
+				() -> assertThat(result.isError()).isTrue(),
+				() -> assertThat(result.content()).isNotEmpty(),
+				() -> assertThat(result.content().toString()).contains("unique", "index 2"),
+				() -> assertThat(result.content().toString())
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)),
+				() -> assertThat(String.valueOf(result.structuredContent()))
+						.doesNotContain(marker, marker.toUpperCase(Locale.ROOT)));
 	}
 
 	@ParameterizedTest
