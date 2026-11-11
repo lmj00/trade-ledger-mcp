@@ -27,8 +27,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.test.annotation.DirtiesContext;
 
 @SpringBootTest(properties = "trade-ledger.journal.root=src/test/resources/journals")
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class TradeLedgerMcpApplicationTests {
 
 	@Autowired
@@ -40,6 +43,30 @@ class TradeLedgerMcpApplicationTests {
 	@Test
 	void contextLoads() {
 		assertThat(journalProperties.root()).isAbsolute().isDirectory();
+		assertThat(applicationContext.containsBean("upbitOrderClient")).isTrue();
+		// Merely starting the server and registering tools must not construct a client
+		// or require credentials / transport JVM options.
+		assertThat(((ConfigurableApplicationContext) applicationContext)
+				.getBeanFactory().containsSingleton("upbitOrderClient")).isFalse();
+	}
+
+	@Test
+	void registersOnlyTwoCalculationToolsAndSingleReadOnlyOrderLookup() {
+		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
+				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order");
+		SyncToolSpecification specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
+				.findFirst().orElseThrow();
+		assertThat(asMap(specification.tool().inputSchema().get("properties")))
+				.containsOnlyKeys("uuid");
+		assertThat(specification.tool().inputSchema().get("required")).isEqualTo(List.of("uuid"));
+		assertThat(asMap(asMap(specification.tool().inputSchema().get("properties")).get("uuid")))
+				.containsEntry("type", "string");
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		assertThat(asMap(specification.tool().outputSchema().get("properties")))
+				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
 	}
 
 	@Test

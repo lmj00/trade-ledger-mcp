@@ -1,8 +1,8 @@
 # trade-ledger-mcp
 
-완결된 거래의 실현 손익을 계산하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`과 구조화된 거래를 분석하는 `analyze_trades`를 제공합니다. 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
+완결된 거래의 실현 손익을 계산하고 업비트 단건 주문을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`를 제공합니다. 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
 
-현재 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 업비트·바이낸스·토스증권의 공식 API 응답이나 공식 내보내기 CSV 형식을 구현한 것이 아닙니다. 아래 사용법은 제공된 코드와 기존 테스트를 읽어 작성했습니다. 이번 문서 작성에서는 외부 조회, 인증정보 접근, 빌드·테스트 실행이나 실제 서비스 연동을 하지 않았으며 서버 검증과 독립 검토는 대기 상태입니다.
+두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 업비트 조회 응답은 별도 주문·체결 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. 바이낸스·토스증권의 공식 API·내보내기 형식은 여전히 미확인입니다. 이번 작업은 제공 규격과 저장소 코드에 근거하며 외부 문서 열람·실계정 접근은 하지 않았습니다. 서버 테스트와 독립 검토는 대기 상태입니다.
 
 ## 설치·빌드·실행
 
@@ -10,9 +10,9 @@ Java 21 JDK를 설치하고 `JAVA_HOME`과 `PATH`가 해당 JDK를 가리키도�
 
 ```bash
 java -version
-./gradlew test
-./gradlew build
-./gradlew bootRun
+JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1' ./gradlew test
+JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1' ./gradlew build
+JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1' ./gradlew bootRun
 ```
 
 `build.gradle`은 Java 21 도구 체인과 JUnit Platform을 지정합니다. `bootRun`은 HTTP 서버가 아닌 동기식 stdio MCP 서버를 시작합니다. MCP 클라이언트가 프로세스의 표준 입력·출력으로 연결해야 하며, 일반 셸에 JSON만 입력하는 것으로 MCP 초기화 절차를 대신할 수는 없습니다.
@@ -27,10 +27,18 @@ MCP 클라이언트에서도 작업 디렉터리를 프로젝트 루트로 지�
 
 ```bash
 ./gradlew bootJar
-TRADE_LEDGER_JOURNAL_ROOT=/absolute/path/to/journals java -jar build/libs/trade-ledger-mcp-0.0.1-SNAPSHOT.jar
+TRADE_LEDGER_JOURNAL_ROOT=/absolute/path/to/journals java \
+  -Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1 \
+  -jar build/libs/trade-ledger-mcp-0.0.1-SNAPSHOT.jar
 ```
 
 클라이언트에는 위 `java` 명령과 인자, 저널 루트 환경변수를 설정합니다. 설정 키는 클라이언트마다 다릅니다. `application.properties`는 배너와 애플리케이션 콘솔 로깅을 끄고 stdout을 MCP JSON-RPC 메시지용으로 예약합니다. Gradle 실행 로그가 stdio 연결에 섞이지 않도록 클라이언트에서 직접 실행 JAR을 사용하는 방식을 권장합니다.
+
+업비트 클라이언트는 첫 조회 시 생성합니다. **키가 없어도 서버 시작과 두 계산 도구의 등록·호출은 가능합니다.** 업비트 조회에는 서버 프로세스 환경변수 `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`와 **주문조회 권한만** 필요합니다. 주문·출금 권한은 필요하지 않습니다. 비밀값은 프로세스 환경으로 전달하며 MCP 인자·예시 파일·명령행에 넣지 않습니다. 호스트와 URL은 환경변수나 도구 인자로 받지 않으며 목적지는 `https://api.upbit.com/v1/order`로 고정됩니다.
+
+조회 프로세스는 시작부터 `-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1`을 지정해야 합니다. JDK HTTP 클라이언트의 암묵적 재전송까지 차단하기 위한 기존 보호 장치이며 시작 후 속성을 바꾸는 것으로 대체할 수 없습니다. 옵션이 없으면 조회는 `UNSAFE_TRANSPORT_CONFIGURATION`으로 실패하고 계산 도구는 계속 사용할 수 있습니다. 옵션이 올바르고 키가 없으면 `MISSING_CREDENTIALS`로 실패합니다. **자동 재시도와 리다이렉트 추적은 없습니다.** 테스트의 로컬 HTTP 클라이언트에도 같은 시작 옵션이 필요하므로 위 테스트 명령은 이를 테스트 JVM에도 전달합니다. `build`도 테스트를 실행하므로 같은 `JAVA_TOOL_OPTIONS`를 적용합니다.
+
+직전 후보에 대해 제공된 최신 서버 기록은 Gradle `test` 종료 코드 1, **248건 중 1건 실패**입니다. `UpbitOrderToolsTest.executionError`에서 Spring 테스트 종료 처리 중 `LifecycleProcessor not initialized`가 발생했습니다. 해당 테스트의 `@AfterAll`이 관리 컨텍스트를 직접 닫은 뒤 Spring의 컨텍스트 캐시 관리가 이를 다시 사용한 경로와 부합합니다. 이번 후보는 직접 종료를 제거하고 `@DirtiesContext`가 컨텍스트와 로컬 대역의 HTTP 자원을 정리하도록 맡깁니다. 테스트 리스너는 정리 전 보관한 대역 참조로 Spring 종료 처리 후 HTTP 클라이언트의 종료 상태를 검사하며, 종료된 컨텍스트를 다시 조회하지 않습니다. 기존 종료 상태 단언과 성공 `content`·`structuredContent` 일치, 오류·정밀도 검증은 유지합니다. 이번 개발 단계에서 테스트를 실행하지 않았으며, 수정 후 `./gradlew test` 결과와 독립 검토 결과는 서버 검증 대기입니다.
 
 ## CSV 저널 계약
 
@@ -70,7 +78,7 @@ trade-001,BTC-USDT,CRYPTO,LONG,0.1234,60000.25,62000.75,5.37,USDT,2026-07-01T01:
 
 ## MCP 도구 입력·출력 예시
 
-두 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**이며 건수는 정수입니다.
+세 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**이며 건수는 정수입니다.
 
 ### `summarize_journal`
 
@@ -146,17 +154,67 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 두 도구의 총손익은 LONG이면 `(청산 단가 - 진입 단가) × 수량`, SHORT이면 `(진입 단가 - 청산 단가) × 수량`입니다. 순손익은 총손익에서 수수료를 뺀 값이며 승리·손실·본전 건수는 각 거래의 **순손익** 부호로 분류합니다. `analyze_trades` 출력에는 `journalName`이 없습니다.
 
+### `get_upbit_order`
+
+필수 인자는 정규 UUID 문자열 `uuid` 하나입니다. 키·시크릿·호스트·임의 URL을 받지 않습니다. 등록 힌트는 `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=true`입니다. 외부 조회가 필요한 도구이며 주문이나 자금 이동 도구는 등록하지 않습니다.
+
+```json
+{
+  "name": "get_upbit_order",
+  "arguments": {"uuid": "123e4567-e89b-12d3-a456-426614174000"}
+}
+```
+
+아래는 가상의 단일 체결을 가진 응답 데이터 예시이며 실계정 조회 결과가 아닙니다. MCP 성공 결과의 `structuredContent`에는 주문 객체를, `content`에는 같은 객체를 JSON으로 직렬화한 단일 `TextContent`를 제공합니다. 수량·가격·체결 금액·수수료는 소수 자릿수를 보존하는 문자열이고 시각은 UTC ISO-8601 문자열입니다.
+
+```json
+{
+  "serviceId": "upbit",
+  "orderId": "123e4567-e89b-12d3-a456-426614174000",
+  "market": "KRW-BTC",
+  "side": "bid",
+  "orderType": "limit",
+  "state": "done",
+  "createdAt": "2026-07-01T01:00:00Z",
+  "executedVolume": "0.10000000",
+  "paidFee": "50.00000000",
+  "trades": [
+    {
+      "tradeId": "example-fill-1",
+      "market": "KRW-BTC",
+      "side": "bid",
+      "price": "1000000.00",
+      "volume": "0.10000000",
+      "funds": "100000.0000000000",
+      "createdAt": "2026-07-01T01:00:01Z"
+    }
+  ]
+}
+```
+
+`paidFee`는 **주문 전체 수수료**입니다. 체결별로 배분하거나 체결 수만큼 더하지 않습니다. 제공된 데이터만으로 수수료 통화를 확정하지 않아 수수료 통화 필드는 제공하지 않으며 시장 코드로 추정하지 않습니다. 체결이 없으면 `trades`는 빈 배열입니다. 매수·매도 매칭, 원가 배분, 완결 거래 생성과 실현손익 계산은 이 조회 도구에 구현되어 있지 않습니다.
+
+오류는 `isError=true`와 `Upbit request failed: <안전한 범주>` 메시지로 반환합니다. `INVALID_UUID`, `MISSING_CREDENTIALS`, `AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `ORDER_NOT_FOUND`, `RATE_LIMITED`, `NETWORK_ERROR`, `TIMEOUT`, `INVALID_RESPONSE` 등이 있으며 알려지지 않은 내부 실패는 `INTERNAL_ERROR`로 처리합니다. 클라이언트 초기화 예외도 원인을 제거한 뒤 전달해 키·JWT·원문 응답과 파서 예외가 MCP 오류 원인으로 따라가지 않게 합니다. 오류의 `structuredContent`에 별도 오류 객체가 존재한다고 가정하지 않습니다.
+
+프로젝트 상한은 연결 **3초**, 본문 수신까지 요청 전체 **10초**, 응답 본문 **1 MiB(1,048,576바이트)**, 주문당 체결 **0~1,000건**, 십진 문자열 **128자**, 기타 원문 문자열 **256자**입니다. UUID는 공백 없이 36자이며 초과 데이터는 부분 반환하지 않습니다. 이 상한은 업비트의 공식 서비스 상한과 구별됩니다. **단건 조회만 지원**하며 주문 목록·페이지 처리·기간별 수집·자동 재시도·호출 속도 조절기는 구현하지 않았습니다.
+
+제공 규격에 따른 공식 호출 제한은 **`default` 그룹 초당 30회 공유 한도**입니다. 이 단건 주문 조회만의 전용 30회가 아니며 같은 계정의 해당 그룹 API 사용량과 공유합니다. 호출자는 다른 클라이언트의 사용량도 함께 조정해야 하며 429는 `RATE_LIMITED`로 반환합니다.
+
+근거를 식별하는 공식 문서 링크는 [개별 주문 조회](https://docs.upbit.com/kr/reference/get-order), [인증](https://docs.upbit.com/kr/reference/auth), [호출 수 제한](https://docs.upbit.com/kr/reference/rate-limits)입니다. 제공된 규격의 `GET /v1/order?uuid=...`, 주문조회 권한, HS512 JWT의 `access_key`·새 `nonce`·미인코딩 쿼리 SHA-512 해시를 구현 기준으로 삼았습니다. 시크릿은 Base64 디코딩하지 않습니다. 이번 작업에서는 외부 링크의 최신 내용과 실계정 동작을 확인하지 않았습니다.
+
+추가한 [UpbitOrderToolsTest](src/test/java/io/github/lmj/tradeledger/mcp/UpbitOrderToolsTest.java)는 가짜 키와 로컬 HTTP 대역을 실제 등록 MCP `callHandler`에 연결하도록 작성했습니다. 체결·주문 수수료·정밀도, 키 미설정·잘못된 UUID·인증·권한·조회·호출 제한·네트워크·파싱 오류를 검사하고, `content`·`structuredContent`와 수집한 애플리케이션/MCP 로그에 키·JWT·원문 표식이 없는지 검사합니다. 이번 회귀 검증은 기존의 비어 있지 않은 `content` 검증을 유지하며, 체결이 있는 주문과 없는 주문 모두 텍스트 JSON 전체가 `structuredContent`와 같은지도 확인합니다. 테스트 작성은 통과 증거가 아니며 수정 후 실행 결과는 서버 검증 대기입니다.
+
 ## 현재 Trade로 표현할 수 있는 범위
 
 [Trade](src/main/java/io/github/lmj/tradeledger/domain/model/Trade.java)는 수량 하나, 진입·청산 단가 하나씩, 동일 통화의 총수수료와 진입·청산 시각을 가진 완결 거래입니다. 개별 체결을 완결 거래로 간주하거나 미청산 거래에 임의 청산값을 넣을 수 없습니다. 분할 체결·부분 청산을 묶는 규칙, 원가 배분 및 포지션 매칭은 구현되어 있지 않습니다. 다른 통화로 낸 수수료도 통화 이름만 바꾸어 입력할 수 없고, 환율·기준 시각·출처를 정한 환산 기능은 없습니다. 따라서 원본 체결이나 서비스 파일을 이 형식으로 임의 변환해서는 안 됩니다. `SHORT` 값 지원이 특정 서비스의 공매도·파생상품 연동을 의미하지도 않습니다.
 
 ## 서비스별 미확인 상태와 다음 확인 자료
 
-제공된 코드에는 로컬 CSV 어댑터만 있으며 아래 세 서비스의 어댑터나 공식 API·내보내기 규격 자료는 없습니다. 외부 접근 없이 작성했으므로 공식 지원 방식의 존재 여부·접근 대상·사용 조건을 판단할 수 없습니다. 아래 “미확인”은 지원 불가 판정이 아닙니다.
+업비트는 제공된 단건 주문 조회 규격에 한해 어댑터와 MCP 연결 후보를 구현했습니다. 공식 규격 제공, 모의 테스트 작성·실행, 실계정 대조는 서로 다른 상태입니다. 바이낸스·토스증권은 외부 접근 없이 공식 방식의 존재 여부·접근 대상·사용 조건을 판단할 수 없습니다. 아래 “미확인”은 지원 불가 판정이 아닙니다.
 
 | 서비스 | 공식 방식 확인 | 어댑터 구현 | 서비스 모의 검증 | 실제 연동 검증 | 다음 확인에 필요한 공식 문서·비식별 파일 예시 |
 | --- | --- | --- | --- | --- | --- |
-| 업비트 | 공식 API 또는 내보내기 지원 방식 미확인 | 미구현 | 미수행 | 미검증 | 공식 거래·체결 내역 조회/API 권한 및 파일 내보내기 안내, 페이지 처리·호출 제한 규정. 제공 가능한 경우 원본 헤더·수수료 통화·파일 시간대가 보존된 비식별 체결 내역 파일과 분할 체결 예시 |
+| 업비트 | 단건 주문 조회·인증·호출 제한 규격 제공. 최신 외부 문서 재확인 미수행 | 단건 주문·체결 조회 및 MCP 연결 구현 후보. 매수·매도 매칭·실현손익 미구현 | 어댑터 및 등록 MCP 핸들러 모의 테스트 작성. 직전 서버 실행 248건 중 종료 처리 1건 실패, 수정 후 재검증 대기 | 미검증 | 최신 공식 주문조회 권한·default 공유 한도 확인, 조회 전용 실계정 원본과 UUID·체결·주문 수수료 대조. 확장 시 목록·페이지 규격과 수수료 통화·시간대가 보존된 비식별 분할 체결 예시 |
 | 바이낸스 | 공식 API 또는 내보내기 지원 방식 미확인 | 미구현 | 미수행 | 미검증 | 대상 상품(현물·파생 등)을 구분한 공식 거래 내역/API·파일 내보내기 안내와 조회 전용 권한·페이지 처리·호출 제한 문서. 제공 가능한 경우 상품 유형·수수료 자산·시간대가 보존된 비식별 파일 및 부분 청산 예시 |
 | 토스증권 | 공식 API 또는 내보내기 지원 방식 미확인 | 미구현 | 미수행 | 미검증 | 공식 거래 내역 조회·내보내기 및 API 제공 여부·이용 대상 안내, 조회 전용 권한·페이지 처리·호출 제한 규정(해당 방식이 있는 경우). 제공 가능한 경우 국내·해외 구분, 거래·수수료 통화, 파일 시간대가 보존된 비식별 거래 내역 파일 |
 
