@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -14,13 +15,16 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -33,6 +37,8 @@ class UpbitOrderClientTest {
 
 	private static final String ID = "123e4567-e89b-12d3-a456-426614174000";
 	private static final String BODY_MARKER = "private-response-marker";
+	private static final String DISABLE_RETRY = "jdk.httpclient.disableRetryConnect";
+	private static final String RETRY_LIMIT = "jdk.httpclient.redirects.retrylimit";
 	private static final Map<String, String> KEYS = Map.of("UPBIT_ACCESS_KEY", UpbitJwtSignerTest.ACCESS,
 			"UPBIT_SECRET_KEY", UpbitJwtSignerTest.SECRET);
 	private static final String ORDER = """
@@ -56,6 +62,123 @@ class UpbitOrderClientTest {
 		expect(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION,
 				() -> UpbitOrderClient.requireNoRetryConfiguration(List.of(disable, limit), "true", "5"));
 		UpbitOrderClient.requireNoRetryConfiguration(List.of(disable, limit), "true", "1");
+	}
+
+	@Test
+	void verifiesStartupOptionsAcrossIndependentJvms() throws Exception {
+		List<String> requests = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			reply(exchange, 200, ORDER);
+		})) {
+			assertThat(runStartupProbe(server.uri(), false)).containsExactly(
+					"MISSING:UNSAFE_TRANSPORT_CONFIGURATION", "LATE:UNSAFE_TRANSPORT_CONFIGURATION");
+			assertThat(requests).isEmpty();
+			assertThat(runStartupProbe(server.uri(), true)).containsExactly("STARTUP:ORDER:" + ID);
+			assertThat(requests).containsExactly("GET /v1/order?uuid=" + ID);
+		}
+	}
+
+	private static List<String> runStartupProbe(URI endpoint, boolean startupOptions) throws Exception {
+		String classpath = System.getProperty("upbit.test.runtimeClasspath");
+		assertThat(classpath).as("Gradle test runtime classpath for the child JVM").isNotBlank();
+		// Avoid compiler and parallel GC threads in the extra JVM on constrained test hosts.
+		List<String> command = new ArrayList<>(List.of(
+				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+				"-Xms16m", "-Xmx96m", "-Xss256k", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1", "-Xint"));
+		if (startupOptions) {
+			command.add("-D" + DISABLE_RETRY + "=true");
+			command.add("-D" + RETRY_LIMIT + "=1");
+		}
+		command.addAll(List.of("-cp", classpath, StartupOptionsProbe.class.getName(),
+				endpoint.toString(), startupOptions ? "startup" : "missing"));
+		ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+		for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) {
+			builder.environment().remove(variable);
+		}
+		Process process = builder.start();
+		try (var input = process.getInputStream()) {
+			process.getOutputStream().close();
+			int outputLimit = 8192;
+			ByteArrayOutputStream output = new ByteArrayOutputStream();
+			byte[] buffer = new byte[1024];
+			long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+			boolean exited = false;
+			// Drain without a reader thread; both output storage and process lifetime are bounded.
+			while (true) {
+				int available;
+				while ((available = input.available()) > 0) {
+					int count = input.read(buffer, 0, Math.min(available, buffer.length));
+					if (count < 0) {
+						break;
+					}
+					output.write(buffer, 0, count);
+					assertThat(output.size()).as("Child JVM output bytes").isLessThanOrEqualTo(outputLimit);
+				}
+				// Drain once more after observing exit so the final result marker cannot race this check.
+				if (exited) {
+					break;
+				}
+				assertThat(System.nanoTime() < deadline).as("Child JVM must finish within 20 seconds").isTrue();
+				exited = process.waitFor(25, TimeUnit.MILLISECONDS);
+			}
+			String result = output.toString(StandardCharsets.UTF_8);
+			assertThat(process.exitValue()).as("Child JVM exit status; bounded output: %s", result).isZero();
+			return result.lines().toList();
+		}
+		finally {
+			if (process.isAlive()) {
+				process.destroyForcibly();
+				assertThat(process.waitFor(5, TimeUnit.SECONDS)).as("Child JVM cleanup").isTrue();
+			}
+		}
+	}
+
+	/** Separate JVM entry point; never reads credentials from the process environment. */
+	public static final class StartupOptionsProbe {
+		public static void main(String[] arguments) {
+			try {
+				URI endpoint = URI.create(arguments[0]);
+				if ("startup".equals(arguments[1])) {
+					String orderId = new UpbitOrderClient(endpoint, () -> KEYS).getOrder(ID).orderId();
+					if (!ID.equals(orderId)) {
+						throw new AssertionError("Unexpected fake order");
+					}
+					System.out.println("STARTUP:ORDER:" + orderId);
+				}
+				else if ("missing".equals(arguments[1])) {
+					if (System.getProperty(DISABLE_RETRY) != null || System.getProperty(RETRY_LIMIT) != null) {
+						throw new AssertionError("Retry options must initially be absent");
+					}
+					requireBlocked(endpoint, "MISSING");
+					System.setProperty(DISABLE_RETRY, "true");
+					System.setProperty(RETRY_LIMIT, "1");
+					requireBlocked(endpoint, "LATE");
+				}
+				else {
+					throw new AssertionError("Unknown probe mode");
+				}
+			}
+			catch (Throwable failure) {
+				// Report no environment, authentication values, response bodies or exception messages.
+				System.err.println("PROBE_FAILED:" + failure.getClass().getSimpleName());
+				System.exit(1);
+			}
+		}
+
+		private static void requireBlocked(URI endpoint, String phase) {
+			try {
+				new UpbitOrderClient(endpoint, () -> KEYS).getOrder(ID);
+			}
+			catch (UpbitApiException exception) {
+				if (exception.code() != UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION) {
+					throw new AssertionError("Unexpected Upbit error category");
+				}
+				System.out.println(phase + ":UNSAFE_TRANSPORT_CONFIGURATION");
+				return;
+			}
+			throw new AssertionError("Unsafe transport was accepted");
+		}
 	}
 
 	@Test
