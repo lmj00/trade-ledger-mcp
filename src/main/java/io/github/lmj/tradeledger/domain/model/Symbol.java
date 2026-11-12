@@ -16,7 +16,7 @@ public record Symbol(String value) {
 		Objects.requireNonNull(value, "symbol must not be null");
 		value = value.trim().toUpperCase(Locale.ROOT);
 		if (!VALID_SYMBOL.matcher(value).matches()) {
-			throw new IllegalArgumentException("invalid symbol: " + value);
+			throw new IllegalArgumentException("invalid symbol");
 		}
 	}
 

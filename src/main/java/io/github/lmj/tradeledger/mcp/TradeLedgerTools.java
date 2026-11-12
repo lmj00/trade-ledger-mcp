@@ -58,7 +58,10 @@ public final class TradeLedgerTools {
 					openWorldHint = false))
 	public TradeAnalysisResponse analyzeTrades(
 			@McpToolParam(
-					description = "Closed trades with decimal values encoded as plain strings and timestamps encoded as ISO-8601 with an offset.",
+					description = "Closed trades with decimal values encoded as plain strings and timestamps encoded as ISO-8601 with an offset. "
+							+ "Raw decimal strings (quantity, entryPrice, exitPrice, fees) may contain at most 128 characters, including signs and decimal points; "
+							+ "all other strings may contain at most 256 characters. Limits include whitespace and are checked before trimming or parsing. "
+							+ "These limits bound mapping and subsequent processing, not transport message size.",
 					required = true)
 			List<TradeInput> trades) {
 		return TradeAnalysisResponse.from(

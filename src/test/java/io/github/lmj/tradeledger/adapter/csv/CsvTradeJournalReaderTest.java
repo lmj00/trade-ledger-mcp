@@ -3,10 +3,17 @@ package io.github.lmj.tradeledger.adapter.csv;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import io.github.lmj.tradeledger.domain.model.Direction;
 import io.github.lmj.tradeledger.domain.model.Trade;
@@ -83,6 +90,27 @@ class CsvTradeJournalReaderTest {
 				null);
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"quantity", "entry_price", "exit_price", "fees"})
+	void rejectsLongDecimalBelowFileLimitWithoutExposingInput(String field) throws IOException {
+		String value = "+1." + "7".repeat(20_000);
+		String[] values = validRow("trade-002", "USDT").split(",");
+		values[CsvTradeSchema.HEADERS.indexOf(field)] = value;
+		writeJournal("long-decimal", HEADER + "\n" + validRow("trade-001", "USDT") + "\n"
+				+ String.join(",", values) + "\n");
+		assertThat(Files.size(journalRoot.resolve("long-decimal.csv")))
+				.isLessThan(CsvTradeJournalReader.DEFAULT_MAX_FILE_SIZE_BYTES);
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read("long-decimal"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_FIELD);
+					assertThat(exception.lineNumber()).hasValue(3);
+					assertThat(exception.field()).hasValue(field);
+					assertThat(exception).hasMessageContaining("128").hasMessageNotContaining(value);
+					assertThat(exception.getCause()).isNull();
+				});
+	}
+
 	@Test
 	void rejectsDuplicateHeaders() throws IOException {
 		writeJournal("duplicate-header", HEADER.replace("strategy", "symbol") + "\n"
@@ -93,6 +121,81 @@ class CsvTradeJournalReaderTest {
 				CsvJournalErrorCode.INVALID_HEADER,
 				null,
 				null);
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void rejectsParserHeadersWithoutRetainingRawInput(boolean missingColumnName) {
+		String marker = "synthetic-header-q8r2";
+		String rawHeader = HEADER.replace("trade_id", marker)
+				.replace("strategy", missingColumnName ? "" : marker);
+		TrackingInputStream input = new TrackingInputStream(
+				(rawHeader + "\n").getBytes(StandardCharsets.UTF_8));
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read(input, "invalid-header"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_HEADER);
+					assertThat(exception.lineNumber()).isEmpty();
+					assertThat(exception.field()).isEmpty();
+					assertThat(exception).hasMessage("journal header is invalid");
+					assertSafeExceptionGraph(exception, rawHeader, marker);
+				});
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void discardsHeaderAndCloseFailuresWithoutChangingHeaderError() {
+		String marker = "synthetic-header-close-v4p6";
+		String rawHeader = HEADER.replace("trade_id", marker).replace("strategy", marker);
+		String closeMessage = "synthetic-close-z5x7 " + journalRoot.resolve("source.csv");
+		TrackingInputStream input = closeFailingInput(rawHeader + "\n", closeMessage);
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read(input, "invalid-header"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_HEADER);
+					assertThat(exception.lineNumber()).isEmpty();
+					assertThat(exception.field()).isEmpty();
+					assertThat(exception).hasMessage("journal header is invalid");
+					assertSafeExceptionGraph(exception, rawHeader, marker, closeMessage, journalRoot.toString());
+				});
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void preservesMapperErrorLocationWhenCloseAlsoFails() {
+		String marker = "synthetic-invalid-quantity-t3u9";
+		String content = HEADER + "\n" + validRow("trade-001", "USDT") + "\n"
+				+ validRow("trade-002", "USDT").replace(",0.1,", "," + marker + ",") + "\n";
+		String closeMessage = "synthetic-close-m6n8 " + journalRoot.resolve("source.csv");
+		TrackingInputStream input = closeFailingInput(content, closeMessage);
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read(input, "invalid-field"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.INVALID_FIELD);
+					assertThat(exception.lineNumber()).hasValue(3);
+					assertThat(exception.field()).hasValue("quantity");
+					assertThat(exception).hasMessage("field must be a plain decimal number");
+					assertSafeExceptionGraph(exception, marker, closeMessage, journalRoot.toString());
+				});
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void preservesByteLimitErrorWhenCloseAlsoFails() {
+		String closeMessage = "synthetic-limit-close-b2c4 " + journalRoot.resolve("source.csv");
+		TrackingInputStream input = closeFailingInput(HEADER + "\n", closeMessage);
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, 10, 10);
+
+		assertThatThrownBy(() -> reader.read(input, "growing"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.FILE_TOO_LARGE);
+					assertThat(exception.lineNumber()).isEmpty();
+					assertThat(exception.field()).isEmpty();
+					assertThat(exception).hasMessage("journal exceeds the maximum file size");
+					assertSafeExceptionGraph(exception, closeMessage, journalRoot.toString());
+				});
+		assertThat(input.bytesRead).isEqualTo(11);
+		assertThat(input.closed).isTrue();
 	}
 
 	@Test
@@ -173,6 +276,147 @@ class CsvTradeJournalReaderTest {
 	}
 
 	@ParameterizedTest
+	@ValueSource(strings = {"breakout", "돌파전략"})
+	void acceptsJournalExactlyAtByteLimit(String strategy) throws IOException {
+		String content = HEADER + "\n"
+				+ validRow("trade-001", "USDT").replace("breakout", strategy) + "\n";
+		byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+		writeJournal("exact-limit", content);
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, bytes.length, 10);
+		TrackingInputStream input = new TrackingInputStream(bytes);
+
+		assertThat(reader.read("exact-limit")).singleElement()
+				.extracting(Trade::strategy).isEqualTo(strategy);
+		assertThat(reader.read(input, "exact-limit")).singleElement()
+				.extracting(Trade::strategy).isEqualTo(strategy);
+		assertThat(input.closed).isTrue();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"breakout", "돌파전략"})
+	void rejectsStreamOneByteOverLimit(String strategy) {
+		String content = HEADER + "\n"
+				+ validRow("trade-001", "USDT").replace("breakout", strategy) + "\n";
+		byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+		TrackingInputStream input = new TrackingInputStream(bytes);
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, bytes.length - 1, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void stopsReadingLargeSingleRecordAtByteLimit() {
+		String content = HEADER + "\n" + validRow("trade-001", "USDT")
+				.replace("breakout", "가".repeat(20_000)) + "\n";
+		TrackingInputStream input = new TrackingInputStream(content.getBytes(StandardCharsets.UTF_8));
+		int limit = 10_000;
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, limit, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.bytesRead).isEqualTo(limit + 1);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamWhenLimitIsExceededWhileReadingHeader() {
+		TrackingInputStream input = new TrackingInputStream(HEADER.getBytes(StandardCharsets.UTF_8));
+		CsvTradeJournalReader reader = new CsvTradeJournalReader(journalRoot, 10, 10);
+
+		assertJournalError(() -> reader.read(input, "growing"),
+				CsvJournalErrorCode.FILE_TOO_LARGE, null, null);
+		assertThat(input.bytesRead).isEqualTo(11);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamOnInvalidHeader() {
+		TrackingInputStream input = new TrackingInputStream("invalid\n".getBytes(StandardCharsets.UTF_8));
+
+		assertJournalError(() -> new CsvTradeJournalReader(journalRoot).read(input, "invalid"),
+				CsvJournalErrorCode.INVALID_HEADER, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void closesStreamOnReadFailure() {
+		TrackingInputStream input = new TrackingInputStream(new byte[0]) {
+			@Override
+			public int read(byte[] bytes, int offset, int length) throws IOException {
+				throw new IOException("read failed");
+			}
+		};
+
+		assertJournalError(() -> new CsvTradeJournalReader(journalRoot).read(input, "unreadable"),
+				CsvJournalErrorCode.JOURNAL_READ_FAILED, null, null);
+		assertThat(input.closed).isTrue();
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void discardsReadAndCloseFailuresDuringHeaderOrRecordParsing(boolean afterHeader) {
+		String marker = "synthetic-read-failure-j7k1";
+		String readMessage = marker + " " + journalRoot.resolve("source.csv");
+		String closeMessage = "synthetic-read-close-s4d6 " + journalRoot.resolve("source.csv");
+		TrackingInputStream input = new TrackingInputStream(
+				(afterHeader ? HEADER + "\n" : "").getBytes(StandardCharsets.UTF_8)) {
+			@Override
+			public int read(byte[] bytes, int offset, int length) throws IOException {
+				int count = super.read(bytes, offset, length);
+				if (count == -1) {
+					throw new IOException(readMessage);
+				}
+				return count;
+			}
+
+			@Override
+			public void close() throws IOException {
+				super.close();
+				throw new IOException(closeMessage);
+			}
+		};
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read(input, "unreadable"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.JOURNAL_READ_FAILED);
+					assertThat(exception).hasMessage("journal could not be read: unreadable");
+					assertSafeExceptionGraph(exception, marker, readMessage, closeMessage, journalRoot.toString());
+				});
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void reportsCloseFailureAfterSuccessfulParsingWithoutRetainingOriginalException() {
+		String closeMessage = "synthetic-success-close-a9e3 " + journalRoot.resolve("source.csv");
+		TrackingInputStream input = closeFailingInput(
+				HEADER + "\n" + validRow("trade-001", "USDT") + "\n", closeMessage);
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(journalRoot).read(input, "close-failure"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.JOURNAL_READ_FAILED);
+					assertThat(exception).hasMessage("journal could not be read: close-failure");
+					assertSafeExceptionGraph(exception, closeMessage, journalRoot.toString());
+				});
+		assertThat(input.closed).isTrue();
+	}
+
+	@Test
+	void reportsMissingRootWithoutRetainingFilesystemException() {
+		String marker = "synthetic-missing-root-h5w7";
+		Path missingRoot = journalRoot.resolve(marker);
+		assertThat(missingRoot).doesNotExist();
+
+		assertThatThrownBy(() -> new CsvTradeJournalReader(missingRoot).read("sample-trades"))
+				.isInstanceOfSatisfying(CsvJournalException.class, exception -> {
+					assertThat(exception.code()).isEqualTo(CsvJournalErrorCode.JOURNAL_READ_FAILED);
+					assertThat(exception).hasMessage("journal could not be read: sample-trades");
+					assertSafeExceptionGraph(exception, marker, missingRoot.toString(), journalRoot.toString());
+				});
+	}
+
+	@ParameterizedTest
 	@NullSource
 	@ValueSource(strings = {"", "../private", "/tmp/trades", "trades.csv", "with space"})
 	void rejectsUnsafeJournalName(String journalName) {
@@ -215,6 +459,35 @@ class CsvTradeJournalReaderTest {
 				+ "2026-07-01T01:00:00Z,2026-07-01T03:00:00Z,breakout";
 	}
 
+	private static TrackingInputStream closeFailingInput(String content, String closeMessage) {
+		return new TrackingInputStream(content.getBytes(StandardCharsets.UTF_8)) {
+			@Override
+			public void close() throws IOException {
+				super.close();
+				throw new IOException(closeMessage);
+			}
+		};
+	}
+
+	private static void assertSafeExceptionGraph(Throwable failure, String... sensitiveValues) {
+		Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+		ArrayDeque<Throwable> pending = new ArrayDeque<>();
+		pending.add(failure);
+		while (!pending.isEmpty()) {
+			Throwable current = pending.removeFirst();
+			if (!visited.add(current)) {
+				continue;
+			}
+			assertThat(current.toString()).doesNotContain(sensitiveValues);
+			if (current.getCause() != null) {
+				pending.add(current.getCause());
+			}
+			Collections.addAll(pending, current.getSuppressed());
+		}
+		assertThat(failure.getCause()).isNull();
+		assertThat(failure.getSuppressed()).isEmpty();
+	}
+
 	private static void assertJournalError(
 			ThrowingOperation operation,
 			CsvJournalErrorCode expectedCode,
@@ -242,5 +515,39 @@ class CsvTradeJournalReaderTest {
 	private interface ThrowingOperation {
 
 		void run() throws Exception;
+	}
+
+	private static class TrackingInputStream extends InputStream {
+
+		private final ByteArrayInputStream input;
+		private int bytesRead;
+		private boolean closed;
+
+		private TrackingInputStream(byte[] bytes) {
+			input = new ByteArrayInputStream(bytes);
+		}
+
+		@Override
+		public int read() {
+			int value = input.read();
+			if (value != -1) {
+				bytesRead++;
+			}
+			return value;
+		}
+
+		@Override
+		public int read(byte[] bytes, int offset, int length) throws IOException {
+			int count = input.read(bytes, offset, length);
+			if (count > 0) {
+				bytesRead += count;
+			}
+			return count;
+		}
+
+		@Override
+		public void close() throws IOException {
+			closed = true;
+		}
 	}
 }

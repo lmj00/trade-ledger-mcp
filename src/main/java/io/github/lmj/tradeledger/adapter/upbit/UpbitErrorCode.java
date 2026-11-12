@@ -1,0 +1,23 @@
+package io.github.lmj.tradeledger.adapter.upbit;
+
+/** Safe categories; exchange messages and credentials are never included. */
+public enum UpbitErrorCode {
+	INVALID_UUID,
+	MISSING_CREDENTIALS,
+	SIGNING_FAILED,
+	UNSAFE_TRANSPORT_CONFIGURATION,
+	BAD_REQUEST,
+	AUTHENTICATION_FAILED,
+	PERMISSION_DENIED,
+	ORDER_NOT_FOUND,
+	IP_BLOCKED,
+	RATE_LIMITED,
+	SERVER_ERROR,
+	REDIRECT_REJECTED,
+	UNEXPECTED_STATUS,
+	NETWORK_ERROR,
+	TIMEOUT,
+	INTERRUPTED,
+	RESPONSE_TOO_LARGE,
+	INVALID_RESPONSE
+}

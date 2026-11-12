@@ -37,4 +37,7 @@ dependencyManagement {
 
 tasks.named('test') {
 	useJUnitPlatform()
+	doFirst {
+		systemProperty 'upbit.test.runtimeClasspath', sourceSets.test.runtimeClasspath.asPath
+	}
 }

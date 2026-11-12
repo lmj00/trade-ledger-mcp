@@ -32,6 +32,8 @@ import org.apache.commons.csv.CSVRecord;
 
 final class CsvTradeMapper {
 
+	private static final int MAX_DECIMAL_LENGTH = 128;
+
 	private static final Pattern PLAIN_DECIMAL = Pattern.compile("[+-]?\\d+(?:\\.\\d+)?");
 
 	Trade map(CSVRecord record, long lineNumber) {
@@ -96,6 +98,9 @@ final class CsvTradeMapper {
 
 	private static BigDecimal decimal(CSVRecord record, String field, long lineNumber) {
 		String value = required(record, field, lineNumber);
+		if (value.length() > MAX_DECIMAL_LENGTH) {
+			throw invalidField(lineNumber, field, "decimal field must not exceed 128 characters", null);
+		}
 		if (!PLAIN_DECIMAL.matcher(value).matches()) {
 			throw invalidField(lineNumber, field, "field must be a plain decimal number", null);
 		}
@@ -117,7 +122,7 @@ final class CsvTradeMapper {
 					lineNumber,
 					field,
 					"field must be an ISO-8601 timestamp with an offset",
-					exception);
+					null);
 		}
 	}
 
@@ -135,7 +140,7 @@ final class CsvTradeMapper {
 					lineNumber,
 					field,
 					"unsupported %s value".formatted(field),
-					exception);
+					null);
 		}
 	}
 

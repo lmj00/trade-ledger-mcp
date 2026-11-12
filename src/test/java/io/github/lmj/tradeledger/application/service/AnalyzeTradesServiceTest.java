@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 
 import io.github.lmj.tradeledger.application.model.TradeAnalysis;
 import io.github.lmj.tradeledger.domain.model.Direction;
@@ -16,6 +17,8 @@ import io.github.lmj.tradeledger.domain.model.Symbol;
 import io.github.lmj.tradeledger.domain.model.Trade;
 import io.github.lmj.tradeledger.domain.service.RealizedPnlCalculator;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class AnalyzeTradesServiceTest {
 
@@ -54,16 +57,23 @@ class AnalyzeTradesServiceTest {
 				.withMessageContaining("index 0");
 	}
 
-	@Test
-	void rejectsDuplicateTradeIds() {
-		List<Trade> trades = List.of(
-				trade("duplicate", Direction.LONG, "100", "120", "1", "1", "USD"),
-				trade("duplicate", Direction.LONG, "100", "120", "1", "1", "USD"));
+	@ParameterizedTest
+	@ValueSource(ints = {1, 2})
+	void rejectsDuplicateTradeIdsWithoutExposingInput(int duplicateIndex) {
+		String marker = "synthetic-id-b8r2";
+		Trade first = trade(marker, Direction.LONG, "100", "120", "1", "1", "USD");
+		Trade other = trade("trade-2", Direction.LONG, "100", "120", "1", "1", "USD");
+		Trade repeated = trade(marker, Direction.SHORT, "120", "100", "2", "1", "USD");
+		List<Trade> trades = duplicateIndex == 1
+				? List.of(first, repeated, other) : List.of(first, other, repeated);
 
 		assertThatIllegalArgumentException()
 				.isThrownBy(() -> service.analyze(trades))
 				.withMessageContaining("unique")
-				.withMessageContaining("duplicate");
+				.withMessageContaining("index " + duplicateIndex)
+				.withMessageNotContaining(marker)
+				.withMessageNotContaining(marker.toUpperCase(Locale.ROOT))
+				.withNoCause();
 	}
 
 	@Test

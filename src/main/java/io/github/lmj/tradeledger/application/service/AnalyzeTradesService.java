@@ -44,7 +44,7 @@ public final class AnalyzeTradesService {
 		for (int index = 0; index < trades.size(); index++) {
 			Trade trade = requireTrade(trades.get(index), index);
 			if (!tradeIds.add(trade.tradeId())) {
-				throw new IllegalArgumentException("trade IDs must be unique: " + trade.tradeId());
+				throw new IllegalArgumentException("trade IDs must be unique: trade at index " + index);
 			}
 			if (!currency.equals(trade.entryPrice().currency())) {
 				throw new IllegalArgumentException("all trades must use the same currency");
