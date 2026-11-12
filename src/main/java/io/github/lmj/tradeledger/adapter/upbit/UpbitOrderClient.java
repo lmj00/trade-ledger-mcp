@@ -136,7 +136,11 @@ public final class UpbitOrderClient {
 				throw new UpbitApiException(statusCode(received.statusCode(), json));
 			}
 			try {
-				return mapper.map(json);
+				OrderExecutionSnapshot snapshot = mapper.map(json);
+				if (!UUID.matcher(snapshot.orderId()).matches() || !uuid.equalsIgnoreCase(snapshot.orderId())) {
+					throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);
+				}
+				return snapshot;
 			}
 			catch (RuntimeException exception) {
 				throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);

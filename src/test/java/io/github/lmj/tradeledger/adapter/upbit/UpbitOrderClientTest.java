@@ -32,10 +32,14 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class UpbitOrderClientTest {
 
 	private static final String ID = "123e4567-e89b-12d3-a456-426614174000";
+	private static final String UPPER_ID = "123E4567-E89B-12D3-A456-426614174000";
 	private static final String BODY_MARKER = "private-response-marker";
 	private static final String DISABLE_RETRY = "jdk.httpclient.disableRetryConnect";
 	private static final String RETRY_LIMIT = "jdk.httpclient.redirects.retrylimit";
@@ -269,6 +273,71 @@ class UpbitOrderClientTest {
 		}
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"123e4567-e89b-12d3-a456-426614174001", "1-1-1-1-1",
+			"123e4567-e89b-12d3-a456-42661417400", "123e4567e89b12d3a456426614174000",
+			"123e4567-e89b-12d3-g456-426614174000", " " + ID, ID + " ",
+			"123e4567-e89b-12d3-a456-426614174 00"})
+	void rejectsMismatchedOrNoncanonicalResponseIdsWithoutLeakingData(String responseId) throws Exception {
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			String body = ORDER.replace(ID, responseId).replace("\"market\":",
+					"\"private\":\"" + BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET
+							+ token + "\",\"market\":");
+			reply(exchange, 200, body);
+		})) {
+			UpbitOrderClient client = server.client();
+			expect(UpbitErrorCode.INVALID_RESPONSE, () -> client.getOrder(ID), tokens, responseId);
+			assertThat(requests).containsExactly("GET /v1/order?uuid=" + ID);
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({ID + "," + ID, ID + "," + UPPER_ID, UPPER_ID + "," + ID, UPPER_ID + "," + UPPER_ID})
+	void acceptsMatchingResponseIdsAndPreservesAmountsAndFills(String requestId, String responseId) throws Exception {
+		String body = """
+				{"uuid":"%s","market":"KRW-BTC","side":"bid","ord_type":"limit","state":"done",
+				"created_at":"2026-07-01T01:00:00Z","executed_volume":"0.0000000000000000000200",
+				"paid_fee":"0.0000000000000000000100","trades":[
+				{"uuid":"fill-1","market":"KRW-BTC","side":"bid","price":"123.456789012345678901234567890",
+				"volume":"0.0000000000000000000100","funds":"0.0000000000000000012345678900",
+				"created_at":"2026-07-01T01:00:00Z"},
+				{"uuid":"fill-2","market":"KRW-BTC","side":"bid","price":"234.567890123456789012345678900",
+				"volume":"0.0000000000000000000100","funds":"0.0000000000000000023456789000",
+				"created_at":"2026-07-01T01:00:00Z"}]}
+				""".formatted(responseId);
+		List<String> requests = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			reply(exchange, 200, body);
+		})) {
+			var snapshot = server.client().getOrder(requestId);
+			assertThat(snapshot.orderId()).isEqualTo(responseId);
+			assertThat(snapshot.executedVolume()).isEqualTo("0.0000000000000000000200");
+			assertThat(snapshot.paidFee()).isEqualTo("0.0000000000000000000100");
+			assertThat(snapshot.feeCurrency()).isEmpty();
+			assertThat(snapshot.trades()).hasSize(2);
+			var first = snapshot.trades().getFirst();
+			assertThat(first.tradeId()).isEqualTo("fill-1");
+			assertThat(first.market()).isEqualTo("KRW-BTC");
+			assertThat(first.side()).isEqualTo("bid");
+			assertThat(first.price()).isEqualTo("123.456789012345678901234567890");
+			assertThat(first.volume()).isEqualTo("0.0000000000000000000100");
+			assertThat(first.funds()).isEqualTo("0.0000000000000000012345678900");
+			assertThat(first.createdAt()).isEqualTo(snapshot.createdAt());
+			var second = snapshot.trades().get(1);
+			assertThat(second.tradeId()).isEqualTo("fill-2");
+			assertThat(second.price()).isEqualTo("234.567890123456789012345678900");
+			assertThat(second.volume()).isEqualTo("0.0000000000000000000100");
+			assertThat(second.funds()).isEqualTo("0.0000000000000000023456789000");
+			assertThat(requests).containsExactly("GET /v1/order?uuid=" + requestId);
+		}
+	}
+
 	@Test
 	void rejectsNoncanonicalIdsAndMissingKeysBeforeAnyHttpRequest() throws Exception {
 		AtomicInteger requests = new AtomicInteger();
@@ -461,7 +530,7 @@ class UpbitOrderClientTest {
 		expect(code, action, List.of());
 	}
 
-	private static void expect(UpbitErrorCode code, Runnable action, List<String> tokens) {
+	private static void expect(UpbitErrorCode code, Runnable action, List<String> tokens, String... responseIds) {
 		assertThatThrownBy(action::run).isInstanceOfSatisfying(UpbitApiException.class, exception -> {
 			assertThat(exception.code()).isEqualTo(code);
 			assertThat(exception.getCause()).isNull();
@@ -470,6 +539,9 @@ class UpbitOrderClientTest {
 			exception.printStackTrace(new PrintWriter(trace));
 			assertThat(exception.getMessage() + exception + trace)
 					.doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET, BODY_MARKER);
+			if (responseIds.length > 0) {
+				assertThat(exception.getMessage() + exception + trace).doesNotContain(responseIds);
+			}
 			for (String token : tokens) {
 				assertThat(trace.toString()).doesNotContain(token, token.substring(7));
 			}
