@@ -1,8 +1,8 @@
 # trade-ledger-mcp
 
-완결된 거래의 실현 손익을 계산하고 업비트 주문·바이낸스 현물 체결을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`, 종료 주문 요약을 조회하는 `get_upbit_closed_orders`, 바이낸스 단일 symbol 최근 체결을 조회하는 `get_binance_account_trades`, 업비트 단건 주문을 공통 체결 형식으로 조회하는 `get_upbit_order_executions`, 바이낸스 최근·필터 체결을 공통 형식으로 조회하는 `get_binance_account_executions`를 제공합니다. 등록 도구는 이 일곱 개이며 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
+완결된 거래의 실현 손익을 계산하고 업비트 주문·바이낸스 현물 체결·토스 주문 요약을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`, 종료 주문 요약을 조회하는 `get_upbit_closed_orders`, 바이낸스 단일 symbol 최근 체결을 조회하는 `get_binance_account_trades`, 업비트 단건 주문을 공통 체결 형식으로 조회하는 `get_upbit_order_executions`, 바이낸스 최근·필터 체결을 공통 형식으로 조회하는 `get_binance_account_executions`, 토스 단건 주문·누적 체결 요약을 조회하는 `get_toss_order`를 제공합니다. 등록 도구는 이 여덟 개이며 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
 
-두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. `get_binance_account_executions`는 선택적 문자열 `fromId`·`startTime`·`endTime`·`orderId` 필터를 받고 `RECENT_SYMBOL`과 `FILTERED_SYMBOL`을 구분합니다. 업비트 종료 주문의 시작·종료 시간 경계는 각각 독립적으로 지정할 수 있습니다. 토스증권은 공식 단건 주문 계약에 따른 요청·누적 체결 요약 모델, 제한된 JSON 매퍼와 읽기 전용 HTTP 클라이언트를 구현했습니다. Spring 빈·MCP는 미등록이며 실계정·조회 전용 권한 분리는 미검증입니다.
+두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. `get_binance_account_executions`는 선택적 문자열 `fromId`·`startTime`·`endTime`·`orderId` 필터를 받고 `RECENT_SYMBOL`과 `FILTERED_SYMBOL`을 구분합니다. 업비트 종료 주문의 시작·종료 시간 경계는 각각 독립적으로 지정할 수 있습니다. 토스증권은 기존 요청·누적 체결 요약 모델·매퍼·읽기 전용 HTTP 클라이언트를 지연 Spring 빈과 MCP에 연결합니다. 실계정·조회 전용 권한 분리는 미검증입니다.
 
 ## 설치·빌드·실행
 
@@ -98,7 +98,7 @@ trade-001,BTC-USDT,CRYPTO,LONG,0.1234,60000.25,62000.75,5.37,USDT,2026-07-01T01:
 
 ## MCP 도구 입력·출력 예시
 
-일곱 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**입니다. 계산 도구의 건수는 정수이고 종료 주문의 `tradesCount`와 바이낸스의 `id`·`orderId`·`orderListId`는 큰 정수의 정밀도를 보존하는 십진 문자열입니다.
+여덟 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**입니다. 계산 도구의 건수는 정수이고 종료 주문의 `tradesCount`와 바이낸스의 `id`·`orderId`·`orderListId`는 큰 정수의 정밀도를 보존하는 십진 문자열입니다.
 
 ### `summarize_journal`
 
@@ -424,7 +424,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 [Binance 공식 Account trade list](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/account)는 `orderId` 단독 및 `orderId`+`fromId`, 시간 경계의 단독·동시 조합, 최대 24시간 간격, `fromId` 하한과 기본 limit 500·최대 1000을 명시합니다(2026-11-13 확인). [General REST API Information](https://developers.binance.com/en/docs/products/spot/rest-api)은 필터 생략 시 최근 항목, 시작 경계부터 오래된 순서, 종료 경계까지 최근 항목, 두 경계 안의 조회 동작 및 기본 응답 시각 단위가 밀리초임을 설명합니다(2026-11-13 확인). 공식 API의 시간 입력은 밀리초·마이크로초를 지원하지만, **이 프로젝트는 정규 ASCII 십진 문자열·비음수 int64·밀리초 전용 입력을 정책으로 제한합니다.** 마이크로초 단위 선택이나 자동 단위 추정·변환은 제공하지 않습니다. `get_binance_account_executions`도 같은 네 필터를 받으며 필터 생략 시 `RECENT_SYMBOL`, 지정 시 `FILTERED_SYMBOL`을 반환합니다. 추가 조회나 측정하지 않은 성능 개선을 주장하지 않습니다. **실계정 동작은 미검증입니다.**
 
-`TradeLedgerMcpApplicationTests.binanceSchemaExposesOnlyAliasSymbolAndOptionalLimitAndFiltersWithStringIds`와 `BinanceAccountTradesToolsTest`는 입력 키가 정확히 `accountAlias`·`symbol`·`limit`·`fromId`·`startTime`·`endTime`·`orderId`인지 검사합니다. 네 필터의 문자열 자료형과 필수 인자가 `accountAlias`·`symbol`뿐인지 검증하며 일곱 도구·출력·등록 힌트도 검사합니다. 요청·매퍼·로컬 HTTP·등록 핸들러 테스트는 주문 필터의 허용 조합, 잘못된 입력, 큰 정수, 원시 쿼리 HMAC·단일 GET, 주문 불일치와 범위 위반의 전체 실패를 포함합니다.
+`TradeLedgerMcpApplicationTests.binanceSchemaExposesOnlyAliasSymbolAndOptionalLimitAndFiltersWithStringIds`와 `BinanceAccountTradesToolsTest`는 입력 키가 정확히 `accountAlias`·`symbol`·`limit`·`fromId`·`startTime`·`endTime`·`orderId`인지 검사합니다. 네 필터의 문자열 자료형과 필수 인자가 `accountAlias`·`symbol`뿐인지 검증하며 여덟 도구·출력·등록 힌트도 검사합니다. 요청·매퍼·로컬 HTTP·등록 핸들러 테스트는 주문 필터의 허용 조합, 잘못된 입력, 큰 정수, 원시 쿼리 HMAC·단일 GET, 주문 불일치와 범위 위반의 전체 실패를 포함합니다.
 
 유효 요청은 기존 `getAccountTrades`를 한 번 호출하고 GET을 정확히 한 번 전송합니다. 오류에 따른 추가 조회·자동 재시도는 없습니다. 키 누락·설정 거부·인증·보안 제한·418·429·5xx·리다이렉트·네트워크·시간 초과·본문 초과·손상 JSON은 기존 `BinanceErrorCode` 범주만 노출합니다. `-1021`은 `INVALID_TIMESTAMP`, `-1022`는 `INVALID_SIGNATURE`, `-2014`는 `INVALID_API_KEY_FORMAT`, `-2015`는 `KEY_IP_OR_PERMISSION_REJECTED`이며 **-2015의 원인을 키·IP·권한 중 하나로 단정하지 않습니다.** 안전한 범주가 없는 초기화 또는 예상 밖 오류는 원인 없는 `INTERNAL_ERROR`로 처리합니다.
 
@@ -480,7 +480,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 응답 항목이 `fromId` 하한·시간 경계·`orderId`와 맞지 않으면 첫 항목 또는 정상 항목 뒤에 있더라도 기존 매퍼가 전체를 `INVALID_RESPONSE`로 거부합니다. 등록 핸들러는 `isError=true`이고 부분 `structuredContent`는 없습니다. 회귀 테스트는 등록 스키마·필터 조합·큰 ID·시간 경계·원시 쿼리 HMAC·단일 GET·안전한 오류와 로그·순수 변환의 범위 및 null 계약을 포함합니다. 실계정은 미검증입니다.
 
-기존 환경 키와 두 JVM 시작 옵션이 그대로 필요하며 HTTP 진단 로깅 거부 정책도 같습니다. 키·시작 옵션 없이 서버 시작과 계산 도구 호출은 가능하고 두 거래소 클라이언트의 지연 생성도 유지합니다. 키 누락·설정 거부·인증·보안·호출 제한·서버·네트워크·시간 초과·본문 초과·손상 응답·초기화 실패는 기존 안전한 Binance 오류 범주로만 반환하며 추가 전송은 없습니다. 예상 밖 변환 실패는 원인 없는 `INTERNAL_ERROR`로 처리하고 응답 원문이나 원인 예외는 노출하지 않습니다. 실계정은 미검증입니다.
+기존 환경 키와 두 JVM 시작 옵션이 그대로 필요하며 HTTP 진단 로깅 거부 정책도 같습니다. 키·시작 옵션 없이 서버 시작과 계산 도구 호출은 가능하고 세 거래소 클라이언트의 지연 생성도 유지합니다. 키 누락·설정 거부·인증·보안·호출 제한·서버·네트워크·시간 초과·본문 초과·손상 응답·초기화 실패는 기존 안전한 Binance 오류 범주로만 반환하며 추가 전송은 없습니다. 예상 밖 변환 실패는 원인 없는 `INTERNAL_ERROR`로 처리하고 응답 원문이나 원인 예외는 노출하지 않습니다. 실계정은 미검증입니다.
 
 ## 내부 공통 체결 변환
 
@@ -502,13 +502,13 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 ## 서비스별 상태와 다음 확인 자료
 
-업비트의 단건 주문·종료 주문 요약과 바이낸스의 단일 symbol 최근 체결은 어댑터·MCP 연결이 소스에 반영되어 있습니다. 공식 규격 근거, 구현, 모의 테스트, 실계정 대조는 서로 다른 상태입니다. 토스증권은 **공식 단건 상세 계약 확보·요약 모델과 매퍼·제한된 HTTP 클라이언트 구현·Spring 및 MCP 미등록·실계정 미검증** 단계입니다.
+업비트의 단건 주문·종료 주문 요약, 바이낸스의 단일 symbol 최근 체결과 토스증권의 단건 주문·누적 체결 요약은 어댑터·MCP 연결이 소스에 반영되어 있습니다. 공식 규격 근거, 구현, 모의 테스트, 실계정 대조는 서로 다른 상태입니다. 토스증권의 실계정·조회 전용 권한 분리는 미검증입니다.
 
 | 서비스 | 공식 방식 확인 | 어댑터 구현 | 서비스 모의 검증 | 실제 연동 검증 | 다음 확인에 필요한 공식 문서·비식별 파일 예시 |
 | --- | --- | --- | --- | --- | --- |
 | 업비트 | 단건·종료 주문 조회·인증·호출 제한 공식 규격 참조. 종료 주문의 단독 경계와 7일 기본 동작 안내 | 두 조회 경로와 MCP 연결 반영. 매수·매도 매칭·실현손익 미구현 | 어댑터·등록 MCP 핸들러 모의 테스트 존재 | 미검증 | 최신 공식 주문조회 권한·default 공유 한도 확인, 조회 전용 실계정 원본과 UUID·종료 주문 요약·체결·주문 수수료 대조. 페이지 규격과 수수료 통화·시간대가 보존된 비식별 분할 체결 예시 |
 | 바이낸스 | 현물 계정 체결 규격·공식 문서 참조 | 단일 symbol의 거래소별·공통 체결 MCP 응답, 문자열 ID·금액, 지연 생성과 종료 연결 반영 | 두 등록 핸들러의 입력·단일 전송·안전한 오류와 공통 응답 회귀 테스트 존재 | 미검증 | 현물 규격·조회 전용 권한·서명·HTTP 오류 계약을 모의 결과와 대조하고 MCP 연결 검토. 파생상품·파일 내보내기 방식은 별도 확인, 수수료 자산·시간대·부분 청산 예시 필요 |
-| 토스증권 | 공식 OpenAPI 1.2.28의 단건 주문·누적 체결 요약 계약 확보 | 요청·요약 모델·매퍼와 고정 단건 HTTP 클라이언트 구현. Spring·MCP 미등록 | 합성 모델·매퍼, 로컬 HTTP·독립 JVM 테스트 존재 | 실계정·조회 전용 권한 분리 미검증 | 아래 단건 계약·운영 설정·남은 확인 참조. 실제 개별 체결·결제 내역 및 비용 귀속은 별도 대조 필요 |
+| 토스증권 | 공식 OpenAPI 1.2.28의 단건 주문·누적 체결 요약 계약 확보 | 요청·요약 모델·매퍼와 고정 단건 HTTP 클라이언트, 지연 Spring 빈·종료·MCP 연결 반영 | 합성 모델·매퍼, 로컬 HTTP·등록 핸들러·독립 JVM 테스트 존재 | 실계정·조회 전용 권한 분리 미검증 | 아래 단건 계약·운영 설정·남은 확인 참조. 실제 개별 체결·결제 내역 및 비용 귀속은 별도 대조 필요 |
 
 ### 토스증권 단건 주문 요약 계약
 
@@ -548,7 +548,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 ### 토스 HTTP 운영 설정과 제한
 
-클라이언트를 직접 사용하는 애플리케이션은 실행 환경의 비밀정보 설정 기능으로 다음 값을 프로세스 환경에 전달합니다. 외부에서 발급한 토큰의 준비·유효성 관리·교체는 운영자의 책임입니다. 클라이언트는 토큰 발급·갱신이나 계좌 목록 조회를 수행하지 않습니다. 비밀값을 소스·예시 파일·명령행·조회 인자에 넣지 않습니다.
+서버 실행 환경의 비밀정보 설정 기능으로 다음 값을 프로세스 환경에 전달합니다. 외부에서 발급한 토큰의 준비·유효성 관리·교체는 운영자의 책임입니다. 클라이언트는 토큰 발급·갱신이나 계좌 목록 조회를 수행하지 않습니다. 비밀값을 소스·예시 파일·명령행·조회 인자에 넣지 않습니다.
 
 | 환경변수 | 전송 및 프로젝트 검증 정책 |
 | --- | --- |
@@ -559,16 +559,57 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 위 실행 예시와 같이 **JVM 시작부터** `-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1`을 모두 지정해야 합니다. 클라이언트 생성 전, 유효 요청의 환경 조회 전, 전송 직전에 시작 인자와 현재 속성을 검사합니다. 옵션 누락·오류·충돌은 `UNSAFE_TRANSPORT_CONFIGURATION`이며 늦은 `System.setProperty()`로 대체할 수 없습니다. `jdk.httpclient.HttpClient.log`는 프로세스 수명 동안 미설정 또는 빈 값이어야 합니다. 비어 있지 않은 시작 설정은 이후 삭제해도 거부하며, 비어 있지 않은 현재 설정도 거부합니다. 검사 사이의 임의 동시 속성 변경까지 방지하지 않으므로 실행 중 이 설정을 변경하지 않아야 합니다.
 
-연결 제한은 **3초**, 본문 완료까지 요청 전체 제한은 **10초**, 실제 수신 본문 상한은 **1 MiB(1,048,576바이트)**입니다. 고정 길이·chunked 본문 모두 상한 초과 시 부분 반환 없이 `RESPONSE_TOO_LARGE`로 실패하며, 지연·끝나지 않는 본문은 `TIMEOUT`으로 종료합니다. 잘못된 UTF-8 또는 매퍼가 거부한 성공 JSON은 `INVALID_RESPONSE`입니다. 리다이렉트·자동 재시도·추가 조회·페이지 순회는 없습니다. 대기를 중단하면 구독과 미완료 요청을 취소하고 인터럽트 플래그를 보존합니다. 클라이언트 소유자는 try-with-resources 또는 `close()`로 연결과 작업 자원을 종료해야 합니다. Spring 종료 관리에는 아직 연결하지 않았습니다.
+연결 제한은 **3초**, 본문 완료까지 요청 전체 제한은 **10초**, 실제 수신 본문 상한은 **1 MiB(1,048,576바이트)**입니다. 고정 길이·chunked 본문 모두 상한 초과 시 부분 반환 없이 `RESPONSE_TOO_LARGE`로 실패하며, 지연·끝나지 않는 본문은 `TIMEOUT`으로 종료합니다. 잘못된 UTF-8 또는 매퍼가 거부한 성공 JSON은 `INVALID_RESPONSE`입니다. 리다이렉트·자동 재시도·추가 조회·페이지 순회는 없습니다. 대기를 중단하면 구독과 미완료 요청을 취소하고 인터럽트 플래그를 보존합니다. Spring은 생성된 토스 클라이언트의 `close()`를 컨텍스트 종료 시 호출하여 소유 HTTP 연결과 작업 자원을 종료합니다. 클라이언트를 직접 사용하는 소유자는 try-with-resources 또는 `close()`로 종료해야 합니다.
 
 HTTP 400·401·403·404·429는 각각 `BAD_REQUEST`·`AUTHENTICATION_FAILED`·`PERMISSION_DENIED`·`ORDER_NOT_FOUND`·`RATE_LIMITED`, 3xx는 `REDIRECT_REJECTED`, 5xx는 `SERVER_ERROR`, 나머지 비정상 상태는 `UNEXPECTED_STATUS`입니다. 비정상 상태의 본문을 파싱하거나 헤더 메시지로 원인을 추정하지 않습니다. 네트워크·시간초과·인터럽트는 `NETWORK_ERROR`·`TIMEOUT`·`INTERRUPTED`로 구분합니다. [TossApiException](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossApiException.java)은 `Toss request failed: <범주>`만 전달하며 원문·인증정보·주문 ID·파서 진단·cause·suppressed 예외를 남기지 않습니다.
 
 [TossOrderClientTest](src/test/java/io/github/lmj/tradeledger/adapter/toss/TossOrderClientTest.java)는 로컬 합성 응답으로 국내 완료·해외 부분 체결·무체결 거부·체결이 남은 취소 주문을 기존 매퍼까지 연결합니다. raw path·헤더 보존, 환경 검증, 독립 JVM 시작 설정, 본문 제한·시간초과, 최초·재사용 연결의 단일 전송, 인터럽트·취소·자원 종료와 오류·로그 비노출 검사도 포함합니다. 패키지 내부 테스트 주입은 고정 `/api/v1/orders/` 접두 경로와 리터럴 loopback HTTP(`127.0.0.1` 또는 `[::1]`)만 허용하며 userinfo·query·fragment·다른 호스트·경로를 거부합니다. 이 테스트의 존재는 실행 통과나 실계정 검증을 뜻하지 않습니다.
 
-### MCP 연결 전 남은 확인
+### `get_toss_order`: 지연 생성과 누적 체결 요약
 
-현재 구현은 **요청 검증 → 프로세스 환경의 외부 발급 토큰·계좌 설정 → 고정 HTTPS 단건 GET → 제한된 UTF-8 응답 → 기존 매퍼 → 불변 주문 요약**까지입니다. Spring 빈·지연 생성·MCP 도구 등록은 후속 작업이며 환경변수만 설정해도 토스 MCP 도구가 생기지는 않습니다. 등록 도구는 기존 일곱 개이며 실계정·이용 자격·조회 전용 권한 분리는 미검증입니다.
+여덟 번째 도구의 입력은 필수 문자열 `orderId` 하나입니다. 토큰·계좌·호스트·URL 인자는 받지 않습니다. `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=true`와 출력 스키마를 제공합니다. 비밀값 없는 합성 요청 예시입니다.
 
-MCP 연결 전 조회 전용 권한 분리, 허용 계좌·시장, 오류·호출 예산 및 실제 주문 요약과 수수료·세금의 의미를 공식 계약 및 비식별 표본으로 대조해야 합니다. 단일 전송, 재시도·리다이렉트 금지, 진단 로깅 거부, 비밀정보 보호, 응답 크기·시간 제한과 자원 종료 경계를 보존해야 합니다. 페이지 반복·기간 분할·자동 토큰 재발급은 별도 범위입니다.
+```json
+{"name":"get_toss_order","arguments":{"orderId":"example-order-1"}}
+```
+
+```json
+{
+  "serviceId": "toss",
+  "orderId": "example-order-1",
+  "symbol": "005930",
+  "side": "BUY",
+  "orderType": "LIMIT",
+  "timeInForce": "DAY",
+  "status": "CANCELED",
+  "price": "70000.00",
+  "quantity": "10.00",
+  "orderAmount": null,
+  "currency": "KRW",
+  "orderedAt": "2026-03-28T00:30:00Z",
+  "canceledAt": "2026-03-28T00:32:00Z",
+  "execution": {
+    "filledQuantity": "2.00",
+    "averageFilledPrice": "69999.5000",
+    "filledAmount": "139999.0000",
+    "commission": "140.00",
+    "tax": "0.00",
+    "filledAt": "2026-03-28T00:31:15Z",
+    "settlementDate": "2026-03-30"
+  }
+}
+```
+
+응답 최상위는 `serviceId="toss"`와 기존 주문 요약의 13개 필드이며 `execution`은 위 일곱 필드만 담습니다. 십진 값·후행 0·불투명 ID·미지 코드를 문자열 그대로 보존하고 시각은 UTC 문자열, 결제 예정일은 날짜 문자열로 전달합니다. `price`·`orderAmount`·`canceledAt`와 누적 요약의 nullable 여섯 필드는 명시적 null 및 nullable 출력 스키마를 가집니다. commission과 tax는 분리합니다. 성공 `TextContent`의 JSON과 `structuredContent`는 같은 데이터입니다.
+
+흐름은 **기존 요청 모델 및 UTF-16 선검증 → ObjectProvider로 기존 지연 클라이언트 획득 → getOrder 한 번 → 순수 응답 변환**입니다. 누락·null·공백뿐인 값·제어문자·257 UTF-16 코드 단위 이상·짝이 맞지 않는 surrogate·잘못된 입력 유형은 `Toss request failed: BAD_REQUEST`로 실패하며 클라이언트 생성·환경 조회·전송이 없습니다. 유효 ID의 공백·특수문자·surrogate 쌍은 보존하고 경로 인코딩은 기존 클라이언트가 담당합니다.
+
+키와 시작 옵션 없이도 서버 등록과 두 계산 도구를 사용할 수 있고 토스 클라이언트는 생성되지 않습니다. 첫 유효 조회에서 지연 생성하며, 필수 JVM 옵션 누락이나 진단 로깅 설정은 전송 없이 `Toss request failed: UNSAFE_TRANSPORT_CONFIGURATION`으로 실패합니다. 유효 옵션과 누락 인증정보는 `MISSING_CREDENTIALS`입니다. MCP 경계는 지연 빈 생성에 포장된 오류도 안전한 `Toss request failed: <범주>`로 전달합니다. 알 수 없는 provider·변환 오류는 `INTERNAL_ERROR`이며 원문·원인·suppressed 그래프를 제거합니다. 오류는 `isError=true`이고 부분 `structuredContent`가 없습니다.
+
+[TossOrderResponseTest](src/test/java/io/github/lmj/tradeledger/mcp/TossOrderResponseTest.java)와 [TossOrderToolsTest](src/test/java/io/github/lmj/tradeledger/mcp/TossOrderToolsTest.java)는 국내 완료·해외 부분 체결·무체결·체결이 남은 취소 주문, 입력 경계, 단일 GET·경로 인코딩, 오류와 수집 로그의 비노출, 독립 JVM 지연 생성 및 Spring 종료 회귀 검사를 포함합니다. 기존 최초·재사용 연결 단절의 재전송 금지 검사는 클라이언트 테스트에서 유지합니다.
+
+### 남은 실계정·권한 확인
+
+실계정·이용 자격·조회 전용 권한 분리는 미검증입니다. 허용 계좌·시장, 오류·호출 예산 및 실제 주문 요약과 수수료·세금의 의미를 공식 계약 및 비식별 표본으로 대조해야 합니다. 토큰 발급·갱신, 전체 내역 수집·페이지 반복·기간 분할은 별도 범위입니다.
 
 실제 개별 체결의 안정된 식별자와 비용 귀속, 실제 결제 거래내역·정정 규칙은 요약 모델과 구분해 검토해야 합니다. 비식별 표본은 원본 필드·통화·시각 의미를 유지하되 개인·계좌 식별정보와 비밀값을 제거해야 합니다. 매수·매도 매칭·원가 배분 계약 없이 완결 거래나 손익을 추정하지 않습니다. 파일 내보내기 규격도 별도 확인 대상입니다.
