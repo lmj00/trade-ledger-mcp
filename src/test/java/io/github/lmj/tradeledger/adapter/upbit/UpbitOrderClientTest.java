@@ -415,6 +415,22 @@ class UpbitOrderClientTest {
 	void serializesExclusiveStatesOptionsAndNormalizedTimesWithIndependentQueryHashes() throws Exception {
 		record QueryCase(UpbitClosedOrdersRequest request, String signing, String encoded) { }
 		List<QueryCase> cases = List.of(
+				new QueryCase(new UpbitClosedOrdersRequest(null, null, null,
+						"2026-07-01T10:00:00+09:00", null, null, null),
+						"states[]=done&states[]=cancel&start_time=2026-07-01T01:00:00Z&limit=100&order_by=desc",
+						"states%5B%5D=done&states%5B%5D=cancel&start_time=2026-07-01T01%3A00%3A00Z&limit=100&order_by=desc"),
+				new QueryCase(new UpbitClosedOrdersRequest(null, null, null,
+						"1782867600000", null, null, null),
+						"states[]=done&states[]=cancel&start_time=2026-07-01T01:00:00Z&limit=100&order_by=desc",
+						"states%5B%5D=done&states%5B%5D=cancel&start_time=2026-07-01T01%3A00%3A00Z&limit=100&order_by=desc"),
+				new QueryCase(new UpbitClosedOrdersRequest(null, null, null,
+						null, "2026-07-01T10:00:00+09:00", null, null),
+						"states[]=done&states[]=cancel&end_time=2026-07-01T01:00:00Z&limit=100&order_by=desc",
+						"states%5B%5D=done&states%5B%5D=cancel&end_time=2026-07-01T01%3A00%3A00Z&limit=100&order_by=desc"),
+				new QueryCase(new UpbitClosedOrdersRequest(null, null, null,
+						null, "1782867600000", null, null),
+						"states[]=done&states[]=cancel&end_time=2026-07-01T01:00:00Z&limit=100&order_by=desc",
+						"states%5B%5D=done&states%5B%5D=cancel&end_time=2026-07-01T01%3A00%3A00Z&limit=100&order_by=desc"),
 				new QueryCase(new UpbitClosedOrdersRequest("KRW-BTC", "done", null,
 						"2026-07-01T10:00:00+09:00", "2026-07-08T01:00:00Z", 1, "asc"),
 						"market=KRW-BTC&state=done&start_time=2026-07-01T01:00:00Z"
