@@ -27,7 +27,8 @@ public final class BinanceAccountTradesTools {
 			name = "get_binance_account_trades",
 			title = "Get Binance Spot account trades for one symbol",
 			description = "Read one result of Spot fills for one symbol, default 500 and maximum 1000. "
-					+ "Optional fromId is an inclusive trade ID lower bound; omitted means recent fills. "
+					+ "Optional fromId is an inclusive trade ID lower bound. Optional startTime/endTime are inclusive "
+					+ "millisecond bounds (at most 24 hours apart), incompatible with fromId. Omitted filters mean recent fills. "
 					+ "accountAlias is a non-secret local display label and does not select the authenticated account. "
 					+ "Even short or empty results do not establish complete history. "
 					+ "No pagination, retries, fee conversion, trade matching, PnL, orders or funds movement.",
@@ -45,8 +46,12 @@ public final class BinanceAccountTradesTools {
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
 			Integer limit,
 			@McpToolParam(description = "Optional inclusive trade ID lower bound: canonical decimal string from 0 through 9223372036854775807, without signs, spaces or leading zeroes.", required = false)
-			String fromId) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId);
+			String fromId,
+			@McpToolParam(description = "Optional inclusive start: project policy requires canonical ASCII nonnegative int64 decimal string in milliseconds only; cannot mix with fromId.", required = false)
+			String startTime,
+			@McpToolParam(description = "Optional inclusive end: same project millisecond string policy as startTime; start <= end and span <= 86400000ms when both supplied.", required = false)
+			String endTime) {
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId, startTime, endTime);
 		try {
 			return BinanceAccountTradesResponse.from(client.getObject().getAccountTrades(accountAlias, request));
 		}
@@ -55,7 +60,11 @@ public final class BinanceAccountTradesTools {
 		}
 	}
 
-	/** Preserve existing Java callers; only the four-argument method is registered. */
+	/** Preserve existing Java callers; only the six-argument method is registered. */
+	public BinanceAccountTradesResponse getBinanceAccountTrades(String accountAlias, String symbol, Integer limit, String fromId) {
+		return getBinanceAccountTrades(accountAlias, symbol, limit, fromId, null, null);
+	}
+
 	public BinanceAccountTradesResponse getBinanceAccountTrades(String accountAlias, String symbol, Integer limit) {
 		return getBinanceAccountTrades(accountAlias, symbol, limit, null);
 	}
@@ -80,7 +89,7 @@ public final class BinanceAccountTradesTools {
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
 			Integer limit) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null);
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null, null, null);
 		try {
 			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromBinance(
 					client.getObject().getAccountTrades(accountAlias, request)));
@@ -90,14 +99,14 @@ public final class BinanceAccountTradesTools {
 		}
 	}
 
-	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId) {
+	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId, String startTime, String endTime) {
 		try {
 			// Match the client's alias policy before obtaining the lazy client. The
-			// request model owns symbol/limit/fromId validation for every MCP call too.
+			// request model owns symbol/limit/fromId/time validation for every MCP call too.
 			if (!validAlias(accountAlias)) {
 				throw new IllegalArgumentException();
 			}
-			return new BinanceAccountTradesRequest(symbol, limit == null ? 500 : limit, fromId);
+			return new BinanceAccountTradesRequest(symbol, limit == null ? 500 : limit, fromId, startTime, endTime);
 		}
 		catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Binance request failed: BAD_REQUEST");

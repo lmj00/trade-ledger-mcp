@@ -111,15 +111,16 @@ class BinanceAccountTradesRequestTest {
 		assertThat(Arrays.stream(type.getDeclaredConstructors())
 				.map(constructor -> Arrays.asList(constructor.getParameterTypes())).toList())
 				.containsExactlyInAnyOrder(List.of(String.class), List.of(String.class, int.class),
-						List.of(String.class, int.class, String.class));
+						List.of(String.class, int.class, String.class),
+						List.of(String.class, int.class, String.class, String.class, String.class));
 		assertThat(Arrays.stream(type.getDeclaredFields()).map(field -> field.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit", "fromId");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime");
 		assertThat(Arrays.stream(type.getDeclaredFields())
 				.allMatch(field -> Modifier.isPrivate(field.getModifiers()) && Modifier.isFinal(field.getModifiers())))
 				.isTrue();
 		assertThat(Arrays.stream(type.getDeclaredMethods())
 				.filter(method -> Modifier.isPublic(method.getModifiers())).map(method -> method.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "toQueryString");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime", "toQueryString");
 	}
 
 	@Test
@@ -140,6 +141,42 @@ class BinanceAccountTradesRequestTest {
 		for (String id : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
 				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
 			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 500, id));
+		}
+	}
+
+	@Test
+	void preservesOptionalTimeBoundsAndChecksDurationWithoutOverflow() {
+		for (String value : List.of("0", "9007199254740993", "9223372036854775807")) {
+			for (int mode = 0; mode < 3; mode++) {
+				String start = mode == 1 ? null : value;
+				String end = mode == 0 ? null : value;
+				var request = new BinanceAccountTradesRequest("BTCUSDT", 2, null, start, end);
+				assertThat(request.startTime()).isEqualTo(start == null ? null : Long.valueOf(start));
+				assertThat(request.endTime()).isEqualTo(end == null ? null : Long.valueOf(end));
+				assertThat(request.toQueryString(123)).isEqualTo("symbol=BTCUSDT&limit=2"
+						+ (start == null ? "" : "&startTime=" + start)
+						+ (end == null ? "" : "&endTime=" + end) + "&recvWindow=5000&timestamp=123");
+			}
+		}
+		for (long start : new long[] {0, Long.MAX_VALUE - 86_400_000L}) {
+			assertThat(new BinanceAccountTradesRequest("BTCUSDT", 2, null, Long.toString(start),
+					Long.toString(start + 86_400_000L)).endTime()).isEqualTo(start + 86_400_000L);
+		}
+		for (String[] bounds : new String[][] {{"1", "0"}, {"0", "86400001"},
+				{"0", "9223372036854775807"}, {"9223372036768375806", "9223372036854775807"}}) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, null, bounds[0], bounds[1]));
+		}
+		for (String[] bounds : new String[][] {{"0", null}, {null, "0"}, {"0", "0"}}) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, "0", bounds[0], bounds[1]));
+		}
+	}
+
+	@Test
+	void rejectsMalformedTimeBoundsBeforeParsing() {
+		for (String value : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, null, value, null));
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, null, null, value));
 		}
 	}
 

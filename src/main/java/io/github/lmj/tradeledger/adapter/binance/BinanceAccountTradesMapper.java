@@ -20,7 +20,7 @@ import tools.jackson.databind.json.JsonMapper;
  * Strict, all-or-nothing mapping of a supplied Spot /api/v3/myTrades array.
  * The official account trade list is scoped to one account and symbol, with
  * default limit 500 and maximum 1000. Only a non-secret local account alias,
- * expected symbol, limit, optional inclusive fromId and response JSON are accepted; no network,
+ * expected symbol, limit, optional inclusive fromId/time bounds and response JSON are accepted; no network,
  * authentication, storage, pagination, completed Trade or PnL is implemented.
  *
  * <p>Project policy (not Binance transport limits): at most 1,048,576 UTF-16
@@ -52,18 +52,18 @@ public final class BinanceAccountTradesMapper {
 	}
 
 	public BinanceAccountTradesSnapshot map(String accountAlias, String expectedSymbol, int limit, String json) {
-		return map(accountAlias, expectedSymbol, limit, null, json);
+		return map(accountAlias, expectedSymbol, limit, null, null, null, json);
 	}
 
 	public BinanceAccountTradesSnapshot map(String accountAlias, BinanceAccountTradesRequest request, String json) {
 		if (request == null) {
 			throw invalid();
 		}
-		return map(accountAlias, request.symbol(), request.limit(), request.fromId(), json);
+		return map(accountAlias, request.symbol(), request.limit(), request.fromId(), request.startTime(), request.endTime(), json);
 	}
 
 	private BinanceAccountTradesSnapshot map(String accountAlias, String expectedSymbol, int limit,
-			Long fromId, String json) {
+			Long fromId, Long startTime, Long endTime, String json) {
 		if (!validLabel(accountAlias) || !validLabel(expectedSymbol) || limit < 1 || limit > MAX_TRADES
 				|| json == null || json.length() > MAX_JSON_LENGTH) {
 			throw invalid();
@@ -79,10 +79,14 @@ public final class BinanceAccountTradesMapper {
 				if (!symbol.equals(expectedSymbol) || !ids.add(id) || (fromId != null && id < fromId)) {
 					throw invalid();
 				}
+				long time = integer(node, "time");
+				if ((startTime != null && time < startTime) || (endTime != null && time > endTime)) {
+					throw invalid();
+				}
 				trades.add(new Execution(symbol, id, integer(node, "orderId"), integer(node, "orderListId"),
 						decimal(node, "price"), decimal(node, "qty"), decimal(node, "quoteQty"),
 						decimal(node, "commission"), text(node, "commissionAsset"),
-						Instant.ofEpochMilli(integer(node, "time")), bool(node, "isBuyer"),
+						Instant.ofEpochMilli(time), bool(node, "isBuyer"),
 						bool(node, "isMaker"), bool(node, "isBestMatch")));
 			}
 			return new BinanceAccountTradesSnapshot("binance", accountAlias, expectedSymbol,

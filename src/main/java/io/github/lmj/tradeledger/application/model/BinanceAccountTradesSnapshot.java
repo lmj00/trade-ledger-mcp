@@ -11,7 +11,7 @@ import java.util.Objects;
  * Amount strings retain their original precision and scale; commissionAsset is
  * preserved without fee aggregation, currency inference or conversion.
  *
- * <p>This models one recent or inclusive-fromId result, without automatic
+ * <p>This models one recent, inclusive-fromId or time-filtered result, without automatic
  * pagination, completed trades or PnL. possiblyTruncated means only that the
  * response size equals the requested limit. A short or empty response does not
  * establish that the full account history has been collected.

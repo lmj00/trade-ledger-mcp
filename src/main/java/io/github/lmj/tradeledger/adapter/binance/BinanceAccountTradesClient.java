@@ -49,7 +49,8 @@ import tools.jackson.databind.json.JsonMapper;
  * Project limits: connection 3 seconds, whole body 10 seconds, body 1 MiB.
  * Close this client to release its owned connections and workers.
  *
- * <p>Without fromId the most recent fills are requested; otherwise fromId is inclusive.
+ * <p>Without filters the most recent fills are requested; fromId and time bounds are inclusive.
+ * Time bounds are optional milliseconds, cannot mix with fromId, and span at most 24 hours.
  * One result up to limit (default 500, maximum 1000) is requested. A limit-sized
  * snapshot may be truncated; this is not full history, completed trades or PnL.
  * Live accounts have not been verified.
