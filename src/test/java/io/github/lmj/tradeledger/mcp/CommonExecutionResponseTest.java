@@ -91,6 +91,30 @@ class CommonExecutionResponseTest {
 		}
 	}
 
+	@ParameterizedTest
+	@ValueSource(booleans = {true, false})
+	void bothBinanceScopesSerializeNullOrderAndOriginalTruncationEvenWhenEmpty(boolean truncated) {
+		for (QueryScope scope : List.of(QueryScope.RECENT_SYMBOL, QueryScope.FILTERED_SYMBOL)) {
+			for (boolean empty : List.of(false, true)) {
+				var fill = new Execution("binance", ALIAS, "BTCUSDT", "9007199254740993", "9223372036854775807",
+						Side.BUY, "1.0000", "0.0200", "0.02000000", TIME);
+				var snapshot = new CommonExecutionSnapshot("binance", ALIAS, "BTCUSDT", scope,
+						Optional.empty(), Optional.of(truncated), empty ? List.of() : List.of(fill),
+						empty ? List.of() : List.of(new Fee(FeeScope.FILL, "9007199254740993", "0.0000100", Optional.of("BNB"))));
+				var result = CommonExecutionResponse.from(snapshot);
+				assertThat(result.queryScope()).isEqualTo(scope.name());
+				assertThat(result.orderId()).isNull();
+				assertThat(result.possiblyTruncated()).isEqualTo(truncated);
+				assertThat(result.executions()).hasSize(empty ? 0 : 1);
+				assertThat(result.fees()).hasSize(empty ? 0 : 1);
+				var json = JsonMapper.builder().build().valueToTree(result);
+				assertThat(json.has("orderId")).isTrue();
+				assertThat(json.get("orderId").isNull()).isTrue();
+				assertThat(json.get("possiblyTruncated").asBoolean()).isEqualTo(truncated);
+			}
+		}
+	}
+
 	@Test
 	void rejectsNullSnapshot() {
 		assertThatNullPointerException().isThrownBy(() -> CommonExecutionResponse.from(null));

@@ -96,7 +96,10 @@ class TradeLedgerMcpApplicationTests {
 			input.values().forEach(property -> assertThat(asMap(property)).containsEntry("type", "string"));
 		}
 		else {
-			assertThat(input).containsOnlyKeys("accountAlias", "symbol", "limit");
+			assertThat(input).containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime", "orderId");
+			for (String filter : List.of("fromId", "startTime", "endTime", "orderId")) {
+				assertThat(asMap(input.get(filter))).containsEntry("type", "string");
+			}
 			assertThat(specification.tool().inputSchema().get("required"))
 					.isEqualTo(List.of("accountAlias", "symbol"));
 			assertThat(asMap(input.get("accountAlias"))).containsEntry("type", "string");

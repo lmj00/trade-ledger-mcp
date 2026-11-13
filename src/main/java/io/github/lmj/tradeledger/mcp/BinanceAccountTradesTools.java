@@ -79,8 +79,11 @@ public final class BinanceAccountTradesTools {
 
 	@McpTool(
 			name = "get_binance_account_executions",
-			title = "Get common executions for recent Binance Spot account trades",
-			description = "Read one recent-symbol Spot result as common executions and per-fill fees, default 500 and maximum 1000. "
+			title = "Get common executions for Binance Spot account trades",
+			description = "Read one Spot symbol result as common executions and per-fill fees, default 500 and maximum 1000. "
+					+ "Optional fromId is an inclusive trade ID lower bound. startTime/endTime are inclusive millisecond bounds "
+					+ "at most 24 hours apart, incompatible with fromId or orderId. orderId is allowed alone or with fromId. "
+					+ "Any filter means FILTERED_SYMBOL, including orderId; omitted filters mean RECENT_SYMBOL. "
 					+ "accountAlias is a non-secret local display label, does not select credentials and is not sent to Binance. "
 					+ "Even short or empty results do not establish complete history. "
 					+ "No additional queries, pagination, retries, fee aggregation or conversion, matching, PnL, orders or funds movement.",
@@ -96,15 +99,30 @@ public final class BinanceAccountTradesTools {
 			@McpToolParam(description = "Required single Spot symbol, for example BTCUSDT.", required = true)
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
-			Integer limit) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null, null, null, null);
+			Integer limit,
+			@McpToolParam(description = "Optional inclusive trade ID lower bound: canonical ASCII nonnegative int64 decimal string, without signs, spaces or leading zeroes.", required = false)
+			String fromId,
+			@McpToolParam(description = "Optional inclusive start: canonical ASCII nonnegative int64 millisecond string; cannot mix with fromId or orderId.", required = false)
+			String startTime,
+			@McpToolParam(description = "Optional inclusive end: same millisecond string policy as startTime; start <= end and span <= 86400000ms when both supplied.", required = false)
+			String endTime,
+			@McpToolParam(description = "Optional order ID: canonical ASCII nonnegative int64 decimal string, at most 19 characters; allowed alone or with fromId, never with time bounds. Still a limited symbol list query.", required = false)
+			String orderId) {
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId, startTime, endTime, orderId);
+		CommonExecutionSnapshot.QueryScope scope = fromId != null || startTime != null || endTime != null || orderId != null
+				? CommonExecutionSnapshot.QueryScope.FILTERED_SYMBOL : CommonExecutionSnapshot.QueryScope.RECENT_SYMBOL;
 		try {
 			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromBinance(
-					client.getObject().getAccountTrades(accountAlias, request)));
+					client.getObject().getAccountTrades(accountAlias, request), scope));
 		}
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);
 		}
+	}
+
+	/** Preserve existing Java callers; only the seven-argument method is registered. */
+	public CommonExecutionResponse getBinanceAccountExecutions(String accountAlias, String symbol, Integer limit) {
+		return getBinanceAccountExecutions(accountAlias, symbol, limit, null, null, null, null);
 	}
 
 	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId, String startTime, String endTime, String orderId) {

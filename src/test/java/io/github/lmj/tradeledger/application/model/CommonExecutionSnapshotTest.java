@@ -103,6 +103,45 @@ class CommonExecutionSnapshotTest {
 			assertThat(result.possiblyTruncated()).contains(truncated);
 			assertThat(result.executions()).hasSize(fills.size());
 			assertThat(result.fees()).hasSize(fills.size());
+			for (QueryScope scope : List.of(QueryScope.RECENT_SYMBOL, QueryScope.FILTERED_SYMBOL)) {
+				var scoped = CommonExecutionSnapshot.fromBinance(binance(ALIAS, fills, truncated), scope);
+				assertThat(scoped.queryScope()).isEqualTo(scope);
+				assertThat(scoped.orderId()).isEmpty();
+				assertThat(scoped.possiblyTruncated()).contains(truncated);
+				assertThat(scoped.executions()).isEqualTo(result.executions());
+				assertThat(scoped.fees()).isEqualTo(result.fees());
+			}
+		}
+	}
+
+	@Test
+	void scopedBinanceConversionPreservesExactFillsFeesAndStructuralKeys() {
+		var source = binance(ALIAS, List.of(
+				binanceFill(9_007_199_254_740_993L, Long.MAX_VALUE, true, "bNb"),
+				binanceFill(Long.MAX_VALUE, 9_007_199_254_740_993L, false, "USDT")), true);
+		var recent = CommonExecutionSnapshot.fromBinance(source);
+		var filtered = CommonExecutionSnapshot.fromBinance(source, QueryScope.FILTERED_SYMBOL);
+		assertThat(CommonExecutionSnapshot.fromBinance(source, QueryScope.RECENT_SYMBOL)).isEqualTo(recent);
+		assertThat(filtered.queryScope()).isEqualTo(QueryScope.FILTERED_SYMBOL);
+		assertThat(filtered.executions()).containsExactlyElementsOf(recent.executions());
+		assertThat(filtered.fees()).containsExactlyElementsOf(recent.fees());
+		assertThat(filtered.orderId()).isEmpty();
+		assertThat(filtered.possiblyTruncated()).contains(true);
+		assertThat(filtered.executions().getFirst().key()).isEqualTo(
+				new ExecutionKey("binance", ALIAS, SYMBOL, "9007199254740993"));
+		assertThat(new ExecutionKey("a|b", "c", SYMBOL, "1"))
+				.isNotEqualTo(new ExecutionKey("a", "b|c", SYMBOL, "1"));
+		assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(binance(ALIAS, List.of(
+				binanceFill(1, 2, true, "BNB"), binanceFill(1, 3, false, MARKER)), false), QueryScope.FILTERED_SYMBOL));
+	}
+
+	@Test
+	void scopedBinanceConversionRejectsNullAndSingleOrderScopesSafely() {
+		var source = binance(ALIAS, List.of(), false);
+		assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(source, null));
+		assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(source, QueryScope.SINGLE_ORDER));
+		for (QueryScope scope : List.of(QueryScope.RECENT_SYMBOL, QueryScope.FILTERED_SYMBOL)) {
+			assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(null, scope));
 		}
 	}
 
@@ -217,10 +256,14 @@ class CommonExecutionSnapshotTest {
 		assertThat(binance.executions()).hasSize(1000);
 		assertThat(binance.fees()).hasSize(1000);
 		assertThat(binance.possiblyTruncated()).contains(false);
+		var filtered = CommonExecutionSnapshot.fromBinance(binance(ALIAS, binanceFills, false), QueryScope.FILTERED_SYMBOL);
+		assertThat(filtered.executions()).isEqualTo(binance.executions());
+		assertThat(filtered.fees()).isEqualTo(binance.fees());
 		upbitFills.add(upbitFill("fill-1000", SYMBOL, "bid"));
 		binanceFills.add(binanceFill(1000, 1000, true, "BNB"));
 		assertSafeFailure(() -> CommonExecutionSnapshot.fromUpbit(ALIAS, upbit("bid", "done", upbitFills)));
 		assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(binance(ALIAS, binanceFills, true)));
+		assertSafeFailure(() -> CommonExecutionSnapshot.fromBinance(binance(ALIAS, binanceFills, true), QueryScope.FILTERED_SYMBOL));
 	}
 
 	@Test

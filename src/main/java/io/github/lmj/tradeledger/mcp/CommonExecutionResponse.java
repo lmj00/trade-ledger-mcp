@@ -15,7 +15,7 @@ public record CommonExecutionResponse(
 		String accountAlias,
 		String symbol,
 		String queryScope,
-		@Schema(nullable = true, description = "Order ID, or null for a recent-symbol query.")
+		@Schema(nullable = true, description = "Order ID, or null for a recent-symbol or filtered-symbol query.")
 		@Nullable String orderId,
 		@Schema(nullable = true, description = "Truncation hint, or null when inapplicable to a single order.")
 		@Nullable Boolean possiblyTruncated,
