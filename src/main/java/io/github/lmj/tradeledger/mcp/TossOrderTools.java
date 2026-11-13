@@ -6,6 +6,7 @@ import java.util.Objects;
 import java.util.Set;
 
 import io.github.lmj.tradeledger.adapter.toss.TossApiException;
+import io.github.lmj.tradeledger.adapter.toss.TossClosedOrdersRequest;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderClient;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderRequest;
 import org.springframework.ai.mcp.annotation.McpTool;
@@ -56,6 +57,44 @@ public final class TossOrderTools {
 		}
 		try {
 			return TossOrderResponse.from(client.getObject().getOrder(request));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	@McpTool(
+			name = "get_toss_closed_orders",
+			title = "Get one page of Toss closed order summaries",
+			description = "Read one CLOSED page with independently optional inclusive KST orderedAt date filters. "
+					+ "Uses server-side credentials. One GET, no automatic pagination, date splitting, detail queries, "
+					+ "individual fills, settlement ledger, common executions, Trade creation, PnL, orders or cancellation.",
+			generateOutputSchema = true,
+			annotations = @McpTool.McpAnnotations(
+					readOnlyHint = true,
+					destructiveHint = false,
+					idempotentHint = true,
+					openWorldHint = true))
+	public TossClosedOrdersResponse getTossClosedOrders(
+			@McpToolParam(description = "Optional case-preserving symbol matching [A-Za-z0-9.\\-]+, at most 256 UTF-16 units.", required = false)
+			String symbol,
+			@McpToolParam(description = "Optional inclusive KST orderedAt start date, strict YYYY-MM-DD; independently usable.", required = false)
+			String from,
+			@McpToolParam(description = "Optional inclusive KST orderedAt end date, strict YYYY-MM-DD; independently usable, from <= to when both given.", required = false)
+			String to,
+			@McpToolParam(description = "Optional opaque cursor, at most 256 UTF-16 units; preserved without trimming or decoding.", required = false)
+			String cursor,
+			@McpToolParam(description = "Maximum orders in this page, 1 through 100; omitted or null defaults to 20.", required = false)
+			Integer limit) {
+		TossClosedOrdersRequest request;
+		try {
+			request = new TossClosedOrdersRequest(symbol, from, to, cursor, limit);
+		}
+		catch (RuntimeException exception) {
+			throw new IllegalArgumentException("Toss request failed: BAD_REQUEST");
+		}
+		try {
+			return TossClosedOrdersResponse.from(client.getObject().getClosedOrders(request));
 		}
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);

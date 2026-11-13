@@ -1,6 +1,8 @@
 package io.github.lmj.tradeledger.config;
 
+import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 
 import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesClient;
 import io.github.lmj.tradeledger.adapter.csv.CsvTradeJournalReader;
@@ -12,6 +14,7 @@ import io.github.lmj.tradeledger.application.service.AnalyzeTradesService;
 import io.github.lmj.tradeledger.application.service.SummarizeJournalService;
 import io.github.lmj.tradeledger.domain.service.RealizedPnlCalculator;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
+import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.TextContent;
 import org.springframework.beans.factory.config.BeanPostProcessor;
@@ -42,25 +45,36 @@ class TradeLedgerConfiguration {
 									|| "get_upbit_closed_orders".equals(specification.tool().name())
 									|| "get_binance_account_trades".equals(specification.tool().name())
 									|| "get_binance_account_executions".equals(specification.tool().name())
-									|| "get_toss_order".equals(specification.tool().name()))) {
+									|| "get_toss_order".equals(specification.tool().name())
+									|| "get_toss_closed_orders".equals(specification.tool().name()))) {
 						return candidate;
 					}
 					String service = "get_binance_account_trades".equals(specification.tool().name())
 								|| "get_binance_account_executions".equals(specification.tool().name())
-							? "Binance" : "get_toss_order".equals(specification.tool().name()) ? "Toss" : "Upbit";
+							? "Binance" : ("get_toss_order".equals(specification.tool().name())
+									|| "get_toss_closed_orders".equals(specification.tool().name())) ? "Toss" : "Upbit";
 					// Preserve the generated schemas and the existing safe error handlers.
 					// The annotation adapter supplies structuredContent for these DTOs.
 					return SyncToolSpecification.builder().tool(specification.tool())
 							.callHandler((exchange, request) -> {
 								// Reject wrong JSON types before the annotation adapter can coerce
 								// them to strings or expose conversion diagnostics containing input.
-								if ("Toss".equals(service) && (request.arguments() == null
+								if ("get_toss_order".equals(specification.tool().name()) && (request.arguments() == null
 										|| !(request.arguments().get("orderId") instanceof String))) {
 									return tossErrorResult("BAD_REQUEST");
 								}
+								CallToolRequest validatedRequest = request;
+								if ("get_toss_closed_orders".equals(specification.tool().name())) {
+									if (!validTossClosedOrdersTypes(request.arguments())) {
+										return tossErrorResult("BAD_REQUEST");
+									}
+									if (request.arguments() == null) {
+										validatedRequest = CallToolRequest.builder(request.name()).arguments(Map.of()).build();
+									}
+								}
 								CallToolResult result;
 								try {
-									result = specification.callHandler().apply(exchange, request);
+									result = specification.callHandler().apply(exchange, validatedRequest);
 								}
 								catch (RuntimeException exception) {
 									if (!"Toss".equals(service)) { throw exception; }
@@ -98,6 +112,23 @@ class TradeLedgerConfiguration {
 	private static CallToolResult tossErrorResult(String category) {
 		return CallToolResult.builder().isError(true)
 				.content(List.of(new TextContent("Toss request failed: " + category))).build();
+	}
+
+	private static boolean validTossClosedOrdersTypes(Map<String, Object> arguments) {
+		if (arguments == null) { return true; }
+		for (String field : List.of("symbol", "from", "to", "cursor")) {
+			Object value = arguments.get(field);
+			if (value != null && !(value instanceof String)) { return false; }
+		}
+		Object limit = arguments.get("limit");
+		if (limit == null) { return true; }
+		// JSON integers only: never truncate decimals or wrap an out-of-range number
+		// in the annotation adapter's Integer conversion.
+		if (!(limit instanceof Byte || limit instanceof Short || limit instanceof Integer
+				|| limit instanceof Long || limit instanceof BigInteger)) { return false; }
+		if (limit instanceof BigInteger integer && integer.bitLength() > 31) { return false; }
+		long value = ((Number) limit).longValue();
+		return value >= 1 && value <= 100;
 	}
 
 	// Credentials and transport startup options are needed only when querying an exchange.
