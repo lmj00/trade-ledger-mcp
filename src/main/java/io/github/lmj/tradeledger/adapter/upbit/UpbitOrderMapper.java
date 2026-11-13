@@ -71,7 +71,15 @@ public final class UpbitOrderMapper {
 			if (!ids.add(tradeId)) {
 				throw invalid("duplicate trade uuid");
 			}
-			executions.add(new Execution(tradeId, text(trade, "market"), text(trade, "side"),
+			String tradeMarket = text(trade, "market");
+			String tradeSide = text(trade, "side");
+			if (!market.equals(tradeMarket)) {
+				throw invalid("trade market");
+			}
+			if (!side.equals(tradeSide)) {
+				throw invalid("trade side");
+			}
+			executions.add(new Execution(tradeId, tradeMarket, tradeSide,
 					decimal(trade, "price", true), decimal(trade, "volume", true),
 					decimal(trade, "funds", true), instant(trade, "created_at")));
 		}

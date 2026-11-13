@@ -12,6 +12,7 @@ import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class UpbitOrderMapperTest {
@@ -63,6 +64,29 @@ class UpbitOrderMapperTest {
 			assertThat(unfilled.paidFee()).isEqualTo("0");
 			assertThat(unfilled.trades()).isEmpty();
 		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"market,KRW-BTC,KRW-ETH", "market,KRW-ETH,KRW-BTC",
+			"side,bid,ask", "side,ask,bid", "market,KRW-BTC,krw-btc", "side,bid,BID",
+			"market,KRW-BTC,secret-marker", "side,bid,secret-marker"})
+	void rejectsMismatchedFillFieldsEvenAfterAValidFill(String field, String orderValue, String tradeValue) {
+		String valid = withText(fill("first"), field, orderValue);
+		String mismatch = withText(fill("second"), field, tradeValue);
+		assertThat(mapper.map(withText(order("done", valid), field, orderValue)).trades()).hasSize(1);
+		for (String trades : List.of(mismatch, valid + "," + mismatch)) {
+			reject(withText(order("done", trades), field, orderValue));
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"bid,done", "ask,done", "bid,cancel", "ask,cancel", "custom,done"})
+	void acceptsMatchingSidesWithoutAddingAnEnumerationRestriction(String side, String state) {
+		var snapshot = mapper.map(withText(order(state, withText(fill("fill-1"), "side", side)), "side", side));
+		assertThat(snapshot.side()).isEqualTo(side);
+		assertThat(snapshot.state()).isEqualTo(state);
+		assertThat(snapshot.trades()).hasSize(1);
+		assertThat(snapshot.trades().getFirst().side()).isEqualTo(side);
 	}
 
 	@Test
@@ -129,7 +153,11 @@ class UpbitOrderMapperTest {
 	@ParameterizedTest
 	@ValueSource(strings = {"uuid", "market", "side"})
 	void enforces256CharacterFillStringPolicy(String field) {
-		mapper.map(order("done", withText(fill("fill-1"), field, "x".repeat(256))));
+		String json = order("done", withText(fill("fill-1"), field, "x".repeat(256)));
+		if (List.of("market", "side").contains(field)) {
+			json = withText(json, field, "x".repeat(256));
+		}
+		mapper.map(json);
 		reject(order("done", withText(fill("fill-1"), field, "x".repeat(257))));
 	}
 

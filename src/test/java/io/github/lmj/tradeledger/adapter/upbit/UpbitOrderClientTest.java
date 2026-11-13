@@ -678,6 +678,41 @@ class UpbitOrderClientTest {
 	}
 
 	@ParameterizedTest
+	@CsvSource({"KRW-BTC,bid,KRW-ETH,bid", "KRW-ETH,bid,KRW-BTC,bid",
+			"KRW-BTC,bid,KRW-BTC,ask", "KRW-BTC,ask,KRW-BTC,bid"})
+	void rejectsMismatchedFillsWithOneGetAndNoSensitiveDiagnostics(
+			String market, String side, String tradeMarket, String tradeSide) throws Exception {
+		String fill = """
+				{"uuid":"fill-1","market":"%s","side":"%s","price":"1.2300",
+				"volume":"0.0200","funds":"0.024600","created_at":"2026-07-01T01:00:00Z"}
+				""".formatted(market, side);
+		String mismatch = fill.replace("fill-1", "fill-2")
+				.replace("\"market\":\"" + market + "\"", "\"market\":\"" + tradeMarket + "\"")
+				.replace("\"side\":\"" + side + "\"", "\"side\":\"" + tradeSide + "\"");
+		AtomicReference<String> trades = new AtomicReference<>();
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			String body = ORDER.replace("KRW-BTC", market).replace("\"bid\"", "\"" + side + "\"")
+					.replace("\"trades\":[]", "\"trades\":[" + trades.get() + "]");
+			reply(exchange, 200, withIgnoredBytes(body, "valid".getBytes(StandardCharsets.UTF_8),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client();
+			int calls = 0;
+			for (String value : List.of(mismatch, fill + "," + mismatch)) {
+				trades.set(value);
+				expect(UpbitErrorCode.INVALID_RESPONSE, () -> client.getOrder(ID), tokens);
+				assertThat(requests).hasSize(++calls).allSatisfy(request ->
+						assertThat(request).isEqualTo("GET /v1/order?uuid=" + ID));
+			}
+		}
+	}
+
+	@ParameterizedTest
 	@CsvSource({ID + "," + ID, ID + "," + UPPER_ID, UPPER_ID + "," + ID, UPPER_ID + "," + UPPER_ID})
 	void acceptsMatchingResponseIdsAndPreservesAmountsAndFills(String requestId, String responseId) throws Exception {
 		String body = """

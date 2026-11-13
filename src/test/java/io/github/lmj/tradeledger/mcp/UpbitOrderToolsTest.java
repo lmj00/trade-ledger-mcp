@@ -360,6 +360,33 @@ class UpbitOrderToolsTest {
 		assertThat(server.credentialReads).hasValue(0);
 	}
 
+	@ParameterizedTest
+	@CsvSource({"KRW-BTC,bid,KRW-ETH,bid", "KRW-ETH,bid,KRW-BTC,bid",
+			"KRW-BTC,bid,KRW-BTC,ask", "KRW-BTC,ask,KRW-BTC,bid"})
+	void bothRegisteredHandlersRejectMismatchedFillsWithoutPartialResults(
+			String market, String side, String tradeMarket, String tradeSide) {
+		String matching = ORDER.replace("KRW-BTC", market).replace("\"bid\"", "\"" + side + "\"");
+		int second = matching.indexOf("{\"uuid\":\"fill-2\"");
+		String mismatch = matching.substring(second)
+				.replace("\"market\":\"" + market + "\"", "\"market\":\"" + tradeMarket + "\"")
+				.replace("\"side\":\"" + side + "\"", "\"side\":\"" + tradeSide + "\"");
+		String orderPrefix = matching.substring(0, matching.indexOf("\"trades\":[") + "\"trades\":[".length());
+		// Include fake credentials and the actual local JWT in an ignored response field.
+		server.ignoredBytes.set("valid".getBytes(StandardCharsets.UTF_8));
+		int calls = 0;
+		for (String body : List.of(orderPrefix + mismatch, matching.substring(0, second) + mismatch)) {
+			server.body.set(body);
+			for (String name : List.of("get_upbit_order", "get_upbit_order_executions")) {
+				CallToolResult result = callValidTool(name);
+				assertSafeError(result, "INVALID_RESPONSE");
+				assertThat(result.toString()).doesNotContain(ID, "fill-1", "fill-2", "0.12345678901234567800");
+				assertThat(server.requests).hasValue(++calls);
+				assertThat(server.paths).hasSize(calls).allSatisfy(path ->
+						assertThat(path).isEqualTo("GET /v1/order?uuid=" + ID));
+			}
+		}
+	}
+
 	@Test
 	void commonHandlerDiscardsConversionDetailsWithoutAnotherQuery() {
 		// The existing HTTP mapper accepts text sides; the common model rejects unknown sides.
