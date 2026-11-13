@@ -2,6 +2,7 @@ package io.github.lmj.tradeledger.config;
 
 import java.util.List;
 
+import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesClient;
 import io.github.lmj.tradeledger.adapter.csv.CsvTradeJournalReader;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
 import io.github.lmj.tradeledger.application.port.out.TradeJournalReader;
@@ -34,11 +35,18 @@ class TradeLedgerConfiguration {
 				}
 				return specifications.stream().map(candidate -> {
 					if (!(candidate instanceof SyncToolSpecification specification)
-							|| !"get_upbit_order".equals(specification.tool().name())) {
+							|| !("get_upbit_order".equals(specification.tool().name())
+									|| "get_upbit_order_executions".equals(specification.tool().name())
+									|| "get_upbit_closed_orders".equals(specification.tool().name())
+									|| "get_binance_account_trades".equals(specification.tool().name())
+									|| "get_binance_account_executions".equals(specification.tool().name()))) {
 						return candidate;
 					}
+					String service = "get_binance_account_trades".equals(specification.tool().name())
+								|| "get_binance_account_executions".equals(specification.tool().name())
+							? "Binance" : "Upbit";
 					// Preserve the generated schema and safe error handler. The annotation
-					// adapter supplies structuredContent only for this DTO return type.
+					// adapter supplies structuredContent only for these DTO return types.
 					return SyncToolSpecification.builder().tool(specification.tool())
 							.callHandler((exchange, request) -> {
 								CallToolResult result = specification.callHandler().apply(exchange, request);
@@ -52,7 +60,7 @@ class TradeLedgerConfiguration {
 								}
 								catch (RuntimeException exception) {
 									return CallToolResult.builder().isError(true)
-											.content(List.of(new TextContent("Upbit request failed: INTERNAL_ERROR"))).build();
+											.content(List.of(new TextContent(service + " request failed: INTERNAL_ERROR"))).build();
 								}
 							}).build();
 				}).toList();
@@ -65,6 +73,12 @@ class TradeLedgerConfiguration {
 	@Lazy
 	UpbitOrderClient upbitOrderClient() {
 		return new UpbitOrderClient();
+	}
+
+	@Bean(destroyMethod = "close")
+	@Lazy
+	BinanceAccountTradesClient binanceAccountTradesClient() {
+		return new BinanceAccountTradesClient();
 	}
 
 	@Bean

@@ -9,8 +9,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,26 +25,36 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
+import io.github.lmj.tradeledger.application.model.ClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
- * A single authenticated GET of one order. Reads UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY
- * from the process environment on each call. No retries or pagination.
+ * A single authenticated GET of one order or closed order summaries. Reads
+ * UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY from the process environment on each call.
+ * No retries or pagination.
  * The JVM must start with {@code -Djdk.httpclient.disableRetryConnect=true} and
  * {@code -Djdk.httpclient.redirects.retrylimit=1}; otherwise construction fails closed.
  * Setting properties here would be unsafe because JDK HTTP classes cache them and
  * another client may already have initialized those classes.
+ * {@code jdk.httpclient.HttpClient.log} must remain unset or empty for the process
+ * lifetime. Nonempty current or startup settings are rejected before transport
+ * creation, credential lookup/signing and sending; clearing a startup setting
+ * cannot prove that the JDK never cached it. Do not change logging at runtime:
+ * these checks do not prevent arbitrary concurrent property changes between checks.
  */
-public final class UpbitOrderClient {
+public final class UpbitOrderClient implements AutoCloseable {
 
 	// Project resource policies, not official Upbit limits.
 	static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(3);
 	static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
 	static final int MAX_RESPONSE_BYTES = 1024 * 1024;
 	private static final URI ENDPOINT = URI.create("https://api.upbit.com/v1/order");
+	private static final URI CLOSED_ENDPOINT = URI.create("https://api.upbit.com/v1/orders/closed");
+	private static final String HTTP_LOG_PROPERTY = "jdk.httpclient.HttpClient.log";
 	private static final Pattern UUID = Pattern.compile(
 			"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 	private static final JsonMapper JSON = JsonMapper.builder().build();
@@ -49,10 +62,12 @@ public final class UpbitOrderClient {
 			"insufficient_permissions", "permission_denied", "no_authorization_ip");
 
 	private final URI endpoint;
+	private final URI closedEndpoint;
 	private final Supplier<Map<String, String>> environment;
 	private final HttpClient http;
 	private final UpbitJwtSigner signer = new UpbitJwtSigner();
 	private final UpbitOrderMapper mapper = new UpbitOrderMapper();
+	private final UpbitClosedOrdersMapper closedMapper = new UpbitClosedOrdersMapper();
 
 	public UpbitOrderClient() {
 		this(ENDPOINT, System::getenv, false);
@@ -66,12 +81,15 @@ public final class UpbitOrderClient {
 	private UpbitOrderClient(URI endpoint, Supplier<Map<String, String>> environment, boolean test) {
 		if (test && (endpoint == null || !"http".equals(endpoint.getScheme()) || endpoint.getHost() == null
 				|| !Set.of("127.0.0.1", "[::1]", "::1").contains(endpoint.getHost())
-				|| !"/v1/order".equals(endpoint.getRawPath()) || endpoint.getRawQuery() != null
+				|| !Set.of(ENDPOINT.getRawPath(), CLOSED_ENDPOINT.getRawPath()).contains(endpoint.getRawPath())
+				|| endpoint.getRawQuery() != null
 				|| endpoint.getRawFragment() != null || endpoint.getRawUserInfo() != null)) {
 			throw new IllegalArgumentException("Invalid local Upbit test endpoint");
 		}
-		this.endpoint = endpoint;
+		this.endpoint = endpoint.resolve(ENDPOINT.getRawPath());
+		this.closedEndpoint = endpoint.resolve(CLOSED_ENDPOINT.getRawPath());
 		this.environment = environment;
+		requireNoDiagnosticLogging();
 		try {
 			requireNoRetryConfiguration(ManagementFactory.getRuntimeMXBean().getInputArguments(),
 					System.getProperty("jdk.httpclient.disableRetryConnect"),
@@ -83,6 +101,27 @@ public final class UpbitOrderClient {
 		this.http = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT)
 				.version(HttpClient.Version.HTTP_1_1)
 				.followRedirects(HttpClient.Redirect.NEVER).build();
+	}
+
+	/** Release the owned HTTP client and its connection/worker resources. */
+	@Override
+	public void close() {
+		http.close();
+	}
+
+	private static void requireNoDiagnosticLogging() {
+		try {
+			String option = "-D" + HTTP_LOG_PROPERTY + "=";
+			if (!System.getProperty(HTTP_LOG_PROPERTY, "").isEmpty()
+					|| ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+							.anyMatch(argument -> argument.startsWith(option) && argument.length() > option.length())) {
+				throw new UpbitApiException(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION);
+			}
+		}
+		catch (RuntimeException exception) {
+			// Never retain a cause or a possibly sensitive property value.
+			throw new UpbitApiException(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION);
+		}
 	}
 
 	// Startup values matter: checking only mutable system properties cannot establish
@@ -108,10 +147,73 @@ public final class UpbitOrderClient {
 		if (uuid == null || !UUID.matcher(uuid).matches()) {
 			throw new UpbitApiException(UpbitErrorCode.INVALID_UUID);
 		}
+		String json = get(endpoint, List.of(Map.entry("uuid", uuid)));
+		try {
+			OrderExecutionSnapshot snapshot = mapper.map(json);
+			if (!UUID.matcher(snapshot.orderId()).matches() || !uuid.equalsIgnoreCase(snapshot.orderId())) {
+				throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);
+			}
+			return snapshot;
+		}
+		catch (RuntimeException exception) {
+			throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);
+		}
+	}
+
+	public ClosedOrdersSnapshot getClosedOrders(UpbitClosedOrdersRequest request) {
+		if (request == null) {
+			throw new UpbitApiException(UpbitErrorCode.BAD_REQUEST);
+		}
+		List<Map.Entry<String, String>> parameters = new ArrayList<>();
+		if (request.market() != null) {
+			parameters.add(Map.entry("market", request.market()));
+		}
+		if (request.state() != null) {
+			parameters.add(Map.entry("state", request.state()));
+		}
+		else {
+			for (String state : request.states()) {
+				parameters.add(Map.entry("states[]", state));
+			}
+		}
+		if (request.startTime() != null) {
+			parameters.add(Map.entry("start_time", request.startTime()));
+			parameters.add(Map.entry("end_time", request.endTime()));
+		}
+		parameters.add(Map.entry("limit", request.limit().toString()));
+		parameters.add(Map.entry("order_by", request.orderBy()));
+		String json = get(closedEndpoint, parameters);
+		try {
+			return closedMapper.map(json, request);
+		}
+		catch (RuntimeException exception) {
+			throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);
+		}
+	}
+
+	private String get(URI destination, List<Map.Entry<String, String>> parameters) {
+		requireNoDiagnosticLogging();
+		// Both strings use the same ordered entries; repeated array keys must survive.
+		String unencoded = parameters.stream().map(entry -> entry.getKey() + "=" + entry.getValue())
+				.collect(Collectors.joining("&"));
+		String encoded = parameters.stream().map(entry -> encode(entry.getKey()) + "=" + encode(entry.getValue()))
+				.collect(Collectors.joining("&"));
+		String token = sign(unencoded);
+		HttpRequest request = HttpRequest.newBuilder(URI.create(destination.toASCIIString() + "?" + encoded))
+				.timeout(REQUEST_TIMEOUT).header("Authorization", "Bearer " + token)
+				.header("Accept", "application/json").GET().build();
+		return send(request);
+	}
+
+	private static String encode(String value) {
+		return URLEncoder.encode(value, StandardCharsets.UTF_8);
+	}
+
+	private String sign(String unencodedQuery) {
 		String token;
 		try {
 			Map<String, String> values = environment.get();
-			token = signer.sign(values.get("UPBIT_ACCESS_KEY"), values.get("UPBIT_SECRET_KEY"), "uuid=" + uuid);
+			token = signer.sign(values.get("UPBIT_ACCESS_KEY"), values.get("UPBIT_SECRET_KEY"), unencodedQuery);
 		}
 		catch (UpbitApiException exception) {
 			throw exception;
@@ -119,28 +221,35 @@ public final class UpbitOrderClient {
 		catch (RuntimeException exception) {
 			throw new UpbitApiException(UpbitErrorCode.MISSING_CREDENTIALS);
 		}
-		HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint.toASCIIString() + "?uuid="
-				+ URLEncoder.encode(uuid, StandardCharsets.UTF_8)))
-				.timeout(REQUEST_TIMEOUT).header("Authorization", "Bearer " + token)
-				.header("Accept", "application/json").GET().build();
+		return token;
+	}
+
+	private String send(HttpRequest request) {
 		BoundedBodySubscriber body = new BoundedBodySubscriber();
 		CompletableFuture<HttpResponse<byte[]>> response = null;
 		try {
+			requireNoDiagnosticLogging();
 			long started = System.nanoTime();
 			response = http.sendAsync(request, info -> body);
 			// Unlike an InputStream body handler, this future completes only after the full body.
 			HttpResponse<byte[]> received = response.get(
 					Math.max(1, REQUEST_TIMEOUT.toNanos() - (System.nanoTime() - started)), TimeUnit.NANOSECONDS);
-			String json = new String(received.body(), StandardCharsets.UTF_8);
+			String json;
+			try {
+				json = StandardCharsets.UTF_8.newDecoder()
+						.onMalformedInput(CodingErrorAction.REPORT)
+						.onUnmappableCharacter(CodingErrorAction.REPORT)
+						.decode(ByteBuffer.wrap(received.body())).toString();
+			}
+			catch (CharacterCodingException exception) {
+				// Never retain decoder diagnostics or use a damaged body for permission checks.
+				throw new UpbitApiException(received.statusCode() == 200
+						? UpbitErrorCode.INVALID_RESPONSE : statusCode(received.statusCode(), ""));
+			}
 			if (received.statusCode() != 200) {
 				throw new UpbitApiException(statusCode(received.statusCode(), json));
 			}
-			try {
-				return mapper.map(json);
-			}
-			catch (RuntimeException exception) {
-				throw new UpbitApiException(UpbitErrorCode.INVALID_RESPONSE);
-			}
+			return json;
 		}
 		catch (TimeoutException exception) {
 			throw new UpbitApiException(UpbitErrorCode.TIMEOUT);

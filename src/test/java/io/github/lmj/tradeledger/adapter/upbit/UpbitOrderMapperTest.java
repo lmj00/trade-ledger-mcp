@@ -12,6 +12,7 @@ import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class UpbitOrderMapperTest {
@@ -63,6 +64,29 @@ class UpbitOrderMapperTest {
 			assertThat(unfilled.paidFee()).isEqualTo("0");
 			assertThat(unfilled.trades()).isEmpty();
 		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"market,KRW-BTC,KRW-ETH", "market,KRW-ETH,KRW-BTC",
+			"side,bid,ask", "side,ask,bid", "market,KRW-BTC,krw-btc", "side,bid,BID",
+			"market,KRW-BTC,secret-marker", "side,bid,secret-marker"})
+	void rejectsMismatchedFillFieldsEvenAfterAValidFill(String field, String orderValue, String tradeValue) {
+		String valid = withText(fill("first"), field, orderValue);
+		String mismatch = withText(fill("second"), field, tradeValue);
+		assertThat(mapper.map(withText(order("done", valid), field, orderValue)).trades()).hasSize(1);
+		for (String trades : List.of(mismatch, valid + "," + mismatch)) {
+			reject(withText(order("done", trades), field, orderValue));
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"bid,done", "ask,done", "bid,cancel", "ask,cancel", "custom,done"})
+	void acceptsMatchingSidesWithoutAddingAnEnumerationRestriction(String side, String state) {
+		var snapshot = mapper.map(withText(order(state, withText(fill("fill-1"), "side", side)), "side", side));
+		assertThat(snapshot.side()).isEqualTo(side);
+		assertThat(snapshot.state()).isEqualTo(state);
+		assertThat(snapshot.trades()).hasSize(1);
+		assertThat(snapshot.trades().getFirst().side()).isEqualTo(side);
 	}
 
 	@Test
@@ -129,7 +153,11 @@ class UpbitOrderMapperTest {
 	@ParameterizedTest
 	@ValueSource(strings = {"uuid", "market", "side"})
 	void enforces256CharacterFillStringPolicy(String field) {
-		mapper.map(order("done", withText(fill("fill-1"), field, "x".repeat(256))));
+		String json = order("done", withText(fill("fill-1"), field, "x".repeat(256)));
+		if (List.of("market", "side").contains(field)) {
+			json = withText(json, field, "x".repeat(256));
+		}
+		mapper.map(json);
 		reject(order("done", withText(fill("fill-1"), field, "x".repeat(257))));
 	}
 
@@ -182,6 +210,81 @@ class UpbitOrderMapperTest {
 		reject(null);
 		reject(withText(order("wait", ""), "created_at", "secret-marker"));
 		reject(amount("paid_fee", "secret-marker"));
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {0, 1, 2})
+	void boundsIgnoredTokensAtRootFillAndNestedLevels(int location) {
+		for (String value : List.of("\"" + "x".repeat(256) + "\"",
+				"\"" + "\\u0078".repeat(256) + "\"", "\"" + "😀".repeat(128) + "\"",
+				"1".repeat(128), "-" + "1".repeat(127),
+				"0." + "0".repeat(125) + "1", "1." + "0".repeat(122) + "e+00")) {
+			assertThat(mapper.map(ignored(location, "ignored", value)).trades()).hasSize(1);
+		}
+		for (String value : List.of("\"" + "x".repeat(257) + "\"",
+				"\"" + "\\u0078".repeat(257) + "\"", "\"" + "😀".repeat(128) + "x\"",
+				"1".repeat(129), "-" + "1".repeat(128),
+				"0." + "0".repeat(126) + "1", "1." + "0".repeat(123) + "e+00")) {
+			reject(ignored(location, "ignored", value));
+		}
+		for (String name : List.of("x".repeat(256), "\\u0078".repeat(256), "😀".repeat(128))) {
+			assertThat(mapper.map(ignored(location, name, "null")).trades()).hasSize(1);
+		}
+		for (String name : List.of("x".repeat(257), "\\u0078".repeat(257), "😀".repeat(128) + "x")) {
+			reject(ignored(location, name, "null"));
+		}
+	}
+
+	@Test
+	void boundsSourceUtf16LengthBeforeParsing() {
+		for (String json : List.of(order("done", fill("first")), ignored(0, "ignored", "\"😀\""))) {
+			String boundary = json + " ".repeat(1_048_576 - json.length());
+			assertThat(mapper.map(boundary).trades()).hasSize(1);
+			reject(boundary + " ");
+		}
+	}
+
+	@Test
+	void boundsDepthIncludingRootAndRejectsVeryDeepInputBeforeTreeCreation() {
+		for (int depth : List.of(64, 65, 10_000)) {
+			for (boolean objects : List.of(false, true)) {
+				String value = (objects ? "{\"n\":" : "[").repeat(depth - 1)
+						+ "0" + (objects ? "}" : "]").repeat(depth - 1);
+				String json = ignored(0, "ignored", value);
+				if (depth == 64) {
+					assertThat(mapper.map(json).trades()).hasSize(1);
+				}
+				else {
+					reject(json);
+				}
+			}
+		}
+	}
+
+	@Test
+	void rejectsLaterIgnoredViolationsAndNestedDuplicateKeysWithoutPartialResults() {
+		reject(order("done", fill("first") + "," + appendField(fill("second"), "ignored",
+				"\"" + "x".repeat(257) + "\"")));
+		reject(ignored(0, "ignored", "{\"n\":1,\"n\":2}"));
+		// Only the root trades array has the execution count policy.
+		assertThat(mapper.map(ignored(0, "ignored", "{\"trades\":[" + "0,".repeat(1000) + "0]}"))
+				.trades()).hasSize(1);
+	}
+
+	private static String ignored(int location, String name, String value) {
+		String trade = fill("first");
+		if (location == 1) {
+			return order("done", appendField(trade, name, value));
+		}
+		if (location == 2) {
+			return appendField(order("done", trade), "ignored", "[{\"nested\":{\"" + name + "\":" + value + "}}]");
+		}
+		return appendField(order("done", trade), name, value);
+	}
+
+	private static String appendField(String json, String name, String value) {
+		int end = json.lastIndexOf('}');
+		return json.substring(0, end) + ",\"" + name + "\":" + value + json.substring(end);
 	}
 
 	private void reject(String json) {
