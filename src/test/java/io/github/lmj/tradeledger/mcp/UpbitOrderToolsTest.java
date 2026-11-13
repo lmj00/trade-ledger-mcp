@@ -565,6 +565,96 @@ class UpbitOrderToolsTest {
 		};
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void registeredHandlersValidateTheWholeBoundedPermissionDocument(String name) {
+		server.status.set(401);
+		int calls = 0;
+		for (var entry : permissionDocuments()) {
+			server.body.set(entry.getKey());
+			assertSafeError(callValidTool(name), entry.getValue());
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths).hasSize(calls).allSatisfy(path -> assertThat(path).isEqualTo(
+					name.equals("get_upbit_closed_orders")
+							? "GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=100&order_by=desc"
+							: "GET /v1/order?uuid=" + ID));
+		}
+	}
+
+	private static List<Map.Entry<String, String>> permissionDocuments() {
+		List<Map.Entry<String, String>> cases = new ArrayList<>();
+		String permission = "{\"error\":{\"name\":\"out_of_scope\"}}";
+		for (String allowed : List.of("out_of_scope", "insufficient_permission", "insufficient_permissions",
+				"permission_denied", "no_authorization_ip")) {
+			cases.add(Map.entry("{\"error\":{\"name\":\"" + allowed + "\"}}", "PERMISSION_DENIED"));
+			cases.add(Map.entry("{\"err\\u006fr\":{\"na\\u006de\":\""
+					+ allowed.replace("_", "\\u005f") + "\"},\"name\":\"unknown\"} \n\t", "PERMISSION_DENIED"));
+		}
+		for (String invalid : List.of("null", "[]", "[" + permission + "]", "\"out_of_scope\"", "{}",
+				"{\"error\":null}", "{\"error\":[]}", "{\"error\":\"out_of_scope\"}", "{\"error\":0}",
+				"{\"error\":{\"name\":null}}", "{\"error\":{\"name\":0}}", "{\"error\":{\"name\":true}}",
+				"{\"error\":{\"name\":[\"out_of_scope\"]}}", "{\"error\":{\"name\":{\"name\":\"out_of_scope\"}}}",
+				"{\"name\":\"out_of_scope\"}", "{\"error\":{\"nested\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":\"unknown\",\"nested\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":\"unknown\"},\"other\":{\"name\":\"out_of_scope\"}}",
+				"{\"other\":{\"error\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"error\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{},\"error\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"error\":{}}",
+				"{\"error\":{\"name\":\"unknown\",\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\",\"na\\u006de\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"err\\u006fr\":{}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"extra\":{\"x\":1,\"x\":2}}",
+				permission + " {}", permission + " []", permission + " null", permission + " true", permission + " 0",
+				permission + " {", permission + " garbage", permission + " \"",
+				permission.substring(0, permission.length() - 1),
+				"{\"error\":{\"name\":\"out_of_scope\"},\"tail\":[}")) {
+			cases.add(Map.entry(invalid, "AUTHENTICATION_FAILED"));
+		}
+		for (int overflow : List.of(0, 1)) {
+			int length = 256 + overflow;
+			int numberLength = 128 + overflow;
+			int arrays = 63 + overflow; // Root object is depth one.
+			for (String field : List.of("\"policyBoundary\":\"" + "x".repeat(length) + "\"",
+					"\"policyBoundary\":\"" + "\\u0078".repeat(length) + "\"",
+					"\"policyBoundary\":\"" + "\\uD83D\\uDE00".repeat(128) + "x".repeat(overflow) + "\"",
+					"\"" + "x".repeat(length) + "\":null", "\"" + "\\u0078".repeat(length) + "\":null",
+					"\"policyBoundary\":" + "1".repeat(numberLength),
+					"\"policyBoundary\":-" + "1".repeat(numberLength - 1),
+					"\"policyBoundary\":1." + "0".repeat(numberLength - 6) + "e+00",
+					"\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays),
+					"\"policyBoundary\":" + "{\"x\":".repeat(arrays) + "0" + "}".repeat(arrays))) {
+				for (boolean permissionFirst : List.of(false, true)) {
+					String fields = permission.substring(1, permission.length() - 1);
+					cases.add(Map.entry("{" + (permissionFirst ? fields + "," + field : field + "," + fields) + "}",
+							overflow == 0 ? "PERMISSION_DENIED" : "AUTHENTICATION_FAILED"));
+				}
+			}
+		}
+		return cases;
+	}
+
+	@ParameterizedTest
+	@CsvSource({"400,BAD_REQUEST", "403,PERMISSION_DENIED", "404,ORDER_NOT_FOUND", "418,IP_BLOCKED",
+			"429,RATE_LIMITED", "302,REDIRECT_REJECTED", "307,REDIRECT_REJECTED", "500,SERVER_ERROR",
+			"503,SERVER_ERROR", "599,SERVER_ERROR"})
+	void registeredHandlersKeepHttpCategoriesForUntrustedPermissionDocuments(int status, String category) {
+		server.status.set(status);
+		int calls = 0;
+		for (String body : List.of("{\"error\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\",\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"}} {}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"policyBoundary\":\"" + "x".repeat(257) + "\"}")) {
+			server.body.set(body);
+			for (String name : List.of("get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders")) {
+				assertSafeError(callValidTool(name), category);
+				assertThat(server.requests).hasValue(++calls);
+				assertThat(server.credentialReads).hasValue(calls);
+			}
+		}
+	}
+
 	private static String utf8SuccessBody(String name) {
 		return name.equals("get_upbit_closed_orders")
 				? "[" + summary(ID, "done", "2", "0.3000") + ","
@@ -1284,6 +1374,7 @@ class UpbitOrderToolsTest {
 
 	private void assertSafeError(CallToolResult result, String category) {
 		assertThat(result.isError()).isTrue();
+		assertThat(result.structuredContent()).isNull();
 		assertThat(result.content()).isNotEmpty().allSatisfy(content ->
 				assertThat(content).isInstanceOfSatisfying(TextContent.class, text ->
 						assertThat(text.text()).contains("Upbit request failed: " + category)));
@@ -1301,6 +1392,7 @@ class UpbitOrderToolsTest {
 		}
 		for (String observation : observations) {
 			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ",
+					"StreamReadException", "Duplicate Object property",
 					"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length",
 					"StreamConstraintsException", "JsonParseException", "[Source:", "line: ", "column: ");
 			for (String token : server.tokens) {
@@ -1437,16 +1529,20 @@ class UpbitOrderToolsTest {
 						return;
 					}
 					String payload = body.get();
+					byte[] ignored = ignoredBytes.get();
 					if (!payload.contains("\"uuid\"") && !payload.stripLeading().startsWith("[")) {
-						// Preserve valid permission JSON while putting secrets in an ignored field;
-						// malformed bodies carry the same markers as raw text.
-						String secrets = ACCESS + SECRET + token;
-						payload = payload.startsWith("{")
-								? payload.substring(0, payload.length() - 1) + ",\"private\":\"" + secrets + "\"}"
-								: payload + secrets;
+						if (payload.startsWith("{")) {
+							// Split the JWT into bounded strings so valid controls exercise permission
+							// parsing; prepend fields to preserve duplicate keys and malformed tails.
+							if (ignored == null) {
+								ignored = "valid".getBytes(StandardCharsets.UTF_8);
+							}
+						}
+						else {
+							payload += ACCESS + SECRET + token;
+						}
 					}
 					byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
-					byte[] ignored = ignoredBytes.get();
 					if (ignored != null) {
 						bytes = withIgnoredBytes(payload, ignored, MARKER + ACCESS + SECRET + token);
 					}
