@@ -188,6 +188,8 @@ public final class UpbitOrderClient implements AutoCloseable {
 		}
 		if (request.startTime() != null) {
 			parameters.add(Map.entry("start_time", request.startTime()));
+		}
+		if (request.endTime() != null) {
 			parameters.add(Map.entry("end_time", request.endTime()));
 		}
 		parameters.add(Map.entry("limit", request.limit().toString()));

@@ -89,14 +89,30 @@ class UpbitClosedOrdersRequestTest {
 	}
 
 	@Test
-	void rejectsLoneInvalidReversedOrOverlongTimeRangesWithoutLeakingInput() {
+	void normalizesEitherBoundaryIndependentlyWithoutCreatingTheOtherBoundary() {
+		String utc = "2026-07-01T01:00:00Z";
+		for (String time : List.of("2026-07-01T10:00:00+09:00",
+				Long.toString(Instant.parse(utc).toEpochMilli()),
+				Long.toString(Long.MIN_VALUE), Long.toString(Long.MAX_VALUE))) {
+			String expected = time.contains("T") ? utc : Instant.ofEpochMilli(Long.parseLong(time)).toString();
+			var startOnly = request(null, null, null, time, null, null, null);
+			assertThat(startOnly.startTime()).isEqualTo(expected);
+			assertThat(startOnly.endTime()).isNull();
+			var endOnly = request(null, null, null, null, time, null, null);
+			assertThat(endOnly.startTime()).isNull();
+			assertThat(endOnly.endTime()).isEqualTo(expected);
+		}
+	}
+
+	@Test
+	void rejectsInvalidSingleBoundariesAndInvalidRangesWithoutLeakingInput() {
 		String valid = "2026-07-01T01:00:00Z";
-		reject(() -> request(null, null, null, valid, null, null, null));
-		reject(() -> request(null, null, null, null, valid, null, null));
 		for (String time : List.of("2026-07-01T01:00:00", "2026-02-30T01:00:00Z", "9223372036854775808",
 				"-9223372036854775809", "1.5", "", "secret-marker", "x".repeat(256), "x".repeat(257))) {
 			reject(() -> request(null, null, null, time, valid, null, null));
 			reject(() -> request(null, null, null, valid, time, null, null));
+			reject(() -> request(null, null, null, time, null, null, null));
+			reject(() -> request(null, null, null, null, time, null, null));
 		}
 		reject(() -> request(null, null, null, valid, "2026-07-01T00:59:59Z", null, null));
 		reject(() -> request(null, null, null, valid, "2026-07-08T01:00:00.000000001Z", null, null));

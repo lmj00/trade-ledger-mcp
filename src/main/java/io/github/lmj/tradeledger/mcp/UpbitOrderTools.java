@@ -90,7 +90,7 @@ public final class UpbitOrderTools {
 	@McpTool(
 			name = "get_upbit_closed_orders",
 			title = "Get Upbit closed order summaries",
-			description = "Read one bounded result of done/cancel order summaries. Both time boundaries or neither; "
+			description = "Read one bounded result of done/cancel order summaries. Time boundaries are independently optional; "
 					+ "at most seven days and 1000 orders. No pagination, retries, fill details, fee currency, "
 					+ "trade matching or PnL. Even short or empty results do not establish complete history.",
 			generateOutputSchema = true,
@@ -106,9 +106,9 @@ public final class UpbitOrderTools {
 			String state,
 			@McpToolParam(description = "Nonempty distinct done/cancel states; defaults to both.", required = false)
 			List<String> states,
-			@McpToolParam(description = "Offset ISO8601 or epoch milliseconds; requires endTime.", required = false)
+			@McpToolParam(description = "Optional offset ISO8601 or epoch milliseconds; independently usable. Alone, Upbit queries the following seven days.", required = false)
 			String startTime,
-			@McpToolParam(description = "Offset ISO8601 or epoch milliseconds; requires startTime, within seven days.", required = false)
+			@McpToolParam(description = "Optional offset ISO8601 or epoch milliseconds; independently usable. Alone, Upbit queries the preceding seven days. With startTime, ordered within seven days.", required = false)
 			String endTime,
 			@McpToolParam(description = "Maximum orders, 1 through 1000; defaults to 100.", required = false)
 			Integer limit,

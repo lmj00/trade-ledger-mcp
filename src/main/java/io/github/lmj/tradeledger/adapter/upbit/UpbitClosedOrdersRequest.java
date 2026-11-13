@@ -9,9 +9,9 @@ import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * Parameters only: no network calls or pagination. This initial implementation
- * requires both time boundaries or neither. Omitted boundaries remain absent so
- * Upbit supplies its recent-seven-day default; no local clock is consulted.
+ * Parameters only: no network calls or pagination. Either time boundary is
+ * independently optional. Omitted boundaries remain absent so
+ * Upbit supplies its seven-day window; no local clock is consulted.
  * Boundaries accept offset ISO8601 or signed integer epoch milliseconds and are
  * normalized to UTC ISO8601. A full result never establishes complete history.
  */
@@ -52,18 +52,15 @@ public record UpbitClosedOrdersRequest(String market, String state, List<String>
 		if (limit < 1 || limit > MAX_LIMIT || !(orderBy.equals("asc") || orderBy.equals("desc"))) {
 			throw invalid();
 		}
-		if ((startTime == null) != (endTime == null)) {
-			throw invalid();
-		}
-		if (startTime != null) {
-			Instant start = parseTime(startTime);
-			Instant end = parseTime(endTime);
+		Instant start = startTime == null ? null : parseTime(startTime);
+		Instant end = endTime == null ? null : parseTime(endTime);
+		if (start != null && end != null) {
 			if (start.isAfter(end) || Duration.between(start, end).compareTo(Duration.ofDays(7)) > 0) {
 				throw invalid();
 			}
-			startTime = start.toString();
-			endTime = end.toString();
 		}
+		startTime = start == null ? null : start.toString();
+		endTime = end == null ? null : end.toString();
 	}
 
 	private static boolean closedState(String value) {

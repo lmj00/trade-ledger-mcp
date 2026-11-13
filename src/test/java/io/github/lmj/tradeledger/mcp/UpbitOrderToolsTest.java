@@ -773,6 +773,48 @@ class UpbitOrderToolsTest {
 	}
 
 	@ParameterizedTest
+	@CsvSource({"startTime,2026-07-01T10:00:00+09:00,start_time",
+			"startTime,1782867600000,start_time", "endTime,2026-07-01T10:00:00+09:00,end_time",
+			"endTime,1782867600000,end_time"})
+	void closedOrdersSingleBoundaryReturnsSummaryAndEmptyArray(String boundary, String time, String parameter) {
+		Map<String, Object> arguments = Map.of(boundary, time);
+		String path = "GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&"
+				+ parameter + "=2026-07-01T01%3A00%3A00Z&limit=100&order_by=desc";
+		server.body.set("[" + summary(ID, "cancel", "9223372036854775808", "0.1000") + "]");
+		CallToolResult result = callClosed(arguments);
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> response = asMap(result.structuredContent());
+		assertThat(response).containsOnlyKeys("serviceId", "orders", "possiblyTruncated")
+				.containsEntry("serviceId", "upbit").containsEntry("possiblyTruncated", false);
+		assertThat((List<?>) response.get("orders")).hasSize(1).allSatisfy(order ->
+				assertThat(asMap(order)).containsOnlyKeys("orderId", "market", "side", "orderType", "state",
+						"createdAt", "executedVolume", "paidFee", "tradesCount")
+						.containsEntry("orderId", ID).containsEntry("market", "KRW-BTC")
+						.containsEntry("side", "bid").containsEntry("orderType", "limit")
+						.containsEntry("state", "cancel").containsEntry("createdAt", "2026-07-01T01:00:00Z")
+						.containsEntry("executedVolume", "0.1000")
+						.containsEntry("paidFee", "0.12345678901234567800")
+						.containsEntry("tradesCount", "9223372036854775808"));
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.credentialReads).hasValue(1);
+		assertThat(server.paths).containsExactly(path);
+
+		server.body.set("[]");
+		CallToolResult empty = callClosed(arguments);
+		assertThat(empty.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(empty.structuredContent())).containsOnlyKeys("serviceId", "orders", "possiblyTruncated")
+				.containsEntry("serviceId", "upbit").containsEntry("orders", List.of())
+				.containsEntry("possiblyTruncated", false);
+		assertMatchingSuccessContent(empty);
+		assertNoSecrets(empty);
+		assertThat(server.requests).hasValue(2);
+		assertThat(server.credentialReads).hasValue(2);
+		assertThat(server.paths).containsExactly(path, path);
+	}
+
+	@ParameterizedTest
 	@MethodSource("invalidClosedRequests")
 	@SuppressWarnings("unchecked")
 	void closedOrdersRejectsInvalidRequestsWithoutHttpEvenWhenKeysAreMissing(Map<String, Object> arguments) {
@@ -787,18 +829,23 @@ class UpbitOrderToolsTest {
 		server.keys.set(Map.of());
 		assertSafeError(callClosed(arguments), "BAD_REQUEST");
 		assertThat(server.requests).hasValue(0);
+		assertThat(server.credentialReads).hasValue(0);
 	}
 
 	static Stream<Map<String, Object>> invalidClosedRequests() {
-		return Stream.of(Map.of("state", "done", "states", List.of("cancel")),
+		Stream<Map<String, Object>> invalidOptionsAndRanges = Stream.of(Map.of("state", "done", "states", List.of("cancel")),
 				Map.of("state", "wait"), Map.of("states", List.of("done", "wait")),
 				Map.of("states", List.of()), Map.of("states", List.of("done", "done")),
 				Map.of("market", MARKER + ACCESS + SECRET), Map.of("market", "krw-btc"),
 				Map.of("orderBy", MARKER + ACCESS + SECRET), Map.of("limit", 0), Map.of("limit", 1001),
-				Map.of("startTime", "2026-07-01T00:00:00Z"), Map.of("endTime", "2026-07-02T00:00:00Z"),
 				Map.of("startTime", "2026-07-02T00:00:00Z", "endTime", "2026-07-01T00:00:00Z"),
 				Map.of("startTime", "2026-07-01T00:00:00Z", "endTime", "2026-07-08T00:00:00.001Z"),
 				Map.of("startTime", MARKER + ACCESS + SECRET, "endTime", "2026-07-08T00:00:00Z"));
+		Stream<Map<String, Object>> invalidSingleBoundaries = Stream.of("startTime", "endTime")
+				.flatMap(boundary -> Stream.of("2026-02-30T01:00:00Z", "2026-07-01T01:00:00", "",
+						"x".repeat(257), "9223372036854775808", "-9223372036854775809", MARKER + ACCESS + SECRET)
+						.map(time -> Map.<String, Object>of(boundary, time)));
+		return Stream.concat(invalidOptionsAndRanges, invalidSingleBoundaries);
 	}
 
 	@Test
@@ -1150,6 +1197,21 @@ class UpbitOrderToolsTest {
 		assertThat(server.requests).hasValue(1);
 	}
 
+	@ParameterizedTest
+	@CsvSource({"startTime,401,AUTHENTICATION_FAILED", "endTime,401,AUTHENTICATION_FAILED",
+			"startTime,403,PERMISSION_DENIED", "endTime,403,PERMISSION_DENIED",
+			"startTime,429,RATE_LIMITED", "endTime,429,RATE_LIMITED",
+			"startTime,302,REDIRECT_REJECTED", "endTime,302,REDIRECT_REJECTED",
+			"startTime,200,INVALID_RESPONSE", "endTime,200,INVALID_RESPONSE",
+			"startTime,-1,NETWORK_ERROR", "endTime,-1,NETWORK_ERROR"})
+	void closedOrdersSingleBoundaryPreservesSafeErrorsAndSingleSend(String boundary, int status, String category) {
+		server.status.set(status);
+		server.body.set(MARKER);
+		assertSafeError(callClosed(Map.of(boundary, "2026-07-01T10:00:00+09:00")), category);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.credentialReads).hasValue(1);
+	}
+
 	@Test
 	void closedOrdersRecognizesPermissionWithinAuthenticationResponse() {
 		server.status.set(401);
@@ -1321,6 +1383,8 @@ class UpbitOrderToolsTest {
 							assertThat(local.clientCreations).hasValue(creations);
 							local.body.set(MARKER); // An accidental send would echo fake keys and the JWT too.
 							for (CallToolResult result : List.of(fixture.call(ID), fixture.callClosed(Map.of()),
+									fixture.callClosed(Map.of("startTime", "2026-07-01T10:00:00+09:00")),
+									fixture.callClosed(Map.of("endTime", "1782867600000")),
 									fixture.callExecutions("main", ID))) {
 								fixture.assertSafeError(result, "UNSAFE_TRANSPORT_CONFIGURATION");
 								assertThat(result.content().toString()).doesNotContain("Exception", "Caused by:", "\tat ");

@@ -176,6 +176,12 @@ class TradeLedgerMcpApplicationTests {
 		for (String name : List.of("market", "state", "startTime", "endTime", "orderBy")) {
 			assertThat(asMap(properties.get(name))).containsEntry("type", "string");
 		}
+		assertThat(specification.tool().description()).contains("independently optional")
+				.doesNotContain("Both time boundaries or neither");
+		for (String name : List.of("startTime", "endTime")) {
+			assertThat(asMap(properties.get(name)).get("description").toString())
+					.contains("independently usable").doesNotContain("requires");
+		}
 		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
 		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
 		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
