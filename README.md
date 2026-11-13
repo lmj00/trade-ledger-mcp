@@ -2,7 +2,7 @@
 
 완결된 거래의 실현 손익을 계산하고 업비트 주문·바이낸스 현물 체결을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`, 종료 주문 요약을 조회하는 `get_upbit_closed_orders`, 바이낸스 단일 symbol 최근 체결을 조회하는 `get_binance_account_trades`를 제공합니다. 등록 도구는 이 다섯 개이며 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
 
-두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. 반영 기록: 기존 바이낸스 요청·모델·매퍼·서명·HTTP 클라이언트를 재사용하는 MCP 도구와 응답 DTO, 지연 생성·종료 연결을 이번 후보에 추가했습니다. 이는 인증·HTTP 검증 완료를 의미하지 않습니다. 토스증권의 공식 API·내보내기 규격은 제공된 근거상 미확인입니다. 이번 작업은 제공 규격과 저장소 코드에 근거하며 외부 문서 열람·실계정 접근은 하지 않았습니다. **신규 검증 상태: 이번 후보의 서버 테스트와 독립 검토는 대기 상태입니다.**
+두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. 이번 후보에는 기존 업비트·바이낸스 스냅샷에서 공통 체결로 옮기는 내부 순수 변환을 추가했습니다. 기존 다섯 MCP 도구와 응답 계약은 유지하며 공통 모델의 MCP 연결은 아직 구현하지 않았습니다. 이는 인증·HTTP 검증 완료를 의미하지 않습니다. 토스증권의 공식 API·내보내기 규격은 제공된 근거상 미확인입니다. 이번 작업은 제공 규격과 저장소 코드에 근거하며 외부 문서 열람·실계정 접근은 하지 않았습니다. **신규 검증 상태: 이번 후보의 서버 테스트와 독립 검토는 대기 상태입니다.**
 
 ## 설치·빌드·실행
 
@@ -334,6 +334,20 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 유효 요청은 기존 `getAccountTrades`를 한 번 호출하고 GET을 정확히 한 번 전송합니다. 오류에 따른 추가 조회·자동 재시도는 없습니다. 키 누락·설정 거부·인증·보안 제한·418·429·5xx·리다이렉트·네트워크·시간 초과·본문 초과·손상 JSON은 기존 `BinanceErrorCode` 범주만 노출합니다. `-1021`은 `INVALID_TIMESTAMP`, `-1022`는 `INVALID_SIGNATURE`, `-2014`는 `INVALID_API_KEY_FORMAT`, `-2015`는 `KEY_IP_OR_PERMISSION_REJECTED`이며 **-2015의 원인을 키·IP·권한 중 하나로 단정하지 않습니다.** 안전한 범주가 없는 초기화 또는 예상 밖 오류는 원인 없는 `INTERNAL_ERROR`로 처리합니다.
 
 제공 코드가 참조하는 근거는 [바이낸스 현물 계정 체결 규격](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/account)입니다. 이번 작업에서는 외부 문서를 새로 조회하지 않았습니다. [BinanceAccountTradesToolsTest](src/test/java/io/github/lmj/tradeledger/mcp/BinanceAccountTradesToolsTest.java)에 가짜 키·고정 시계·기존 루프백 주입점을 통한 등록 핸들러 테스트, 입력·출력 경계, 오류·로그 비노출, 독립 JVM 설정 거부와 종료 단언을 추가했습니다. 기존 클라이언트의 단일 전송·독립 JVM·자원 종료 검사는 유지합니다. **테스트 작성과 실행 통과는 별개이며 신규 후보의 실제 결과는 서버 검증 대기입니다.**
+
+## 내부 공통 체결 변환
+
+[CommonExecutionSnapshot](src/main/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshot.java)은 불변 record이며 `fromUpbit(accountAlias, snapshot)`와 `fromBinance(snapshot)` 정적 메서드로 기존 스냅샷만 변환합니다. 별도 서비스·어댑터 인터페이스·의존성이나 HTTP·환경변수·파일 접근, MCP 등록은 추가하지 않습니다. 원본 체결 목록을 한 번 순회해 변환하며 추가 조회를 하지 않습니다. 성능 향상 수치는 측정하거나 주장하지 않습니다.
+
+각 체결에는 서비스 ID, 비밀정보가 아닌 계정 별칭, 원본 시장/symbol, 체결 ID, 주문 ID, `BUY`/`SELL`, 가격·수량·체결 금액 문자열과 `Instant`를 담습니다. 업비트 `bid`/`ask`는 각각 `BUY`/`SELL`, 바이낸스 `isBuyer`는 true일 때 `BUY`, false일 때 `SELL`로 옮깁니다. 금액 문자열의 고정밀 값·후행 0과 원본 종목을 변경하지 않고, 바이낸스 long ID는 정확한 십진 문자열로 보존합니다. 체결 ID의 구조적 키는 `(serviceId, accountAlias, symbol, executionId)`이며 다른 서비스·별칭·종목의 같은 ID를 합치지 않습니다. 별칭은 기존 바이낸스 도구와 같은 최대 256 UTF-16 코드 단위·공백만인 값 거부·ISO 제어문자 거부·올바른 surrogate 쌍 정책을 적용하며 유효한 값은 그대로 유지합니다.
+
+`fees`는 체결과 별도 목록입니다. 업비트 `paidFee`는 `ORDER` 범위와 주문 ID로 정확히 한 번 기록하며 통화는 `Optional.empty()`(미확인)입니다. 여러 체결에 배분하지 않고 무체결 주문의 수수료도 보존합니다. 바이낸스는 각 체결의 commission을 `FILL` 범위와 체결 ID로 기록하고 `commissionAsset` 원문을 통화로 유지합니다. 종목으로 통화를 추정하거나 서로 다른 수수료 자산을 합산·환산하지 않습니다. 주문 상태로 체결을 걸러내지 않으므로 체결이 있는 `cancel`과 무체결 주문도 변환합니다. 원본 주문 상태 등 서비스별 정보는 기존 스냅샷에 남습니다. 완결 `Trade` 생성, 매수/매도 매칭과 손익 계산은 수행하지 않습니다.
+
+조회 범위 `SINGLE_ORDER`는 주문 ID가 있고 `possiblyTruncated`는 해당 없음(`Optional.empty()`)입니다. `RECENT_SYMBOL`은 단일 주문 ID가 없으며 원본 바이낸스 `possiblyTruncated` true/false를 그대로 담습니다. **어느 범위도 전체 계정 내역 수집 완료를 표현하지 않습니다.** 빈 결과·false 역시 완료 보장이 아닙니다.
+
+변환은 누락·잘못된 별칭·알 수 없는 업비트 방향·부모 주문과 체결의 시장/방향 불일치·부모 symbol과 체결 symbol 불일치·중복 키를 부분 결과 없이 거부합니다. 오류는 입력값·원인·suppressed 예외가 없는 고정 메시지 `Invalid common execution snapshot`입니다. 목록은 빈 목록부터 최대 1000건까지 허용하며 결과 체결·수수료 목록은 방어 복사하고 변경을 막습니다.
+
+[CommonExecutionSnapshotTest](src/test/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshotTest.java)에 합성 입력의 필드 대응, 큰 ID·소수 정밀도·UTC 시각, 주문/체결 수수료, 취소·무체결, 키·입력 경계, 불변성과 조회 범위 회귀 테스트를 추가했습니다. **이번 후보의 테스트는 개발 환경에서 실행하지 않았으며 서버 테스트와 독립 검토 대기입니다.** 이번 개발 환경의 `java -version`은 `java: command not found`와 종료 코드 127을 반환했습니다. 서버는 Java 21, 오프라인·자원 제한과 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'`을 유지한 `/opt/gradle/bin/gradle test` 전체 실행 결과를 별도로 기록해야 합니다. 위의 이전 후보 실패 기록은 이번 변경의 검증 결과가 아닙니다. 공통 모델의 MCP 연결과 실계정 원본 대조는 남아 있으며 실계정은 미검증입니다.
 
 ## 현재 Trade로 표현할 수 있는 범위
 
