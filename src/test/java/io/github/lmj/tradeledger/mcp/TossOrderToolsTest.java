@@ -14,8 +14,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -32,6 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
+import java.util.stream.IntStream;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -41,9 +45,12 @@ import ch.qos.logback.core.read.ListAppender;
 import com.sun.net.httpserver.HttpServer;
 import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
 import io.github.lmj.tradeledger.adapter.toss.TossApiException;
+import io.github.lmj.tradeledger.adapter.toss.TossClosedOrdersRequest;
 import io.github.lmj.tradeledger.adapter.toss.TossErrorCode;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderClient;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderRequest;
+import io.github.lmj.tradeledger.application.model.TossClosedOrdersSnapshot;
+import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
@@ -84,6 +91,7 @@ import tools.jackson.databind.JsonNode;
 		mergeMode = TestExecutionListeners.MergeMode.MERGE_WITH_DEFAULTS)
 class TossOrderToolsTest {
 	private static final String NAME = "get_toss_order";
+	private static final String CLOSED_NAME = "get_toss_closed_orders";
 	private static final String ID = "PrivateMcpOrder%2F+";
 	private static final String TOKEN = "fake-toss-mcp-token";
 	private static final String ACCOUNT = "9007199254740993";
@@ -103,6 +111,7 @@ class TossOrderToolsTest {
 		server.keys.set(KEYS);
 		server.status.set(200);
 		server.body.set(TossOrderResponseTest.envelope(0, ID));
+		server.rawBody.set(null);
 		server.requests.set(0);
 		server.environmentReads.set(0);
 		server.paths.clear();
@@ -145,6 +154,186 @@ class TossOrderToolsTest {
 		assertThat(server.clientCreations).hasValue(creations);
 		assertThat(server.environmentReads).hasValue(0);
 		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void closedToolValidatesThenObtainsProviderAndQueriesExactlyOnePage() {
+		ObjectProvider<TossOrderClient> provider = mock(ObjectProvider.class);
+		TossOrderClient client = mock(TossOrderClient.class);
+		doReturn(client).when(provider).getObject();
+		var request = new TossClosedOrdersRequest("aApL.BrK-1", "2026-03-28", null, " opaque%2F=+/&?#한😀 ", 100);
+		var page = new TossClosedOrdersSnapshot(List.of(TossOrderResponseTest.snapshot(3, ID)), " next ", true);
+		when(client.getClosedOrders(request)).thenReturn(page);
+		assertThat(new TossOrderTools(provider).getTossClosedOrders(request.symbol(), request.from(), request.to(),
+				request.cursor(), request.limit())).isEqualTo(TossClosedOrdersResponse.from(page));
+		verify(provider).getObject();
+		verify(client).getClosedOrders(request);
+		verifyNoMoreInteractions(provider, client);
+	}
+
+	static Stream<Map<String, Object>> invalidClosedArguments() {
+		List<Map<String, Object>> cases = new ArrayList<>();
+		for (String field : List.of("symbol", "from", "to", "cursor")) {
+			for (Object wrong : List.of(123, 1.25, true, List.of(PRIVATE), Map.of(PRIVATE, TOKEN))) {
+				cases.add(Map.of(field, wrong));
+			}
+		}
+		for (Object wrong : List.of(0, 101, -1, 1.25, 1.0, new BigDecimal("1.0"), "20", true,
+				List.of(PRIVATE), Map.of(PRIVATE, TOKEN), Long.MAX_VALUE, 4294967316L,
+				new BigInteger("18446744073709551636"))) {
+			cases.add(Map.of("limit", wrong));
+		}
+		for (String wrong : List.of("", " ", "A/B", "a_b", "한", "x".repeat(257), PRIVATE + TOKEN + ACCOUNT + "!")) {
+			cases.add(Map.of("symbol", wrong));
+		}
+		for (String wrong : List.of("", " ", "\u2003", "x\n", "x\u0000", "x\u007f", "x\u0085", "x".repeat(257),
+				"\ud800", "\udc00", "x\ud800y", "\ud800\ud800", "😀\udc00", PRIVATE + TOKEN + ACCOUNT + "\n")) {
+			cases.add(Map.of("cursor", wrong));
+		}
+		for (String field : List.of("from", "to")) {
+			for (String wrong : List.of("", "2026-2-01", "2026-02-29", "2026-04-31", "2026-03-28T00:00:00Z",
+					" 2026-03-28", "2026-03-28 ", "２０２６-03-28", PRIVATE + TOKEN + ACCOUNT)) {
+				cases.add(Map.of(field, wrong));
+			}
+		}
+		cases.add(Map.of("from", "2026-03-29", "to", "2026-03-28"));
+		return cases.stream();
+	}
+
+	@ParameterizedTest
+	@MethodSource("invalidClosedArguments")
+	@SuppressWarnings("unchecked")
+	void closedInvalidInputsNeverObtainProviderReadEnvironmentOrTransmit(Map<String, Object> arguments) {
+		// Typed Java calls also validate before provider access; wrong JSON types
+		// are tested through the registered handler before adapter coercion.
+		if (arguments.entrySet().stream().allMatch(entry -> entry.getKey().equals("limit")
+				? entry.getValue() instanceof Integer : entry.getValue() instanceof String)) {
+			ObjectProvider<TossOrderClient> provider = mock(ObjectProvider.class);
+			assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(
+					(String) arguments.get("symbol"), (String) arguments.get("from"), (String) arguments.get("to"),
+					(String) arguments.get("cursor"), (Integer) arguments.get("limit")))
+					.hasMessage("Toss request failed: BAD_REQUEST").hasNoCause()
+					.satisfies(TossOrderToolsTest::assertSafeThrowable);
+			verifyNoInteractions(provider);
+		}
+		server.keys.set(Map.of());
+		int creations = server.clientCreations.get();
+		assertSafeError(callNamed(context, CLOSED_NAME, arguments), "BAD_REQUEST");
+		assertThat(server.clientCreations).hasValue(creations);
+		assertThat(server.environmentReads).hasValue(0);
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	void registeredInvalidClosedInputsNeverResolveEvenAnUncreatedLazyClient() {
+		AtomicInteger resolutions = new AtomicInteger();
+		runner().withBean("unavailableTossClient", TossOrderClient.class, () -> {
+			resolutions.incrementAndGet();
+			throw new IllegalStateException(PRIVATE + TOKEN + ACCOUNT);
+		}, definition -> { definition.setPrimary(true); definition.setLazyInit(true); }).run(application -> {
+			assertThat(application).hasNotFailed();
+			invalidClosedArguments().forEach(arguments ->
+					assertSafeError(callNamed(application, CLOSED_NAME, arguments), "BAD_REQUEST"));
+			assertThat(resolutions).hasValue(0);
+		});
+	}
+
+	@Test
+	void closedDefaultNullAndBoundaryRequestsSendOnlySpecifiedFiltersOnce() {
+		server.body.set(closedEnvelope(null, false));
+		List<Map<String, Object>> cases = new ArrayList<>();
+		cases.add(null);
+		cases.add(Map.of());
+		Map<String, Object> nulls = new LinkedHashMap<>();
+		for (String field : List.of("symbol", "from", "to", "cursor", "limit")) { nulls.put(field, null); }
+		cases.add(nulls);
+		cases.add(Map.of("limit", 1));
+		cases.add(Map.of("limit", 100));
+		cases.add(Map.of("from", "2024-02-29"));
+		cases.add(Map.of("to", "2026-03-28"));
+		cases.add(Map.of("from", "2026-03-28", "to", "2026-03-28"));
+		for (Map<String, Object> arguments : cases) {
+			int before = server.requests.get();
+			var result = callNamed(context, CLOSED_NAME, arguments);
+			assertThat(result.isError()).isFalse();
+			assertThat(server.requests).hasValue(before + 1);
+			Map<String, String> expected = new LinkedHashMap<>(Map.of("status", "CLOSED", "limit", "20"));
+			if (arguments != null) {
+				arguments.forEach((key, value) -> { if (value != null) { expected.put(key, value.toString()); } });
+			}
+			assertClosedQuery(expected);
+		}
+		// Also exercise the MCP request with an omitted arguments property.
+		var spec = ((List<?>) context.getBean("toolSpecs")).stream().map(SyncToolSpecification.class::cast)
+				.filter(candidate -> candidate.tool().name().equals(CLOSED_NAME)).findFirst().orElseThrow();
+		int before = server.requests.get();
+		assertThat(spec.callHandler().apply(null, CallToolRequest.builder(CLOSED_NAME).build()).isError()).isFalse();
+		assertThat(server.requests).hasValue(before + 1);
+		assertClosedQuery(Map.of("status", "CLOSED", "limit", "20"));
+	}
+
+	@Test
+	void closedFiltersPreserveOpaqueCursorAndSymbolWithoutChangingRequestTargetOrHeaders() {
+		server.body.set(closedEnvelope(null, false));
+		String cursor = " opaque%2F=+/&?#한😀 ";
+		Map<String, Object> arguments = Map.of("symbol", "aApL.BrK-1", "from", "2026-03-01", "to", "2026-03-28",
+				"cursor", cursor, "limit", 100);
+		assertThat(callNamed(context, CLOSED_NAME, arguments).isError()).isFalse();
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.paths).containsExactly("GET /api/v1/orders?status=CLOSED&limit=100&symbol=aApL%2EBrK-1"
+				+ "&from=2026-03-01&to=2026-03-28&cursor=%20opaque%252F%3D%2B%2F%26%3F%23%ED%95%9C%F0%9F%98%80%20");
+		assertClosedQuery(Map.of("status", "CLOSED", "limit", "100", "symbol", "aApL.BrK-1", "from", "2026-03-01",
+				"to", "2026-03-28", "cursor", cursor));
+		for (String boundary : List.of("x".repeat(256), "😀".repeat(128))) {
+			int before = server.requests.get();
+			assertThat(callNamed(context, CLOSED_NAME, Map.of("symbol", "a".repeat(256), "cursor", boundary)).isError()).isFalse();
+			assertThat(server.requests).hasValue(before + 1);
+			assertClosedQuery(Map.of("status", "CLOSED", "limit", "20", "symbol", "a".repeat(256), "cursor", boundary));
+		}
+	}
+
+	private void assertClosedQuery(Map<String, String> expected) {
+		URI target = URI.create(server.paths.getLast().substring("GET ".length()));
+		assertThat(target.getRawPath()).isEqualTo("/api/v1/orders");
+		assertThat(target.getRawFragment()).isNull();
+		Map<String, String> actual = new LinkedHashMap<>();
+		for (String pair : target.getRawQuery().split("&")) {
+			String[] parts = pair.split("=", 2);
+			assertThat(actual.put(parts[0], URLDecoder.decode(parts[1], StandardCharsets.UTF_8))).isNull();
+		}
+		assertThat(actual).isEqualTo(expected);
+		assertThat(server.headers.getLast()).isEqualTo("Bearer " + TOKEN + "|" + ACCOUNT + "|application/json");
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {0, 1, 4, 100})
+	void registeredClosedPagesKeepExactSummariesNullsAndServerMetadata(int count) {
+		String[] orders = IntStream.range(0, count).mapToObj(i -> TossOrderResponseTest.envelope(i % 4, "order-" + i))
+				.toArray(String[]::new);
+		for (boolean hasNext : List.of(false, true)) {
+			String cursor = hasNext ? " next%2F=+/&?#한😀 " : null;
+			server.body.set(closedEnvelope(cursor, hasNext, orders));
+			int before = server.requests.get();
+			var result = callNamed(context, CLOSED_NAME, Map.of("limit", 100));
+			assertThat(result.isError()).isFalse();
+			var actual = TossOrderResponseTest.JSON.valueToTree(result.structuredContent());
+			var expected = TossOrderResponseTest.JSON.readTree("{\"serviceId\":\"toss\",\"orders\":["
+					+ String.join(",", IntStream.range(0, count).mapToObj(i -> TossOrderResponseTest.expected(i % 4, "order-" + i)).toList())
+					+ "],\"nextCursor\":" + TossOrderResponseTest.JSON.writeValueAsString(cursor) + ",\"hasNext\":" + hasNext + "}");
+			assertThat(actual).isEqualTo(expected);
+			assertThat(result.content()).hasSize(1).allSatisfy(content ->
+					assertThat(content).isInstanceOfSatisfying(TextContent.class, text ->
+							assertThat(TossOrderResponseTest.JSON.readTree(text.text())).isEqualTo(expected)));
+			assertThat(server.requests).hasValue(before + 1);
+		}
+	}
+
+	private static String closedEnvelope(String cursor, boolean hasNext, String... wrappedOrders) {
+		List<String> orders = Stream.of(wrappedOrders)
+				.map(json -> json.substring("{\"result\":".length(), json.length() - 1)).toList();
+		return "{\"result\":{\"orders\":[" + String.join(",", orders) + "],\"nextCursor\":"
+				+ TossOrderResponseTest.JSON.writeValueAsString(cursor) + ",\"hasNext\":" + hasNext + "}}";
 	}
 
 	@Test
@@ -224,12 +413,51 @@ class TossOrderToolsTest {
 		assertThatThrownBy(() -> new TossOrderTools(provider).getTossOrder(ID))
 				.hasMessage("Toss request failed: " + code).hasNoCause()
 				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+		assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(null, null, null, null, null))
+				.hasMessage("Toss request failed: " + code).hasNoCause()
+				.satisfies(TossOrderToolsTest::assertSafeThrowable);
 		TossOrderClient client = mock(TossOrderClient.class);
 		doReturn(client).when(provider).getObject();
 		when(client.getOrder(any())).thenThrow(safeException(code));
+		when(client.getClosedOrders(any())).thenThrow(safeException(code));
 		assertThatThrownBy(() -> new TossOrderTools(provider).getTossOrder(ID))
 				.hasMessage("Toss request failed: " + code).hasNoCause()
 				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+		assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(null, null, null, null, null))
+				.hasMessage("Toss request failed: " + code).hasNoCause()
+				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void lastOrderProjectionFailureDiscardsEarlierProjectionAndPrivateExceptionGraph() {
+		RuntimeException failure = new IllegalStateException(PRIVATE + TOKEN + ACCOUNT + ID,
+				new IllegalArgumentException(PRIVATE));
+		failure.addSuppressed(new IllegalStateException(TOKEN));
+		TossOrderSnapshot damaged = mock(TossOrderSnapshot.class);
+		when(damaged.orderId()).thenReturn("damaged-order");
+		when(damaged.execution()).thenThrow(failure);
+		var page = new TossClosedOrdersSnapshot(List.of(TossOrderResponseTest.snapshot(0, "first"), damaged), null, false);
+		TossOrderClient client = mock(TossOrderClient.class);
+		when(client.getClosedOrders(any())).thenReturn(page);
+		ObjectProvider<TossOrderClient> provider = mock(ObjectProvider.class);
+		doReturn(client).when(provider).getObject();
+		assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(null, null, null, null, null))
+				.hasMessage("Toss request failed: INTERNAL_ERROR").hasNoCause()
+				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+		runner().withBean("projectionFailureTossClient", TossOrderClient.class, () -> client, definition -> {
+			definition.setPrimary(true);
+			definition.setLazyInit(true);
+			definition.setDestroyMethodName("close");
+		}).run(application -> {
+			assertThat(application).hasNotFailed();
+			assertSafeError(callNamed(application, CLOSED_NAME, Map.of()), "INTERNAL_ERROR");
+		});
+		verify(provider).getObject();
+		verify(client, org.mockito.Mockito.times(2)).getClosedOrders(new TossClosedOrdersRequest());
+		verify(client).close();
+		verifyNoMoreInteractions(provider, client);
+		assertThat(server.requests).hasValue(0);
 	}
 
 	@Test
@@ -242,10 +470,12 @@ class TossOrderToolsTest {
 					for (TossErrorCode code : TossErrorCode.values()) {
 						failure.set(new BeanCreationException(PRIVATE + TOKEN + ACCOUNT + ID, safeException(code)));
 						assertSafeError(call(application, arguments(ID)), code.name());
+						assertSafeError(callNamed(application, CLOSED_NAME, Map.of()), code.name());
 					}
 					failure.set(new BeanCreationException(PRIVATE + TOKEN + ACCOUNT + ID,
 							new IllegalStateException(PRIVATE)));
 					assertSafeError(call(application, arguments(ID)), "INTERNAL_ERROR");
+					assertSafeError(callNamed(application, CLOSED_NAME, Map.of()), "INTERNAL_ERROR");
 				});
 		assertThat(server.requests).hasValue(0);
 	}
@@ -262,13 +492,21 @@ class TossOrderToolsTest {
 		assertThatThrownBy(() -> new TossOrderTools(provider).getTossOrder(ID))
 				.hasMessage("Toss request failed: INTERNAL_ERROR").hasNoCause()
 				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+		assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(null, null, null, null, null))
+				.hasMessage("Toss request failed: INTERNAL_ERROR").hasNoCause()
+				.satisfies(TossOrderToolsTest::assertSafeThrowable);
 		TossOrderClient client = mock(TossOrderClient.class);
 		doReturn(client).when(provider).getObject();
 		when(client.getOrder(any())).thenReturn(null);
+		when(client.getClosedOrders(any())).thenReturn(null);
 		assertThatThrownBy(() -> new TossOrderTools(provider).getTossOrder(ID))
 				.hasMessage("Toss request failed: INTERNAL_ERROR").hasNoCause()
 				.satisfies(TossOrderToolsTest::assertSafeThrowable);
 		verify(client).getOrder(new TossOrderRequest(ID));
+		assertThatThrownBy(() -> new TossOrderTools(provider).getTossClosedOrders(null, null, null, null, null))
+				.hasMessage("Toss request failed: INTERNAL_ERROR").hasNoCause()
+				.satisfies(TossOrderToolsTest::assertSafeThrowable);
+		verify(client).getClosedOrders(new TossClosedOrdersRequest());
 		runner().withBean("faultyTossClient", TossOrderClient.class, () -> client, definition -> {
 			definition.setPrimary(true);
 			definition.setLazyInit(true);
@@ -276,8 +514,10 @@ class TossOrderToolsTest {
 		}).run(application -> {
 			assertThat(application).hasNotFailed();
 			assertSafeError(call(application, arguments(ID)), "INTERNAL_ERROR");
+			assertSafeError(callNamed(application, CLOSED_NAME, Map.of()), "INTERNAL_ERROR");
 		});
 		verify(client, org.mockito.Mockito.times(2)).getOrder(new TossOrderRequest(ID));
+		verify(client, org.mockito.Mockito.times(2)).getClosedOrders(new TossClosedOrdersRequest());
 		verify(client).close();
 		verifyNoMoreInteractions(client);
 		assertThat(server.requests).hasValue(0);
@@ -300,6 +540,48 @@ class TossOrderToolsTest {
 		};
 		assertSafeError(call(context, arguments(ID)), category);
 		assertThat(server.requests).hasValue(1);
+		assertSafeError(callNamed(context, CLOSED_NAME, Map.of()), category);
+		assertThat(server.requests).hasValue(2);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"overLimit", "duplicate", "metadata", "missingMetadata", "lastDamaged", "utf8", "oversized", "timeout"})
+	void registeredClosedFailuresRejectWholePageAndNeverTransmitAgain(String scenario) {
+		String first = TossOrderResponseTest.envelope(0, "first");
+		String category = "INVALID_RESPONSE";
+		Map<String, Object> arguments = Map.of();
+		switch (scenario) {
+			case "overLimit" -> {
+				server.body.set(closedEnvelope(null, false, first, TossOrderResponseTest.envelope(1, "last")));
+				arguments = Map.of("limit", 1);
+			}
+			case "duplicate" -> server.body.set(closedEnvelope(null, false, first, first));
+			case "metadata" -> server.body.set(closedEnvelope(PRIVATE, false, first));
+			case "missingMetadata" -> server.body.set(closedEnvelope(null, false, first).replace("\"hasNext\":false", "\"ignored\":false"));
+			case "lastDamaged" -> server.body.set(closedEnvelope(null, false, first,
+					TossOrderResponseTest.envelope(3, "last").replace("\"filledQuantity\":\"2.00\"", "\"filledQuantity\":\"" + PRIVATE + "\"")));
+			case "utf8" -> {
+				byte[] body = closedEnvelope(null, false, first).getBytes(StandardCharsets.UTF_8);
+				// A malformed byte within a JSON string must not be replaced silently.
+				int index = new String(body, StandardCharsets.UTF_8).indexOf("first");
+				body[index] = (byte) 0xc3;
+				server.rawBody.set(body);
+			}
+			case "oversized" -> {
+				server.body.set(" ".repeat(1_048_577) + PRIVATE);
+				category = "RESPONSE_TOO_LARGE";
+			}
+			case "timeout" -> {
+				server.status.set(-2);
+				category = "TIMEOUT";
+			}
+			default -> throw new AssertionError(scenario);
+		}
+		try {
+			assertSafeError(callNamed(context, CLOSED_NAME, arguments), category);
+			assertThat(server.requests).hasValue(1);
+		}
+		finally { server.release.get().countDown(); }
 	}
 
 	@ParameterizedTest
@@ -331,6 +613,9 @@ class TossOrderToolsTest {
 		server.keys.set(Map.of());
 		assertSafeError(call(context, arguments(ID)), "MISSING_CREDENTIALS");
 		assertThat(server.environmentReads).hasValue(1);
+		assertThat(server.requests).hasValue(0);
+		assertSafeError(callNamed(context, CLOSED_NAME, Map.of()), "MISSING_CREDENTIALS");
+		assertThat(server.environmentReads).hasValue(2);
 		assertThat(server.requests).hasValue(0);
 	}
 
@@ -395,48 +680,52 @@ class TossOrderToolsTest {
 	public static final class StartupProbe {
 		public static void main(String[] args) {
 			try {
-				AtomicReference<LocalToss> retained = new AtomicReference<>();
-				runner().withUserConfiguration(LocalConfiguration.class).withPropertyValues(
-						"logging.console.enabled=false", "spring.main.banner-mode=off").run(application -> {
-					assertThat(application).hasNotFailed();
-					LocalToss local = application.getBean(LocalToss.class);
-					retained.set(local);
-					local.keys.set(Map.of());
-					assertLazy(application);
-					List<?> specs = (List<?>) application.getBean("toolSpecs");
-					assertThat(specs.stream().map(SyncToolSpecification.class::cast).map(spec -> spec.tool().name()))
-							.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
-									"get_upbit_closed_orders", "get_upbit_order_executions", "get_binance_account_trades",
-									"get_binance_account_executions", NAME);
-					CallToolResult summary = callNamed(application, "summarize_journal", Map.of("journalName", "sample-trades"));
-					assertThat(summary.isError()).isNotEqualTo(Boolean.TRUE);
-					assertThat(TossOrderResponseTest.JSON.valueToTree(summary.structuredContent()).get("totalNetPnl").asString())
-							.isEqualTo("355.78645");
-					Map<String, Object> trade = Map.ofEntries(
-							Map.entry("tradeId", "probe-trade"), Map.entry("symbol", "BTC-USDT"),
-							Map.entry("market", "CRYPTO"), Map.entry("direction", "LONG"),
-							Map.entry("quantity", "1"), Map.entry("entryPrice", "100"), Map.entry("exitPrice", "110"),
-							Map.entry("fees", "1"), Map.entry("currency", "USDT"),
-							Map.entry("openedAt", "2026-07-01T00:00:00Z"),
-							Map.entry("closedAt", "2026-07-01T01:00:00Z"), Map.entry("strategy", "probe"));
-					CallToolResult analysis = callNamed(application, "analyze_trades", Map.of("trades", List.of(trade)));
-					assertThat(analysis.isError()).isNotEqualTo(Boolean.TRUE);
-					assertThat(TossOrderResponseTest.JSON.valueToTree(analysis.structuredContent()).get("totalNetPnl").asString())
-							.isEqualTo("9");
-					assertError(call(application, Map.of()), "BAD_REQUEST");
-					assertLazy(application);
-					assertThat(local.environmentReads).hasValue(0);
-					assertThat(local.clientCreations).hasValue(0);
-					if (args[0].equals("clearedLogging")) { System.clearProperty(HTTP_LOG); }
-					assertError(call(application, arguments(ID)), args[0].equals("missing")
-							? "MISSING_CREDENTIALS" : "UNSAFE_TRANSPORT_CONFIGURATION");
-					assertThat(local.requests).hasValue(0);
-					assertThat(local.clientCreations).hasValue(1);
-					assertThat(local.environmentReads).hasValue(args[0].equals("missing") ? 1 : 0);
-				});
-				LocalToss local = retained.get();
-				assertThat(local.closed).isTrue();
-				if (local.transport != null) { assertThat(local.transport.isTerminated()).isTrue(); }
+				for (String lookup : List.of(NAME, CLOSED_NAME)) {
+					AtomicReference<LocalToss> retained = new AtomicReference<>();
+					runner().withUserConfiguration(LocalConfiguration.class).withPropertyValues(
+							"logging.console.enabled=false", "spring.main.banner-mode=off").run(application -> {
+						assertThat(application).hasNotFailed();
+						LocalToss local = application.getBean(LocalToss.class);
+						retained.set(local);
+						local.keys.set(Map.of());
+						assertLazy(application);
+						List<?> specs = (List<?>) application.getBean("toolSpecs");
+						assertThat(specs.stream().map(SyncToolSpecification.class::cast).map(spec -> spec.tool().name()))
+								.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
+										"get_upbit_closed_orders", "get_upbit_order_executions", "get_binance_account_trades",
+										"get_binance_account_executions", NAME, CLOSED_NAME);
+						CallToolResult summary = callNamed(application, "summarize_journal", Map.of("journalName", "sample-trades"));
+						assertThat(summary.isError()).isNotEqualTo(Boolean.TRUE);
+						assertThat(TossOrderResponseTest.JSON.valueToTree(summary.structuredContent()).get("totalNetPnl").asString())
+								.isEqualTo("355.78645");
+						Map<String, Object> trade = Map.ofEntries(
+								Map.entry("tradeId", "probe-trade"), Map.entry("symbol", "BTC-USDT"),
+								Map.entry("market", "CRYPTO"), Map.entry("direction", "LONG"),
+								Map.entry("quantity", "1"), Map.entry("entryPrice", "100"), Map.entry("exitPrice", "110"),
+								Map.entry("fees", "1"), Map.entry("currency", "USDT"),
+								Map.entry("openedAt", "2026-07-01T00:00:00Z"),
+								Map.entry("closedAt", "2026-07-01T01:00:00Z"), Map.entry("strategy", "probe"));
+						CallToolResult analysis = callNamed(application, "analyze_trades", Map.of("trades", List.of(trade)));
+						assertThat(analysis.isError()).isNotEqualTo(Boolean.TRUE);
+						assertThat(TossOrderResponseTest.JSON.valueToTree(analysis.structuredContent()).get("totalNetPnl").asString())
+								.isEqualTo("9");
+						assertError(call(application, Map.of()), "BAD_REQUEST");
+						assertLazy(application);
+						assertThat(local.environmentReads).hasValue(0);
+						assertThat(local.clientCreations).hasValue(0);
+						if (args[0].equals("clearedLogging")) { System.clearProperty(HTTP_LOG); }
+						assertError(callNamed(application, CLOSED_NAME, Map.of("limit", 1.25)), "BAD_REQUEST");
+						assertLazy(application);
+						assertError(callNamed(application, lookup, lookup.equals(NAME) ? arguments(ID) : Map.of()), args[0].equals("missing")
+								? "MISSING_CREDENTIALS" : "UNSAFE_TRANSPORT_CONFIGURATION");
+						assertThat(local.requests).hasValue(0);
+						assertThat(local.clientCreations).hasValue(1);
+						assertThat(local.environmentReads).hasValue(args[0].equals("missing") ? 1 : 0);
+					});
+					LocalToss local = retained.get();
+					assertThat(local.closed).isTrue();
+					if (local.transport != null) { assertThat(local.transport.isTerminated()).isTrue(); }
+				}
 				System.out.println("PROBE_OK");
 			}
 			catch (Throwable failure) {
@@ -563,6 +852,7 @@ class TossOrderToolsTest {
 		final AtomicInteger environmentReads = new AtomicInteger();
 		final AtomicInteger status = new AtomicInteger(200);
 		final AtomicReference<String> body = new AtomicReference<>();
+		final AtomicReference<byte[]> rawBody = new AtomicReference<>();
 		final List<String> paths = new CopyOnWriteArrayList<>();
 		final List<String> headers = new CopyOnWriteArrayList<>();
 		final AtomicReference<CountDownLatch> release = new AtomicReference<>(new CountDownLatch(1));
@@ -586,7 +876,7 @@ class TossOrderToolsTest {
 						return;
 					}
 					if (status.get() == 302) { exchange.getResponseHeaders().set("Location", uri().toString()); }
-					byte[] bytes = body.get().getBytes(StandardCharsets.UTF_8);
+					byte[] bytes = rawBody.get() == null ? body.get().getBytes(StandardCharsets.UTF_8) : rawBody.get();
 					exchange.sendResponseHeaders(status.get(), bytes.length);
 					exchange.getResponseBody().write(bytes);
 				}
