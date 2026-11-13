@@ -5,7 +5,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 
+import io.github.lmj.tradeledger.application.model.TossClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
 import io.github.lmj.tradeledger.application.model.TossOrderSnapshot.ExecutionSummary;
 import tools.jackson.core.JacksonException;
@@ -17,7 +19,7 @@ import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-/** Pure, bounded mapping of a single success envelope. No transport or pagination. */
+/** Pure, bounded mapping of one order or one CLOSED page. No transport or page traversal. */
 public final class TossOrderMapper {
 
 	// Project resource limits; decimal field length 30 comes from the official schema.
@@ -39,7 +41,7 @@ public final class TossOrderMapper {
 			throw invalid();
 		}
 		try {
-			checkTokens(json);
+			checkTokens(json, -1);
 			JsonNode envelope = object(JSON.readTree(json));
 			if (envelope.get("error") != null) {
 				throw invalid();
@@ -49,18 +51,7 @@ public final class TossOrderMapper {
 			if (!request.orderId().equals(id)) {
 				throw invalid();
 			}
-			JsonNode execution = object(order.get("execution"));
-			return new TossOrderSnapshot(id, text(order, "symbol", true, false),
-					text(order, "side", true, false), text(order, "orderType", true, false),
-					text(order, "timeInForce", true, false), text(order, "status", true, false),
-					text(order, "price", false, true), text(order, "quantity", true, false),
-					text(order, "orderAmount", false, true), text(order, "currency", true, false),
-					instant(order, "orderedAt", true, false), instant(order, "canceledAt", false, true),
-					new ExecutionSummary(text(execution, "filledQuantity", true, false),
-							text(execution, "averageFilledPrice", true, true),
-							text(execution, "filledAmount", true, true),
-							text(execution, "commission", true, true), text(execution, "tax", true, true),
-							instant(execution, "filledAt", true, true), date(execution, "settlementDate")));
+			return mapOrder(order);
 		}
 		catch (JacksonException | IllegalArgumentException | DateTimeException exception) {
 			// Neither parser/date diagnostics nor raw values may escape in the exception graph.
@@ -68,7 +59,53 @@ public final class TossOrderMapper {
 		}
 	}
 
-	private static void checkTokens(String json) {
+	public TossClosedOrdersSnapshot mapClosedOrders(TossClosedOrdersRequest request, String json) {
+		if (request == null || json == null || json.length() > MAX_JSON_LENGTH) {
+			throw invalid();
+		}
+		try {
+			checkTokens(json, request.limit());
+			JsonNode envelope = object(JSON.readTree(json));
+			if (envelope.get("error") != null) {
+				throw invalid();
+			}
+			JsonNode page = object(envelope.get("result"));
+			JsonNode orders = page.get("orders");
+			JsonNode hasNext = page.get("hasNext");
+			if (orders == null || !orders.isArray() || orders.size() > request.limit()
+					|| orders.size() > TossClosedOrdersSnapshot.MAX_ORDERS
+					|| hasNext == null || !hasNext.isBoolean()) {
+				throw invalid();
+			}
+			String cursor = text(page, "nextCursor", true, true);
+			var snapshots = new ArrayList<TossOrderSnapshot>(orders.size());
+			for (JsonNode order : orders) {
+				snapshots.add(mapOrder(object(order)));
+			}
+			return new TossClosedOrdersSnapshot(snapshots, cursor, hasNext.asBoolean());
+		}
+		catch (JacksonException | IllegalArgumentException | DateTimeException exception) {
+			throw invalid();
+		}
+	}
+
+	private static TossOrderSnapshot mapOrder(JsonNode order) {
+		String id = text(order, "orderId", true, false);
+		JsonNode execution = object(order.get("execution"));
+		return new TossOrderSnapshot(id, text(order, "symbol", true, false),
+				text(order, "side", true, false), text(order, "orderType", true, false),
+				text(order, "timeInForce", true, false), text(order, "status", true, false),
+				text(order, "price", false, true), text(order, "quantity", true, false),
+				text(order, "orderAmount", false, true), text(order, "currency", true, false),
+				instant(order, "orderedAt", true, false), instant(order, "canceledAt", false, true),
+				new ExecutionSummary(text(execution, "filledQuantity", true, false),
+						text(execution, "averageFilledPrice", true, true),
+						text(execution, "filledAmount", true, true),
+						text(execution, "commission", true, true), text(execution, "tax", true, true),
+						instant(execution, "filledAt", true, true), date(execution, "settlementDate")));
+	}
+
+	private static void checkTokens(String json, int maxOrders) {
 		// Read the complete document, including ignored fields and damaged tails,
 		// before allocating a tree or producing any summary. Two linear passes.
 		try (var parser = JSON.createParser(json)) {
@@ -76,17 +113,41 @@ public final class TossOrderMapper {
 				throw invalid();
 			}
 			int depth = 1;
+			String property = null;
+			boolean resultObject = false;
+			int ordersDepth = -1;
+			int orderCount = 0;
 			JsonToken token;
 			while ((token = parser.nextToken()) != null) {
 				if (depth == 0) {
 					throw invalid();
 				}
+				// Count direct result.orders elements before allocating any tree nodes.
+				if (depth == ordersDepth && token != JsonToken.END_ARRAY && ++orderCount > maxOrders) {
+					throw invalid();
+				}
+				if (token == JsonToken.PROPERTY_NAME) {
+					property = parser.getString();
+				}
 				if (token == JsonToken.START_OBJECT || token == JsonToken.START_ARRAY) {
+					if (depth == 1 && "result".equals(property) && token == JsonToken.START_OBJECT) {
+						resultObject = true;
+					}
+					if (maxOrders >= 0 && depth == 2 && resultObject && "orders".equals(property)
+							&& token == JsonToken.START_ARRAY) {
+						ordersDepth = 3;
+					}
 					if (++depth > MAX_NESTING_DEPTH) {
 						throw invalid();
 					}
 				}
 				else if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
+					if (depth == ordersDepth) {
+						ordersDepth = -1;
+					}
+					if (depth == 2) {
+						resultObject = false;
+					}
 					depth--;
 				}
 				else if (token == JsonToken.PROPERTY_NAME || token == JsonToken.VALUE_STRING) {
