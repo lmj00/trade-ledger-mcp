@@ -28,6 +28,25 @@ class BinanceAccountTradesMapperTest {
 	private static final String MARKER = "synthetic-private-marker";
 
 	@Test
+	void enforcesInclusiveRequestBoundWithoutChangingUnfilteredInt64Contract() {
+		for (long id : new long[] {0, 9_007_199_254_740_993L, Long.MAX_VALUE}) {
+			var request = new BinanceAccountTradesRequest(SYMBOL, 2, Long.toString(id));
+			assertThat(mapper.map(ALIAS, request, array(fill(id))).trades().getFirst().id()).isEqualTo(id);
+			assertThat(mapper.map(ALIAS, request, "[]").possiblyTruncated()).isFalse();
+			assertSafeFailure(() -> mapper.map(ALIAS, request, array(fill(id - 1))));
+			assertSafeFailure(() -> mapper.map(ALIAS, request, array(fill(id), fill(id - 1))));
+		}
+		var request = new BinanceAccountTradesRequest(SYMBOL, 2, "10");
+		assertThat(mapper.map(ALIAS, request, array(fill(10), fill(11))).possiblyTruncated()).isTrue();
+		assertThat(mapper.map(ALIAS, request, array(fill(11))).possiblyTruncated()).isFalse();
+		assertSafeFailure(() -> mapper.map(ALIAS, request, array(fill(10), fill(10))));
+		assertSafeFailure(() -> mapper.map(ALIAS, request, array(fill(10), fill(11), fill(12))));
+		assertSafeFailure(() -> mapper.map(ALIAS, (BinanceAccountTradesRequest) null, "[]"));
+		assertThat(mapper.map(ALIAS, SYMBOL, array(fill(Long.MIN_VALUE))).trades().getFirst().id())
+				.isEqualTo(Long.MIN_VALUE);
+	}
+
+	@Test
 	void mapsEmptyArrayWithoutClaimingCompleteHistory() {
 		var snapshot = mapper.map(ALIAS, SYMBOL, "[]");
 		assertThat(snapshot.serviceId()).isEqualTo("binance");

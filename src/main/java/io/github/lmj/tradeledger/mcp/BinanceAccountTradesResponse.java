@@ -5,7 +5,7 @@ import java.util.Objects;
 
 import io.github.lmj.tradeledger.application.model.BinanceAccountTradesSnapshot;
 
-/** Recent fills only; even short or empty results do not establish complete history. */
+/** One recent or inclusive-fromId result; short or empty results do not establish complete history. */
 public record BinanceAccountTradesResponse(String serviceId, String accountAlias, String symbol,
 		List<ExecutionResponse> trades, boolean possiblyTruncated) {
 
