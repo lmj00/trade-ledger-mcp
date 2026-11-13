@@ -66,6 +66,78 @@ class BinanceAccountTradesClientTest {
 			""".strip();
 
 	@Test
+	void signsEachTimeCombinationExactlyOnceAndPreservesInt64(CapturedOutput output) throws Exception {
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> signatures = new ArrayList<>();
+		AtomicReference<String> body = new AtomicReference<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			reply(exchange, 200, body.get());
+		})) {
+			var client = server.client();
+			for (String value : List.of("0", "9007199254740993", "9223372036854775807")) {
+				for (int mode = 0; mode < 3; mode++) {
+					String start = mode == 1 ? null : value;
+					String end = mode == 0 ? null : value;
+					body.set("[" + FILL.replace("1499865549590", value) + "]");
+					int before = requests.size();
+					var result = client.getAccountTrades(ALIAS,
+							new BinanceAccountTradesRequest("BTCUSDT", 1, null, start, end));
+					assertThat(requests).hasSize(before + 1);
+					assertThat(requests.getLast()).startsWith("GET " + PATH + "?");
+					String raw = URI.create(requests.getLast().substring(4)).getRawQuery();
+					int boundary = raw.indexOf("&signature=");
+					String query = raw.substring(0, boundary);
+					String signature = raw.substring(boundary + "&signature=".length());
+					signatures.add(signature);
+					assertThat(query).isEqualTo("symbol=BTCUSDT&limit=1"
+							+ (start == null ? "" : "&startTime=" + start)
+							+ (end == null ? "" : "&endTime=" + end)
+							+ "&recvWindow=5000&timestamp=1700000000123");
+					for (String field : List.of("startTime", "endTime")) {
+						String bound = field.equals("startTime") ? start : end;
+						assertThat(query.split("&")).filteredOn(part -> part.startsWith(field + "="))
+								.containsExactly(bound == null ? new String[0] : new String[] {field + "=" + bound});
+					}
+					assertThat(signature).isEqualTo(hmac(query));
+					assertThat(result.trades().getFirst().time()).isEqualTo(Instant.ofEpochMilli(Long.parseLong(value)));
+					assertThat(result.possiblyTruncated()).isTrue();
+				}
+			}
+		}
+		assertSafeOutput(output, signatures);
+	}
+
+	@Test
+	void rejectsTimeOutsideEitherBoundAtEveryPosition(CapturedOutput output) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, body.get());
+		})) {
+			var client = server.client();
+			for (int mode = 0; mode < 3; mode++) {
+				var request = new BinanceAccountTradesRequest("BTCUSDT", 2, null,
+						mode == 1 ? null : "1499865549590", mode == 0 ? null : "1499865549590");
+				for (String time : List.of("1499865549589", "1499865549591")) {
+					if ((mode == 0 && time.endsWith("91")) || (mode == 1 && time.endsWith("89"))) {
+						continue;
+					}
+					String outside = FILL.replace("1499865549590", time)
+							.replace("\"id\":9007199254740993", "\"id\":1");
+					for (String invalid : List.of("[" + outside + "]", "[" + FILL + "," + outside + "]")) {
+						body.set(invalid);
+						expect(BinanceErrorCode.INVALID_RESPONSE, () -> client.getAccountTrades(ALIAS, request));
+					}
+				}
+			}
+			assertThat(calls).hasValue(8);
+		}
+		assertSafeOutput(output, List.of());
+	}
+
+	@Test
 	void signsFromIdExactlyOnceAndAcceptsEqualIds(CapturedOutput output) throws Exception {
 		List<String> requests = new CopyOnWriteArrayList<>();
 		List<String> signatures = new ArrayList<>();

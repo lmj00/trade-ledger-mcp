@@ -47,6 +47,39 @@ class BinanceAccountTradesMapperTest {
 	}
 
 	@Test
+	void enforcesTimeBoundsInExistingTraversalAtEveryPosition() {
+		for (long start : new long[] {0, 9_007_199_254_740_993L, Long.MAX_VALUE - 2}) {
+			long end = start + 2;
+			for (int mode = 0; mode < 3; mode++) {
+				var request = new BinanceAccountTradesRequest(SYMBOL, 3, null,
+						mode == 1 ? null : Long.toString(start), mode == 0 ? null : Long.toString(end));
+				String first = raw(fill(1), "time", Long.toString(start));
+				String middle = raw(fill(2), "time", Long.toString(start + 1));
+				String last = raw(fill(3), "time", Long.toString(end));
+				var result = mapper.map(ALIAS, request, array(first, middle, last));
+				assertThat(result.trades()).extracting(Execution::time).containsExactly(
+						Instant.ofEpochMilli(start), Instant.ofEpochMilli(start + 1), Instant.ofEpochMilli(end));
+				assertThat(result.possiblyTruncated()).isTrue();
+				assertThat(mapper.map(ALIAS, request, array(middle)).possiblyTruncated()).isFalse();
+				assertThat(mapper.map(ALIAS, request, "[]").trades()).isEmpty();
+				if (mode != 1) {
+					String below = raw(fill(4), "time", Long.toString(start - 1));
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(below)));
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(middle, below)));
+				}
+				if (mode != 0 && end < Long.MAX_VALUE) {
+					String above = raw(fill(4), "time", Long.toString(end + 1));
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(above)));
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(middle, above)));
+				}
+			}
+			var equal = new BinanceAccountTradesRequest(SYMBOL, 2, null, Long.toString(start), Long.toString(start));
+			assertThat(mapper.map(ALIAS, equal, array(raw(fill(1), "time", Long.toString(start))))
+					.trades().getFirst().time()).isEqualTo(Instant.ofEpochMilli(start));
+		}
+	}
+
+	@Test
 	void mapsEmptyArrayWithoutClaimingCompleteHistory() {
 		var snapshot = mapper.map(ALIAS, SYMBOL, "[]");
 		assertThat(snapshot.serviceId()).isEqualTo("binance");

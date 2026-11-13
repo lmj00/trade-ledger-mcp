@@ -4,9 +4,10 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Immutable input for one Spot account trade query for a single symbol.
- * Only symbol, limit and optional inclusive fromId are retained, without credentials.
- * Order IDs, time filters and automatic pagination are unsupported.
- * fromId follows project policy: canonical ASCII decimal, 0 through Long.MAX_VALUE.
+ * Only symbol, limit, optional inclusive fromId and time bounds are retained, without credentials.
+ * Order IDs and automatic pagination are unsupported; fromId cannot mix with time bounds.
+ * fromId and time bounds follow project policy: canonical ASCII decimal, 0 through Long.MAX_VALUE.
+ * Time bounds support milliseconds only; two bounds must be ordered and at most 24 hours apart.
  *
  * <p>Project policy, not Binance symbol grammar: symbol must be nonblank,
  * contain at most 256 UTF-16 code units (consistent with the response mapper),
@@ -20,6 +21,8 @@ public final class BinanceAccountTradesRequest {
 	private final String symbol;
 	private final int limit;
 	private final Long fromId;
+	private final Long startTime;
+	private final Long endTime;
 
 	public BinanceAccountTradesRequest(String symbol) {
 		this(symbol, 500);
@@ -30,12 +33,24 @@ public final class BinanceAccountTradesRequest {
 	}
 
 	public BinanceAccountTradesRequest(String symbol, int limit, String fromId) {
+		this(symbol, limit, fromId, null, null);
+	}
+
+	public BinanceAccountTradesRequest(String symbol, int limit, String fromId, String startTime, String endTime) {
 		if (!validSymbol(symbol) || limit < 1 || limit > 1000) {
 			throw invalid();
 		}
 		this.symbol = symbol;
 		this.limit = limit;
-		this.fromId = parseFromId(fromId);
+		this.fromId = parseBound(fromId);
+		this.startTime = parseBound(startTime);
+		this.endTime = parseBound(endTime);
+		// Ordered nonnegative int64 values make subtraction safe, even near Long.MAX_VALUE.
+		if ((this.fromId != null && (this.startTime != null || this.endTime != null))
+				|| (this.startTime != null && this.endTime != null
+						&& (this.startTime > this.endTime || this.endTime - this.startTime > 86_400_000L))) {
+			throw invalid();
+		}
 	}
 
 	public String symbol() {
@@ -50,7 +65,15 @@ public final class BinanceAccountTradesRequest {
 		return fromId;
 	}
 
-	private static Long parseFromId(String value) {
+	public Long startTime() {
+		return startTime;
+	}
+
+	public Long endTime() {
+		return endTime;
+	}
+
+	private static Long parseBound(String value) {
 		if (value == null) {
 			return null;
 		}
@@ -77,7 +100,10 @@ public final class BinanceAccountTradesRequest {
 			throw invalid();
 		}
 		return "symbol=" + encode(symbol) + "&limit=" + limit
-				+ (fromId == null ? "" : "&fromId=" + fromId) + "&recvWindow=5000&timestamp=" + timestamp;
+				+ (fromId == null ? "" : "&fromId=" + fromId)
+				+ (startTime == null ? "" : "&startTime=" + startTime)
+				+ (endTime == null ? "" : "&endTime=" + endTime)
+				+ "&recvWindow=5000&timestamp=" + timestamp;
 	}
 
 	private static boolean validSymbol(String value) {

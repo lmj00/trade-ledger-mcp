@@ -145,7 +145,103 @@ class BinanceAccountTradesToolsTest {
 	}
 
 	@Test
-	void registersOptionalStringFromIdAndKeepsAllSevenTools() {
+	void registeredTimeFiltersPreserveBoundariesAndEmptyResults() {
+		for (String value : List.of("0", "9007199254740993", "9223372036854775807")) {
+			for (int mode = 0; mode < 3; mode++) {
+				Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 1);
+				if (mode != 1) {
+					args.put("startTime", value);
+				}
+				if (mode != 0) {
+					args.put("endTime", value);
+				}
+				for (boolean empty : List.of(false, true)) {
+					server.body.set(empty ? "[]" : "[" + FILL.replace("1499865549590", value) + "]");
+					int before = server.requests.get();
+					CallToolResult result = call(args);
+					assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+					assertThat(server.requests).hasValue(before + 1);
+					assertThat(server.paths.getLast()).startsWith("GET /api/v3/myTrades?symbol=BTCUSDT&limit=1"
+							+ (mode == 1 ? "" : "&startTime=" + value)
+							+ (mode == 0 ? "" : "&endTime=" + value)
+							+ "&recvWindow=5000&timestamp=1700000000123&signature=");
+					Map<String, Object> response = asMap(result.structuredContent());
+					assertThat(response).containsOnlyKeys("serviceId", "accountAlias", "symbol", "trades", "possiblyTruncated")
+							.containsEntry("possiblyTruncated", !empty);
+					if (empty) {
+						assertThat(response.get("trades")).isEqualTo(List.of());
+					}
+					else {
+						assertThat(asMap(((List<?>) response.get("trades")).getFirst()))
+								.containsEntry("time", Instant.ofEpochMilli(Long.parseLong(value)).toString());
+					}
+					assertMatchingSuccessContent(result);
+					assertNoSecrets(result);
+				}
+			}
+		}
+	}
+
+	@Test
+	void invalidTimeFiltersNeverObtainLazyClientOrSendHttp() {
+		@SuppressWarnings("unchecked")
+		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
+		var tools = new BinanceAccountTradesTools(provider);
+		List<Map<String, String>> invalid = new ArrayList<>();
+		for (String field : List.of("startTime", "endTime")) {
+			for (String value : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+					" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+				invalid.add(Map.of(field, value));
+			}
+			invalid.add(Map.of("fromId", "0", field, "0"));
+		}
+		invalid.add(Map.of("fromId", "0", "startTime", "0", "endTime", "0"));
+		invalid.add(Map.of("startTime", "1", "endTime", "0"));
+		invalid.add(Map.of("startTime", "0", "endTime", "86400001"));
+		invalid.add(Map.of("startTime", "0", "endTime", "9223372036854775807"));
+		invalid.add(Map.of("startTime", "9223372036768375806", "endTime", "9223372036854775807"));
+		for (Map<String, String> filters : invalid) {
+			assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null,
+					filters.get("fromId"), filters.get("startTime"), filters.get("endTime")))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
+			args.putAll(filters);
+			assertSafeError(call(args), "BAD_REQUEST");
+		}
+		verifyNoInteractions(provider);
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	void registeredTimeFiltersRejectOutOfBoundsWithoutPartialResults() {
+		for (int mode = 0; mode < 3; mode++) {
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
+			if (mode != 1) {
+				args.put("startTime", "1499865549590");
+			}
+			if (mode != 0) {
+				args.put("endTime", "1499865549590");
+			}
+			for (String time : List.of("1499865549589", "1499865549591")) {
+				if ((mode == 0 && time.endsWith("91")) || (mode == 1 && time.endsWith("89"))) {
+					continue;
+				}
+				String outside = FILL.replace("1499865549590", time)
+						.replace("\"id\":9007199254740993", "\"id\":1");
+				for (String body : List.of("[" + outside + "]", "[" + FILL + "," + outside + "]")) {
+					server.body.set(body);
+					CallToolResult result = call(args);
+					assertSafeError(result, "INVALID_RESPONSE");
+					assertThat(result.structuredContent()).isNull();
+				}
+			}
+		}
+		assertThat(server.requests).hasValue(8);
+	}
+
+	@Test
+	void registersOptionalStringFiltersAndKeepsAllSevenTools() {
 		List<?> specs = (List<?>) context.getBean("toolSpecs");
 		List<SyncToolSpecification> tools = specs.stream().filter(SyncToolSpecification.class::isInstance)
 				.map(SyncToolSpecification.class::cast).toList();
@@ -157,15 +253,21 @@ class BinanceAccountTradesToolsTest {
 				.findFirst().orElseThrow().tool().inputSchema());
 		assertThat(asMap(tools.stream().filter(spec -> spec.tool().name().equals(NAME))
 				.findFirst().orElseThrow().tool().inputSchema().get("properties")))
-				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId");
+				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime");
 		assertThat(schema.get("properties").get("accountAlias").get("type").asString()).isEqualTo("string");
 		assertThat(schema.get("properties").get("symbol").get("type").asString()).isEqualTo("string");
 		assertThat(schema.get("properties").get("limit").get("type").asString()).isEqualTo("integer");
 		assertThat(schema.get("properties").get("fromId").get("type").asString()).isEqualTo("string");
+		for (String field : List.of("startTime", "endTime")) {
+			assertThat(schema.get("properties").get(field).get("type").asString()).isEqualTo("string");
+		}
 		assertThat(schema.get("required")).isEqualTo(mapper.valueToTree(List.of("accountAlias", "symbol")));
 		var commonSchema = mapper.valueToTree(tools.stream()
 				.filter(spec -> spec.tool().name().equals(EXECUTIONS_NAME)).findFirst().orElseThrow()
 				.tool().inputSchema());
+		assertThat(asMap(tools.stream().filter(spec -> spec.tool().name().equals(EXECUTIONS_NAME))
+				.findFirst().orElseThrow().tool().inputSchema().get("properties")))
+				.containsOnlyKeys("accountAlias", "symbol", "limit");
 		assertThat(commonSchema.get("properties").has("fromId")).isFalse();
 	}
 
