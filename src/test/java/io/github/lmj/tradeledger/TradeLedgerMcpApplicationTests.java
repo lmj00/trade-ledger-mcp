@@ -15,6 +15,9 @@ import java.util.stream.IntStream;
 
 import io.github.lmj.tradeledger.adapter.csv.CsvTradeJournalReader;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
+import io.github.lmj.tradeledger.mcp.BinanceAccountTradesTools;
+import io.github.lmj.tradeledger.mcp.TradeLedgerTools;
+import io.github.lmj.tradeledger.mcp.UpbitOrderTools;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
@@ -25,12 +28,17 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.annotation.ComponentScan;
+import org.springframework.context.annotation.Import;
 import org.springframework.test.annotation.DirtiesContext;
 
-@SpringBootTest(properties = "trade-ledger.journal.root=src/test/resources/journals")
+@SpringBootTest(classes = TradeLedgerMcpApplication.class,
+		properties = "trade-ledger.journal.root=src/test/resources/journals")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class TradeLedgerMcpApplicationTests {
 
@@ -44,17 +52,20 @@ class TradeLedgerMcpApplicationTests {
 	void contextLoads() {
 		assertThat(journalProperties.root()).isAbsolute().isDirectory();
 		assertThat(applicationContext.containsBean("upbitOrderClient")).isTrue();
+		assertThat(applicationContext.containsBean("binanceAccountTradesClient")).isTrue();
 		// Merely starting the server and registering tools must not construct a client
 		// or require credentials / transport JVM options.
 		assertThat(((ConfigurableApplicationContext) applicationContext)
 				.getBeanFactory().containsSingleton("upbitOrderClient")).isFalse();
+		assertThat(((ConfigurableApplicationContext) applicationContext)
+				.getBeanFactory().containsSingleton("binanceAccountTradesClient")).isFalse();
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndTwoReadOnlyOrderLookups() {
+	void registersOnlyTwoCalculationToolsAndThreeReadOnlyLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
 				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
-						"get_upbit_closed_orders");
+						"get_upbit_closed_orders", "get_binance_account_trades");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -68,6 +79,30 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
 		assertThat(asMap(specification.tool().outputSchema().get("properties")))
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
+	}
+
+	@Test
+	void binanceSchemaExposesOnlyAliasSymbolAndOptionalLimitWithStringIds() {
+		SyncToolSpecification specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_binance_account_trades"))
+				.findFirst().orElseThrow();
+		Map<String, Object> properties = asMap(specification.tool().inputSchema().get("properties"));
+		assertThat(properties).containsOnlyKeys("accountAlias", "symbol", "limit");
+		assertThat(specification.tool().inputSchema().get("required"))
+				.isEqualTo(List.of("accountAlias", "symbol"));
+		assertThat(asMap(properties.get("accountAlias"))).containsEntry("type", "string");
+		assertThat(asMap(properties.get("symbol"))).containsEntry("type", "string");
+		assertThat(asMap(properties.get("limit"))).containsEntry("type", "integer");
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		Map<String, Object> output = asMap(specification.tool().outputSchema().get("properties"));
+		assertThat(output).containsOnlyKeys("serviceId", "accountAlias", "symbol", "trades", "possiblyTruncated");
+		Map<String, Object> execution = asMap(asMap(asMap(output.get("trades")).get("items")).get("properties"));
+		for (String field : List.of("id", "orderId", "orderListId", "time", "price", "qty", "quoteQty", "commission")) {
+			assertThat(asMap(execution.get(field))).containsEntry("type", "string");
+		}
 	}
 
 	@Test
@@ -152,13 +187,15 @@ class TradeLedgerMcpApplicationTests {
 		}
 
 		new ApplicationContextRunner()
-				.withUserConfiguration(TradeLedgerMcpApplication.class)
+				.withUserConfiguration(RunnerConfiguration.class)
 				.withPropertyValues(
 						"trade-ledger.journal.root=" + root,
 						"spring.ai.mcp.server.type=SYNC",
 						"spring.ai.mcp.server.stdio=true")
 				.run(context -> {
 					assertThat(context).hasNotFailed();
+					assertThat(context).doesNotHaveBean("localUpbitClient");
+					assertThat(context).doesNotHaveBean("localBinanceClient");
 					assertThat(context.getBean("tradeJournalReader")).isInstanceOf(CsvTradeJournalReader.class);
 					SyncToolSpecification specification = toolSpecifications(context).stream()
 							.filter(candidate -> candidate.tool().name().equals("summarize_journal"))
@@ -283,6 +320,15 @@ class TradeLedgerMcpApplicationTests {
 				.contains("trades[1]." + field)
 				.contains("at most " + limit + " characters")
 				.doesNotContain(raw);
+	}
+
+	// Keep ContextRunner away from other tests' configurations while using the
+	// production beans, tool registration and Boot auto-configuration.
+	@TestConfiguration(proxyBeanMethods = false)
+	@EnableAutoConfiguration
+	@ComponentScan(basePackageClasses = TradeJournalProperties.class)
+	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class})
+	static class RunnerConfiguration {
 	}
 
 	private SyncToolSpecification analyzeTradesSpecification() {
