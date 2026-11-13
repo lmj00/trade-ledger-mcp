@@ -367,13 +367,13 @@ class BinanceAccountTradesToolsTest {
 	}
 
 	@Test
-	void registersOptionalStringFiltersAndKeepsAllSevenTools() {
+	void registersOptionalStringFiltersAndKeepsAllEightTools() {
 		List<?> specs = (List<?>) context.getBean("toolSpecs");
 		List<SyncToolSpecification> tools = specs.stream().filter(SyncToolSpecification.class::isInstance)
 				.map(SyncToolSpecification.class::cast).toList();
 		assertThat(tools).extracting(spec -> spec.tool().name()).containsExactlyInAnyOrder(
 				"summarize_journal", "analyze_trades", "get_upbit_order", "get_upbit_closed_orders",
-				NAME, "get_upbit_order_executions", EXECUTIONS_NAME);
+				NAME, "get_upbit_order_executions", EXECUTIONS_NAME, "get_toss_order");
 		var mapper = JsonMapper.builder().build();
 		var schema = mapper.valueToTree(tools.stream().filter(spec -> spec.tool().name().equals(NAME))
 				.findFirst().orElseThrow().tool().inputSchema());
@@ -1114,7 +1114,7 @@ class BinanceAccountTradesToolsTest {
 	@TestConfiguration(proxyBeanMethods = false)
 	@EnableAutoConfiguration
 	@ComponentScan(basePackageClasses = TradeJournalProperties.class)
-	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class})
+	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class, TossOrderTools.class})
 	static class RunnerConfiguration {
 	}
 

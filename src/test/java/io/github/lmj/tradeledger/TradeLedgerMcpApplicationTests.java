@@ -17,6 +17,7 @@ import io.github.lmj.tradeledger.adapter.csv.CsvTradeJournalReader;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.github.lmj.tradeledger.mcp.BinanceAccountTradesTools;
 import io.github.lmj.tradeledger.mcp.TradeLedgerTools;
+import io.github.lmj.tradeledger.mcp.TossOrderTools;
 import io.github.lmj.tradeledger.mcp.UpbitOrderTools;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
@@ -53,20 +54,23 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(journalProperties.root()).isAbsolute().isDirectory();
 		assertThat(applicationContext.containsBean("upbitOrderClient")).isTrue();
 		assertThat(applicationContext.containsBean("binanceAccountTradesClient")).isTrue();
+		assertThat(applicationContext.containsBean("tossOrderClient")).isTrue();
 		// Merely starting the server and registering tools must not construct a client
 		// or require credentials / transport JVM options.
 		assertThat(((ConfigurableApplicationContext) applicationContext)
 				.getBeanFactory().containsSingleton("upbitOrderClient")).isFalse();
 		assertThat(((ConfigurableApplicationContext) applicationContext)
 				.getBeanFactory().containsSingleton("binanceAccountTradesClient")).isFalse();
+		assertThat(((ConfigurableApplicationContext) applicationContext)
+				.getBeanFactory().containsSingleton("tossOrderClient")).isFalse();
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndFiveReadOnlyLookups() {
+	void registersOnlyTwoCalculationToolsAndSixReadOnlyLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
 				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
 						"get_upbit_closed_orders", "get_binance_account_trades", "get_upbit_order_executions",
-						"get_binance_account_executions");
+						"get_binance_account_executions", "get_toss_order");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -80,6 +84,37 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
 		assertThat(asMap(specification.tool().outputSchema().get("properties")))
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
+	}
+
+	@Test
+	void tossSchemaExposesOnlyOrderIdAndNullableCumulativeSummary() {
+		var specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_toss_order")).findFirst().orElseThrow();
+		Map<String, Object> input = asMap(specification.tool().inputSchema().get("properties"));
+		assertThat(input).containsOnlyKeys("orderId");
+		assertThat(asMap(input.get("orderId"))).containsEntry("type", "string");
+		assertThat(specification.tool().inputSchema().get("required")).isEqualTo(List.of("orderId"));
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		Map<String, Object> output = asMap(specification.tool().outputSchema().get("properties"));
+		assertThat(output).containsOnlyKeys("serviceId", "orderId", "symbol", "side", "orderType", "timeInForce",
+				"status", "price", "quantity", "orderAmount", "currency", "orderedAt", "canceledAt", "execution");
+		for (String field : List.of("price", "orderAmount", "canceledAt")) {
+			assertNullableType(output.get(field), "string");
+		}
+		for (String field : List.of("serviceId", "orderId", "symbol", "side", "orderType", "timeInForce",
+				"status", "quantity", "currency", "orderedAt")) {
+			assertThat(asMap(output.get(field))).containsEntry("type", "string");
+		}
+		Map<String, Object> execution = asMap(asMap(output.get("execution")).get("properties"));
+		assertThat(execution).containsOnlyKeys("filledQuantity", "averageFilledPrice", "filledAmount", "commission",
+				"tax", "filledAt", "settlementDate");
+		assertThat(asMap(execution.get("filledQuantity"))).containsEntry("type", "string");
+		for (String field : List.of("averageFilledPrice", "filledAmount", "commission", "tax", "filledAt", "settlementDate")) {
+			assertNullableType(execution.get(field), "string");
+		}
 	}
 
 	@ParameterizedTest
@@ -389,7 +424,7 @@ class TradeLedgerMcpApplicationTests {
 	@TestConfiguration(proxyBeanMethods = false)
 	@EnableAutoConfiguration
 	@ComponentScan(basePackageClasses = TradeJournalProperties.class)
-	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class})
+	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class, TossOrderTools.class})
 	static class RunnerConfiguration {
 	}
 
