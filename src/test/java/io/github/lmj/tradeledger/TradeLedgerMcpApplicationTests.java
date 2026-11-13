@@ -136,7 +136,7 @@ class TradeLedgerMcpApplicationTests {
 				.filter(candidate -> candidate.tool().name().equals("get_binance_account_trades"))
 				.findFirst().orElseThrow();
 		Map<String, Object> properties = asMap(specification.tool().inputSchema().get("properties"));
-		assertThat(properties).containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime");
+		assertThat(properties).containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime", "orderId");
 		assertThat(specification.tool().inputSchema().get("required"))
 				.isEqualTo(List.of("accountAlias", "symbol"));
 		assertThat(asMap(properties.get("accountAlias"))).containsEntry("type", "string");
@@ -144,7 +144,8 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(asMap(properties.get("limit"))).containsEntry("type", "integer");
 		assertThat(asMap(properties.get("fromId"))).containsEntry("type", "string");
 		assertThat(asMap(properties.get("startTime"))).containsEntry("type", "string");
-			assertThat(asMap(properties.get("endTime"))).containsEntry("type", "string");
+		assertThat(asMap(properties.get("endTime"))).containsEntry("type", "string");
+		assertThat(asMap(properties.get("orderId"))).containsEntry("type", "string");
 		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
 		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
 		assertThat(specification.tool().annotations().idempotentHint()).isTrue();

@@ -66,6 +66,85 @@ class BinanceAccountTradesClientTest {
 			""".strip();
 
 	@Test
+	void signsOrderIdAndOptionalFromIdExactlyOnce(CapturedOutput output) throws Exception {
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> signatures = new ArrayList<>();
+		AtomicReference<String> body = new AtomicReference<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			reply(exchange, 200, body.get());
+		})) {
+			var client = server.client();
+			for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+				for (boolean withFromId : List.of(false, true)) {
+					var request = new BinanceAccountTradesRequest("BTCUSDT", 2, withFromId ? "10" : null, null, null, id);
+					String first = FILL.replace("\"id\":9007199254740993", "\"id\":10")
+							.replace("\"orderId\":9223372036854775807", "\"orderId\":" + id);
+					String second = first.replace("\"id\":10", "\"id\":11");
+					for (boolean empty : List.of(false, true)) {
+						body.set(empty ? "[]" : "[" + first + "," + second + "]");
+						int before = requests.size();
+						var result = client.getAccountTrades(ALIAS, request);
+						assertThat(requests).hasSize(before + 1);
+						assertThat(requests.getLast()).startsWith("GET " + PATH + "?");
+						String raw = URI.create(requests.getLast().substring(4)).getRawQuery();
+						int boundary = raw.indexOf("&signature=");
+						String query = raw.substring(0, boundary);
+						String signature = raw.substring(boundary + "&signature=".length());
+						signatures.add(signature);
+						assertThat(query).isEqualTo("symbol=BTCUSDT&limit=2" + (withFromId ? "&fromId=10" : "")
+								+ "&orderId=" + id + "&recvWindow=5000&timestamp=1700000000123");
+						assertThat(query.split("&")).filteredOn(part -> part.startsWith("orderId="))
+								.containsExactly("orderId=" + id);
+						assertThat(query.split("&")).filteredOn(part -> part.startsWith("fromId="))
+								.containsExactly(withFromId ? new String[] {"fromId=10"} : new String[0]);
+						assertThat(signature).isEqualTo(hmac(query));
+						assertThat(result.trades()).hasSize(empty ? 0 : 2);
+						assertThat(result.trades()).allSatisfy(fill -> assertThat(fill.orderId()).isEqualTo(Long.parseLong(id)));
+						assertThat(result.possiblyTruncated()).isEqualTo(!empty);
+					}
+				}
+			}
+		}
+		assertSafeOutput(output, signatures);
+	}
+
+	@Test
+	void rejectsOrderMismatchAndFromIdViolationAtEveryPosition(CapturedOutput output) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		AtomicInteger calls = new AtomicInteger();
+		List<String> signatures = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			String signature = exchange.getRequestURI().getRawQuery().split("&signature=")[1];
+			signatures.add(signature);
+			reply(exchange, 200, body.get().replace("{", "{\"private\":\"" + PRIVATE + KEY + SECRET + signature + "\","));
+		})) {
+			var client = server.client();
+			for (boolean withFromId : List.of(false, true)) {
+				var request = new BinanceAccountTradesRequest("BTCUSDT", 2,
+						withFromId ? "9007199254740993" : null, null, null, "9223372036854775807");
+				List<String> invalidFills = new ArrayList<>();
+				invalidFills.add(FILL.replace("\"orderId\":9223372036854775807", "\"orderId\":0")
+						.replace("\"id\":9007199254740993", "\"id\":9007199254740994"));
+				if (withFromId) {
+					invalidFills.add(FILL.replace("\"id\":9007199254740993", "\"id\":9007199254740992"));
+				}
+				for (String invalid : invalidFills) {
+					for (String response : List.of("[" + invalid + "]", "[" + FILL + "," + invalid + "]")) {
+						body.set(response);
+						int before = calls.get();
+						expect(BinanceErrorCode.INVALID_RESPONSE, () -> client.getAccountTrades(ALIAS, request));
+						assertThat(calls).hasValue(before + 1);
+					}
+				}
+			}
+			assertThat(calls).hasValue(6);
+		}
+		assertSafeOutput(output, signatures);
+	}
+
+	@Test
 	void signsEachTimeCombinationExactlyOnceAndPreservesInt64(CapturedOutput output) throws Exception {
 		List<String> requests = new CopyOnWriteArrayList<>();
 		List<String> signatures = new ArrayList<>();

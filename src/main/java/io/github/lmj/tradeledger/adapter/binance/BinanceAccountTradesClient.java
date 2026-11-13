@@ -50,7 +50,8 @@ import tools.jackson.databind.json.JsonMapper;
  * Close this client to release its owned connections and workers.
  *
  * <p>Without filters the most recent fills are requested; fromId and time bounds are inclusive.
- * Time bounds are optional milliseconds, cannot mix with fromId, and span at most 24 hours.
+ * orderId selects one order, alone or with inclusive fromId.
+ * Time bounds are optional milliseconds, cannot mix with fromId or orderId, and span at most 24 hours.
  * One result up to limit (default 500, maximum 1000) is requested. A limit-sized
  * snapshot may be truncated; this is not full history, completed trades or PnL.
  * Live accounts have not been verified.

@@ -145,6 +145,120 @@ class BinanceAccountTradesToolsTest {
 	}
 
 	@Test
+	void legacyJavaOverloadsKeepExactQueriesWhenOrderIdIsOmitted() {
+		var tools = new BinanceAccountTradesTools(context.getBeanProvider(BinanceAccountTradesClient.class));
+		server.body.set("[]");
+		assertThat(tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null).trades()).isEmpty();
+		assertThat(tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", 2, "0").trades()).isEmpty();
+		assertThat(tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", 2, null, "0", null).trades()).isEmpty();
+		assertThat(tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", 2, null, null, "1").trades()).isEmpty();
+		assertThat(tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", 2, null, "0", "1").trades()).isEmpty();
+		assertThat(server.requests).hasValue(5);
+		List<String> expected = List.of("symbol=BTCUSDT&limit=500", "symbol=BTCUSDT&limit=2&fromId=0",
+				"symbol=BTCUSDT&limit=2&startTime=0", "symbol=BTCUSDT&limit=2&endTime=1",
+				"symbol=BTCUSDT&limit=2&startTime=0&endTime=1");
+		assertThat(server.paths).hasSize(5);
+		for (int i = 0; i < expected.size(); i++) {
+			assertThat(server.paths.get(i)).isEqualTo("GET /api/v3/myTrades?" + expected.get(i)
+					+ "&recvWindow=5000&timestamp=1700000000123&signature=" + server.signatures.get(i));
+		}
+	}
+
+	@Test
+	void registeredOrderIdSupportsMultipleFillsAndEmptyResults() {
+		for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+			for (boolean withFromId : List.of(false, true)) {
+				Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
+				args.put("orderId", id);
+				if (withFromId) { args.put("fromId", "9007199254740993"); }
+				String first = FILL.replace("\"orderId\":9223372036854775807", "\"orderId\":" + id);
+				String second = first.replace("\"id\":9007199254740993", "\"id\":9007199254740994");
+				for (boolean empty : List.of(false, true)) {
+					server.body.set(empty ? "[]" : "[" + first + "," + second + "]");
+					int before = server.requests.get();
+					CallToolResult result = call(args);
+					assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+					assertThat(server.requests).hasValue(before + 1);
+					assertThat(server.paths.getLast()).startsWith("GET /api/v3/myTrades?symbol=BTCUSDT&limit=2"
+							+ (withFromId ? "&fromId=9007199254740993" : "")
+							+ "&orderId=" + id + "&recvWindow=5000&timestamp=1700000000123&signature=");
+					Map<String, Object> response = asMap(result.structuredContent());
+					assertThat(response).containsOnlyKeys("serviceId", "accountAlias", "symbol", "trades", "possiblyTruncated")
+							.containsEntry("possiblyTruncated", !empty);
+					List<?> fills = (List<?>) response.get("trades");
+					assertThat(fills).hasSize(empty ? 0 : 2);
+					for (Object fill : fills) {
+						assertThat(asMap(fill)).containsEntry("orderId", id)
+								.containsEntry("price", "9007199254740993.12345678900")
+								.containsEntry("commissionAsset", "BNB")
+								.containsEntry("time", "2017-07-12T13:19:09.590Z");
+					}
+					assertMatchingSuccessContent(result);
+					assertNoSecrets(result);
+				}
+			}
+		}
+	}
+
+	@Test
+	void invalidOrderIdsAndTimeCombinationsNeverObtainProviderOrSendHttp() {
+		@SuppressWarnings("unchecked")
+		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
+		var tools = new BinanceAccountTradesTools(provider);
+		List<Map<String, String>> invalid = new ArrayList<>();
+		for (String id : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+			invalid.add(Map.of("orderId", id));
+		}
+		for (Map<String, String> times : List.of(Map.of("startTime", "0"), Map.of("endTime", "0"),
+				Map.of("startTime", "0", "endTime", "0"))) {
+			for (boolean withFromId : List.of(false, true)) {
+				Map<String, String> filters = new LinkedHashMap<>(times);
+				filters.put("orderId", "0");
+				if (withFromId) { filters.put("fromId", "0"); }
+				invalid.add(filters);
+			}
+		}
+		for (Map<String, String> filters : invalid) {
+			assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null,
+					filters.get("fromId"), filters.get("startTime"), filters.get("endTime"), filters.get("orderId")))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
+			args.putAll(filters);
+			CallToolResult result = call(args);
+			assertSafeError(result, "BAD_REQUEST");
+			assertThat(result.structuredContent()).isNull();
+		}
+		verifyNoInteractions(provider);
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	void registeredOrderMismatchAndFromIdViolationFailWithoutPartialContent() {
+		for (boolean withFromId : List.of(false, true)) {
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
+			args.put("orderId", "9223372036854775807");
+			if (withFromId) { args.put("fromId", "9007199254740993"); }
+			List<String> invalid = new ArrayList<>();
+			invalid.add(FILL.replace("\"orderId\":9223372036854775807", "\"orderId\":0")
+					.replace("\"id\":9007199254740993", "\"id\":9007199254740994"));
+			if (withFromId) { invalid.add(FILL.replace("\"id\":9007199254740993", "\"id\":9007199254740992")); }
+			for (String fill : invalid) {
+				for (String body : List.of("[" + fill + "]", "[" + FILL + "," + fill + "]")) {
+					server.body.set(body.replace("{", "{\"private\":\"" + MARKER + KEY + SECRET + "\","));
+					int before = server.requests.get();
+					CallToolResult result = call(args);
+					assertSafeError(result, "INVALID_RESPONSE");
+					assertThat(result.structuredContent()).isNull();
+					assertThat(server.requests).hasValue(before + 1);
+				}
+			}
+		}
+		assertThat(server.requests).hasValue(6);
+	}
+
+	@Test
 	void registeredTimeFiltersPreserveBoundariesAndEmptyResults() {
 		for (String value : List.of("0", "9007199254740993", "9223372036854775807")) {
 			for (int mode = 0; mode < 3; mode++) {
@@ -253,11 +367,12 @@ class BinanceAccountTradesToolsTest {
 				.findFirst().orElseThrow().tool().inputSchema());
 		assertThat(asMap(tools.stream().filter(spec -> spec.tool().name().equals(NAME))
 				.findFirst().orElseThrow().tool().inputSchema().get("properties")))
-				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime");
+				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime", "orderId");
 		assertThat(schema.get("properties").get("accountAlias").get("type").asString()).isEqualTo("string");
 		assertThat(schema.get("properties").get("symbol").get("type").asString()).isEqualTo("string");
 		assertThat(schema.get("properties").get("limit").get("type").asString()).isEqualTo("integer");
 		assertThat(schema.get("properties").get("fromId").get("type").asString()).isEqualTo("string");
+		assertThat(schema.get("properties").get("orderId").get("type").asString()).isEqualTo("string");
 		for (String field : List.of("startTime", "endTime")) {
 			assertThat(schema.get("properties").get(field).get("type").asString()).isEqualTo("string");
 		}
