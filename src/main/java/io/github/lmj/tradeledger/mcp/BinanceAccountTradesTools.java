@@ -8,6 +8,7 @@ import java.util.Set;
 import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesClient;
 import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesRequest;
 import io.github.lmj.tradeledger.adapter.binance.BinanceApiException;
+import io.github.lmj.tradeledger.application.model.CommonExecutionSnapshot;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.beans.factory.ObjectProvider;
@@ -42,24 +43,57 @@ public final class BinanceAccountTradesTools {
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
 			Integer limit) {
-		BinanceAccountTradesRequest request;
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit);
+		try {
+			return BinanceAccountTradesResponse.from(client.getObject().getAccountTrades(accountAlias, request));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	@McpTool(
+			name = "get_binance_account_executions",
+			title = "Get common executions for recent Binance Spot account trades",
+			description = "Read one recent-symbol Spot result as common executions and per-fill fees, default 500 and maximum 1000. "
+					+ "accountAlias is a non-secret local display label, does not select credentials and is not sent to Binance. "
+					+ "Even short or empty results do not establish complete history. "
+					+ "No additional queries, pagination, retries, fee aggregation or conversion, matching, PnL, orders or funds movement.",
+			generateOutputSchema = true,
+			annotations = @McpTool.McpAnnotations(
+					readOnlyHint = true,
+					destructiveHint = false,
+					idempotentHint = true,
+					openWorldHint = true))
+	public CommonExecutionResponse getBinanceAccountExecutions(
+			@McpToolParam(description = "Required non-secret local display label; does not select credentials or account.", required = true)
+			String accountAlias,
+			@McpToolParam(description = "Required single Spot symbol, for example BTCUSDT.", required = true)
+			String symbol,
+			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
+			Integer limit) {
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit);
+		try {
+			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromBinance(
+					client.getObject().getAccountTrades(accountAlias, request)));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit) {
 		try {
 			// Match the client's alias policy before obtaining the lazy client. The
 			// request model owns symbol/limit validation for every MCP call too.
 			if (!validAlias(accountAlias)) {
 				throw new IllegalArgumentException();
 			}
-			request = limit == null ? new BinanceAccountTradesRequest(symbol)
+			return limit == null ? new BinanceAccountTradesRequest(symbol)
 					: new BinanceAccountTradesRequest(symbol, limit);
 		}
 		catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Binance request failed: BAD_REQUEST");
-		}
-		try {
-			return BinanceAccountTradesResponse.from(client.getObject().getAccountTrades(accountAlias, request));
-		}
-		catch (RuntimeException exception) {
-			throw safeFailure(exception);
 		}
 	}
 

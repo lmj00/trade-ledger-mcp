@@ -38,10 +38,12 @@ class TradeLedgerConfiguration {
 							|| !("get_upbit_order".equals(specification.tool().name())
 									|| "get_upbit_order_executions".equals(specification.tool().name())
 									|| "get_upbit_closed_orders".equals(specification.tool().name())
-									|| "get_binance_account_trades".equals(specification.tool().name()))) {
+									|| "get_binance_account_trades".equals(specification.tool().name())
+									|| "get_binance_account_executions".equals(specification.tool().name()))) {
 						return candidate;
 					}
 					String service = "get_binance_account_trades".equals(specification.tool().name())
+								|| "get_binance_account_executions".equals(specification.tool().name())
 							? "Binance" : "Upbit";
 					// Preserve the generated schema and safe error handler. The annotation
 					// adapter supplies structuredContent only for these DTO return types.

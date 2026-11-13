@@ -62,10 +62,11 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndFourReadOnlyLookups() {
+	void registersOnlyTwoCalculationToolsAndFiveReadOnlyLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
 				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
-						"get_upbit_closed_orders", "get_binance_account_trades", "get_upbit_order_executions");
+						"get_upbit_closed_orders", "get_binance_account_trades", "get_upbit_order_executions",
+						"get_binance_account_executions");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -81,16 +82,27 @@ class TradeLedgerMcpApplicationTests {
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
 	}
 
-	@Test
-	void commonOrderSchemaRequiresOnlyAliasAndUuidAndAllowsExplicitNulls() {
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order_executions", "get_binance_account_executions"})
+	void commonExecutionSchemasExposeOnlyQueryArgumentsAndAllowExplicitNulls(String name) {
 		SyncToolSpecification specification = toolSpecifications().stream()
-				.filter(candidate -> candidate.tool().name().equals("get_upbit_order_executions"))
+				.filter(candidate -> candidate.tool().name().equals(name))
 				.findFirst().orElseThrow();
 		Map<String, Object> input = asMap(specification.tool().inputSchema().get("properties"));
-		assertThat(input).containsOnlyKeys("accountAlias", "uuid");
-		assertThat(specification.tool().inputSchema().get("required"))
-				.isEqualTo(List.of("accountAlias", "uuid"));
-		input.values().forEach(property -> assertThat(asMap(property)).containsEntry("type", "string"));
+		if (name.equals("get_upbit_order_executions")) {
+			assertThat(input).containsOnlyKeys("accountAlias", "uuid");
+			assertThat(specification.tool().inputSchema().get("required"))
+					.isEqualTo(List.of("accountAlias", "uuid"));
+			input.values().forEach(property -> assertThat(asMap(property)).containsEntry("type", "string"));
+		}
+		else {
+			assertThat(input).containsOnlyKeys("accountAlias", "symbol", "limit");
+			assertThat(specification.tool().inputSchema().get("required"))
+					.isEqualTo(List.of("accountAlias", "symbol"));
+			assertThat(asMap(input.get("accountAlias"))).containsEntry("type", "string");
+			assertThat(asMap(input.get("symbol"))).containsEntry("type", "string");
+			assertThat(asMap(input.get("limit"))).containsEntry("type", "integer");
+		}
 		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
 		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
 		assertThat(specification.tool().annotations().idempotentHint()).isTrue();

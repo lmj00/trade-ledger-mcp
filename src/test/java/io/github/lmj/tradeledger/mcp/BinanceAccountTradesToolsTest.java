@@ -2,9 +2,15 @@ package io.github.lmj.tradeledger.mcp;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -42,8 +48,10 @@ import ch.qos.logback.core.read.ListAppender;
 import com.sun.net.httpserver.HttpServer;
 import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
 import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesClient;
+import io.github.lmj.tradeledger.adapter.binance.BinanceAccountTradesRequest;
 import io.github.lmj.tradeledger.adapter.binance.BinanceApiException;
 import io.github.lmj.tradeledger.adapter.binance.BinanceErrorCode;
+import io.github.lmj.tradeledger.application.model.BinanceAccountTradesSnapshot;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
@@ -53,7 +61,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
@@ -88,6 +96,8 @@ class BinanceAccountTradesToolsTest {
 	private static final String MARKER = "private-binance-mcp-response";
 	private static final String ALIAS = "local-display-account";
 	private static final String NAME = "get_binance_account_trades";
+	private static final String EXECUTIONS_NAME = "get_binance_account_executions";
+	private static final List<String> NAMES = List.of(NAME, EXECUTIONS_NAME);
 	private static final String DISABLE = "jdk.httpclient.disableRetryConnect";
 	private static final String RETRIES = "jdk.httpclient.redirects.retrylimit";
 	private static final String HTTP_LOG = "jdk.httpclient.HttpClient.log";
@@ -177,25 +187,80 @@ class BinanceAccountTradesToolsTest {
 		assertNoSecrets(result);
 	}
 
+	@Test
+	void registeredCommonHandlerPreservesExecutionsAndSeparateSourceFees() {
+		String sell = FILL.replace("\"id\":9007199254740993", "\"id\":9223372036854775807")
+				.replace("\"isBuyer\":true", "\"isBuyer\":false").replace("BNB", "USDT");
+		server.body.set("[" + FILL + "," + sell + "]");
+		CallToolResult result = call(context, EXECUTIONS_NAME, arguments(ALIAS, "BTCUSDT", null));
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> response = asMap(result.structuredContent());
+		assertThat(response).containsOnlyKeys("serviceId", "accountAlias", "symbol", "queryScope", "orderId",
+				"possiblyTruncated", "executions", "fees")
+				.containsEntry("serviceId", "binance").containsEntry("accountAlias", ALIAS)
+				.containsEntry("symbol", "BTCUSDT").containsEntry("queryScope", "RECENT_SYMBOL")
+				.containsEntry("orderId", null).containsEntry("possiblyTruncated", false);
+		List<?> executions = (List<?>) response.get("executions");
+		List<?> fees = (List<?>) response.get("fees");
+		assertThat(executions).hasSize(2);
+		assertThat(fees).hasSize(2);
+		for (int index = 0; index < executions.size(); index++) {
+			String id = index == 0 ? "9007199254740993" : "9223372036854775807";
+			assertThat(asMap(executions.get(index)))
+					.containsOnlyKeys("serviceId", "accountAlias", "symbol", "executionId", "orderId", "side",
+							"price", "quantity", "amount", "executedAt")
+					.containsEntry("serviceId", "binance").containsEntry("accountAlias", ALIAS)
+					.containsEntry("symbol", "BTCUSDT").containsEntry("executionId", id)
+					.containsEntry("orderId", "9223372036854775807")
+					.containsEntry("side", index == 0 ? "BUY" : "SELL")
+					.containsEntry("price", "9007199254740993.12345678900")
+					.containsEntry("quantity", "0.02000000000000000100")
+					.containsEntry("amount", "180143985094819.87147665314740999300")
+					.containsEntry("executedAt", "2017-07-12T13:19:09.590Z");
+			assertThat(asMap(fees.get(index))).containsOnlyKeys("scope", "targetId", "amount", "currency")
+					.containsEntry("scope", "FILL").containsEntry("targetId", id)
+					.containsEntry("amount", "0.00001000000000000000")
+					.containsEntry("currency", index == 0 ? "BNB" : "USDT");
+		}
+		assertMatchingSuccessContent(result);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.paths).hasSize(1);
+		assertThat(server.paths.getFirst()).startsWith("GET /api/v3/myTrades?symbol=BTCUSDT&limit=500"
+				+ "&recvWindow=5000&timestamp=1700000000123&signature=").doesNotContain(ALIAS, KEY, SECRET);
+		assertThat(server.headers).hasSize(1);
+		assertThat(server.headers.getFirst()).contains(KEY).doesNotContain(ALIAS, SECRET);
+		assertNoSecrets(result);
+	}
+
 	@ParameterizedTest
-	@ValueSource(ints = {1, 1000})
-	void registeredHandlerPreservesLimitBoundariesAndMarksTruncation(int limit) {
+	@MethodSource("limitBoundaries")
+	void registeredHandlerPreservesLimitBoundariesAndMarksTruncation(String name, int limit) {
 		server.body.set(IntStream.range(0, limit)
 				.mapToObj(index -> FILL.replace("\"id\":9007199254740993", "\"id\":" + index))
 				.collect(Collectors.joining(",", "[", "]")));
-		CallToolResult result = call(arguments(ALIAS, "BTCUSDT", limit));
+		CallToolResult result = call(context, name, arguments(ALIAS, "BTCUSDT", limit));
 		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
 		assertThat(asMap(result.structuredContent())).containsEntry("possiblyTruncated", true);
-		assertThat((List<?>) asMap(result.structuredContent()).get("trades")).hasSize(limit);
+		assertThat((List<?>) asMap(result.structuredContent()).get(name.equals(NAME) ? "trades" : "executions"))
+				.hasSize(limit);
+		if (name.equals(EXECUTIONS_NAME)) {
+			assertThat((List<?>) asMap(result.structuredContent()).get("fees")).hasSize(limit);
+			assertThat(asMap(result.structuredContent())).containsEntry("queryScope", "RECENT_SYMBOL")
+					.containsEntry("orderId", null);
+		}
 		assertThat(server.requests).hasValue(1);
-		assertThat(server.paths.getFirst()).contains("&limit=" + limit + "&");
+		assertThat(server.paths).hasSize(1);
+		assertThat(server.paths.getFirst()).startsWith("GET /api/v3/myTrades?symbol=BTCUSDT&limit=" + limit
+				+ "&recvWindow=5000&timestamp=1700000000123&signature=").doesNotContain(ALIAS, KEY, SECRET);
+		assertThat(server.headers).hasSize(1);
+		assertThat(server.headers.getFirst()).contains(KEY).doesNotContain(ALIAS, SECRET);
 		assertMatchingSuccessContent(result);
 		assertNoSecrets(result);
 	}
 
 	@ParameterizedTest
-	@ValueSource(strings = {"ascii-boundary", "surrogate-boundary", "unicode"})
-	void acceptsValidAliasesWithoutTrimmingOrSendingThem(String kind) {
+	@MethodSource("validAliases")
+	void acceptsValidAliasesWithoutTrimmingOrSendingThem(String name, String kind) {
 		String alias = switch (kind) {
 			case "ascii-boundary" -> "x".repeat(256);
 			case "surrogate-boundary" -> "😀".repeat(128);
@@ -203,11 +268,15 @@ class BinanceAccountTradesToolsTest {
 		};
 		String symbol = kind.equals("unicode") ? "한글😀" : "s".repeat(256);
 		server.body.set("[]");
-		CallToolResult result = call(arguments(alias, symbol, null));
+		CallToolResult result = call(context, name, arguments(alias, symbol, null));
 		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
 		assertThat(asMap(result.structuredContent())).containsEntry("accountAlias", alias)
-				.containsEntry("symbol", symbol).containsEntry("trades", List.of())
+				.containsEntry("symbol", symbol).containsEntry(name.equals(NAME) ? "trades" : "executions", List.of())
 				.containsEntry("possiblyTruncated", false);
+		if (name.equals(EXECUTIONS_NAME)) {
+			assertThat(asMap(result.structuredContent())).containsEntry("fees", List.of())
+					.containsEntry("queryScope", "RECENT_SYMBOL").containsEntry("orderId", null);
+		}
 		assertThat(server.requests).hasValue(1);
 		assertThat(server.paths.getFirst()).contains("&limit=500&").doesNotContain(alias);
 		if (kind.equals("unicode")) {
@@ -216,6 +285,15 @@ class BinanceAccountTradesToolsTest {
 		assertThat(server.headers.getFirst()).doesNotContain(alias);
 		assertMatchingSuccessContent(result);
 		assertNoSecrets(result);
+	}
+
+	static Stream<Arguments> limitBoundaries() {
+		return NAMES.stream().flatMap(name -> Stream.of(1, 1000).map(limit -> Arguments.of(name, limit)));
+	}
+
+	static Stream<Arguments> validAliases() {
+		return NAMES.stream().flatMap(name -> Stream.of("ascii-boundary", "surrogate-boundary", "unicode")
+				.map(kind -> Arguments.of(name, kind)));
 	}
 
 	static Stream<Map<String, Object>> invalidRequests() {
@@ -242,59 +320,79 @@ class BinanceAccountTradesToolsTest {
 				(String) arguments.get("symbol"), (Integer) arguments.get("limit")))
 				.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
 				.hasNoCause().satisfies(failure -> assertSafeThrowable(failure));
+		assertThatThrownBy(() -> tools.getBinanceAccountExecutions((String) arguments.get("accountAlias"),
+				(String) arguments.get("symbol"), (Integer) arguments.get("limit")))
+				.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+				.hasNoCause().satisfies(failure -> assertSafeThrowable(failure));
 		verifyNoInteractions(provider);
 		server.keys.set(Map.of());
 		int creations = server.clientCreations.get();
 		assertSafeError(call(arguments), "BAD_REQUEST");
+		assertSafeError(call(context, EXECUTIONS_NAME, arguments), "BAD_REQUEST");
 		assertThat(server.clientCreations).hasValue(creations);
 		assertThat(server.requests).hasValue(0);
 	}
 
-	@Test
-	void missingCredentialsNeverSendsHttp() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void missingCredentialsNeverSendsHttp(String name) {
 		server.keys.set(Map.of());
-		assertSafeError(call(arguments(ALIAS, "BTCUSDT", null)), "MISSING_CREDENTIALS");
+		assertSafeError(call(context, name, arguments(ALIAS, "BTCUSDT", null)), "MISSING_CREDENTIALS");
 		assertThat(server.requests).hasValue(0);
 	}
 
 	@ParameterizedTest
-	@CsvSource({"400,BAD_REQUEST", "401,AUTHENTICATION_FAILED", "403,SECURITY_RESTRICTION",
-			"418,IP_BLOCKED", "429,RATE_LIMITED", "500,SERVER_ERROR", "503,SERVER_ERROR",
-			"302,REDIRECT_REJECTED", "200,INVALID_RESPONSE", "-1,NETWORK_ERROR"})
-	void registeredErrorsDiscardRawDetailsAndNeverRetry(int status, String category) {
+	@MethodSource("httpErrors")
+	void registeredErrorsDiscardRawDetailsAndNeverRetry(String name, int status, String category) {
 		server.status.set(status);
 		server.body.set(MARKER);
-		assertSafeError(call(arguments(ALIAS, "BTCUSDT", null)), category);
+		assertSafeError(call(context, name, arguments(ALIAS, "BTCUSDT", null)), category);
 		assertThat(server.requests).hasValue(1);
 	}
 
 	@ParameterizedTest
-	@CsvSource({"-1021,INVALID_TIMESTAMP", "-1022,INVALID_SIGNATURE", "-2014,INVALID_API_KEY_FORMAT",
-			"-2015,KEY_IP_OR_PERMISSION_REJECTED"})
-	void registeredHandlerExposesSafeExchangeCodeWithoutDiagnosingItsCause(int code, String category) {
+	@MethodSource("exchangeErrors")
+	void registeredHandlerExposesSafeExchangeCodeWithoutDiagnosingItsCause(String name, int code, String category) {
 		server.status.set(401);
 		server.body.set("{\"code\":" + code + ",\"msg\":\"" + MARKER + "\"}");
-		assertSafeError(call(arguments(ALIAS, "BTCUSDT", null)), category);
+		assertSafeError(call(context, name, arguments(ALIAS, "BTCUSDT", null)), category);
 		assertThat(server.requests).hasValue(1);
 	}
 
-	@Test
-	void oversizedResponseIsSafeAndNeverRetried() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void oversizedResponseIsSafeAndNeverRetried(String name) {
 		server.body.set(MARKER + "x".repeat(1024 * 1024));
-		assertSafeError(call(arguments(ALIAS, "BTCUSDT", null)), "RESPONSE_TOO_LARGE");
+		assertSafeError(call(context, name, arguments(ALIAS, "BTCUSDT", null)), "RESPONSE_TOO_LARGE");
 		assertThat(server.requests).hasValue(1);
 	}
 
-	@Test
-	void fullBodyTimeoutIsSafeAndNeverRetried() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void fullBodyTimeoutIsSafeAndNeverRetried(String name) {
 		server.status.set(-2);
 		try {
-			assertSafeError(call(arguments(ALIAS, "BTCUSDT", null)), "TIMEOUT");
+			assertSafeError(call(context, name, arguments(ALIAS, "BTCUSDT", null)), "TIMEOUT");
 			assertThat(server.requests).hasValue(1);
 		}
 		finally {
 			server.releaseBody.get().countDown();
 		}
+	}
+
+	static Stream<Arguments> httpErrors() {
+		Map<Integer, String> errors = Map.of(400, "BAD_REQUEST", 401, "AUTHENTICATION_FAILED",
+				403, "SECURITY_RESTRICTION", 418, "IP_BLOCKED", 429, "RATE_LIMITED", 500, "SERVER_ERROR",
+				503, "SERVER_ERROR", 302, "REDIRECT_REJECTED", 200, "INVALID_RESPONSE", -1, "NETWORK_ERROR");
+		return NAMES.stream().flatMap(name -> errors.entrySet().stream()
+				.map(error -> Arguments.of(name, error.getKey(), error.getValue())));
+	}
+
+	static Stream<Arguments> exchangeErrors() {
+		Map<Integer, String> errors = Map.of(-1021, "INVALID_TIMESTAMP", -1022, "INVALID_SIGNATURE",
+				-2014, "INVALID_API_KEY_FORMAT", -2015, "KEY_IP_OR_PERMISSION_REJECTED");
+		return NAMES.stream().flatMap(name -> errors.entrySet().stream()
+				.map(error -> Arguments.of(name, error.getKey(), error.getValue())));
 	}
 
 	@Test
@@ -308,10 +406,16 @@ class BinanceAccountTradesToolsTest {
 			assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null))
 					.hasMessage("Binance request failed: " + code.name()).hasNoCause()
 					.satisfies(failure -> assertSafeThrowable(failure));
+			assertThatThrownBy(() -> tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null))
+					.hasMessage("Binance request failed: " + code.name()).hasNoCause()
+					.satisfies(failure -> assertSafeThrowable(failure));
 		}
 		doThrow(new BeanCreationException(MARKER + KEY, new IllegalStateException(SECRET)))
 				.when(provider).getObject();
 		assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null))
+				.hasMessage("Binance request failed: INTERNAL_ERROR").hasNoCause()
+				.satisfies(failure -> assertSafeThrowable(failure));
+		assertThatThrownBy(() -> tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null))
 				.hasMessage("Binance request failed: INTERNAL_ERROR").hasNoCause()
 				.satisfies(failure -> assertSafeThrowable(failure));
 	}
@@ -332,7 +436,66 @@ class BinanceAccountTradesToolsTest {
 					assertThat(application).doesNotHaveBean("localUpbitClient");
 					assertThat(application).doesNotHaveBean("localBinanceClient");
 					assertSafeError(call(application, NAME, arguments(ALIAS, "BTCUSDT", null)), category);
+					assertSafeError(call(application, EXECUTIONS_NAME, arguments(ALIAS, "BTCUSDT", null)), category);
 				});
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void unexpectedCommonConversionFailureIsSafeAndDoesNotQueryAgain() {
+		BinanceAccountTradesClient faultyClient = mock(BinanceAccountTradesClient.class);
+		when(faultyClient.getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class)))
+				.thenReturn(new BinanceAccountTradesSnapshot(MARKER + KEY + SECRET + "x".repeat(256),
+						ALIAS, "BTCUSDT", List.of(), false));
+		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
+		when(provider.getObject()).thenReturn(faultyClient);
+		assertThatThrownBy(() -> new BinanceAccountTradesTools(provider)
+				.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null))
+				.hasMessage("Binance request failed: INTERNAL_ERROR").hasNoCause()
+				.satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+		verify(provider).getObject();
+		verifyNoMoreInteractions(provider);
+		verify(faultyClient).getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class));
+		new ApplicationContextRunner().withUserConfiguration(RunnerConfiguration.class)
+				.withPropertyValues("trade-ledger.journal.root=src/test/resources/journals",
+						"spring.ai.mcp.server.type=SYNC", "spring.ai.mcp.server.stdio=true")
+				.withBean("faultyBinanceClient", BinanceAccountTradesClient.class, () -> faultyClient,
+						definition -> {
+							definition.setPrimary(true);
+							definition.setLazyInit(true);
+							definition.setDestroyMethodName("close");
+						})
+				.run(application -> {
+					assertThat(application).hasNotFailed();
+					assertSafeError(call(application, EXECUTIONS_NAME, arguments(ALIAS, "BTCUSDT", null)), "INTERNAL_ERROR");
+				});
+		verify(faultyClient, times(2)).getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class));
+		// The runner destroys the supplied bean when its context closes.
+		verify(faultyClient).close();
+		verifyNoMoreInteractions(faultyClient);
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	@SuppressWarnings("unchecked")
+	void commonConversionPreservesSourceTruncationRatherThanRecomputingIt(boolean truncated) {
+		BinanceAccountTradesClient suppliedClient = mock(BinanceAccountTradesClient.class);
+		when(suppliedClient.getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class)))
+				.thenReturn(new BinanceAccountTradesSnapshot("binance", ALIAS, "BTCUSDT", List.of(), truncated));
+		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
+		when(provider.getObject()).thenReturn(suppliedClient);
+		CommonExecutionResponse result = new BinanceAccountTradesTools(provider)
+				.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null);
+		assertThat(result.possiblyTruncated()).isEqualTo(truncated);
+		assertThat(result.queryScope()).isEqualTo("RECENT_SYMBOL");
+		assertThat(result.orderId()).isNull();
+		assertThat(result.executions()).isEmpty();
+		assertThat(result.fees()).isEmpty();
+		verify(provider).getObject();
+		verify(suppliedClient).getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class));
+		verifyNoMoreInteractions(provider, suppliedClient);
 		assertThat(server.requests).hasValue(0);
 	}
 
@@ -426,12 +589,15 @@ class BinanceAccountTradesToolsTest {
 								assertThat(application.getBeanFactory().containsSingleton(bean)).isFalse();
 							}
 							if (args[0].equals("clearedLogging")) { System.clearProperty(HTTP_LOG); }
-							CallToolResult result = call(application, NAME, arguments(ALIAS, "BTCUSDT", null));
-							assertThat(result.isError()).isTrue();
-							assertThat(result.content().toString()).contains("Binance request failed: UNSAFE_TRANSPORT_CONFIGURATION")
-									.doesNotContain(KEY, SECRET, MARKER);
-							assertThat(local.requests).hasValue(0);
-							assertThat(local.clientCreations).hasValue(1);
+							int attempts = 0;
+							for (String name : NAMES) {
+								CallToolResult result = call(application, name, arguments(ALIAS, "BTCUSDT", null));
+								assertThat(result.isError()).isTrue();
+								assertThat(result.content().toString()).contains("Binance request failed: UNSAFE_TRANSPORT_CONFIGURATION")
+										.doesNotContain(KEY, SECRET, MARKER);
+								assertThat(local.requests).hasValue(0);
+								assertThat(local.clientCreations).hasValue(++attempts);
+							}
 						});
 				assertThat(retained.get().closed).isTrue();
 				System.out.println("PROBE_OK");
