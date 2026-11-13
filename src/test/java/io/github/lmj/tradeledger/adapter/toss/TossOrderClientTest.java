@@ -13,6 +13,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -43,16 +44,21 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+
+import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
 
 @ExtendWith(OutputCaptureExtension.class)
 class TossOrderClientTest {
 	private static final String TOKEN = "fake-toss-token-marker";
 	private static final String ACCOUNT = "9007199254740993";
 	private static final String ID = "PrivateOrder%2F+";
+	private static final String CURSOR = " private-cursor=+/%2F한😀&injected=yes?# ";
+	private static final String RAW_CURSOR = "%20private-cursor%3D%2B%2F%252F%ED%95%9C%F0%9F%98%80%26injected%3Dyes%3F%23%20";
 	private static final String PRIVATE = "private-response-marker";
 	private static final String PATH = "/api/v1/orders/";
 	private static final String RAW_ID = "PrivateOrder%252F%2B";
@@ -71,7 +77,7 @@ class TossOrderClientTest {
 	@AfterEach
 	void privateDataNeverAppearsInLogs(CapturedOutput output) {
 		try {
-			assertThat(output.getAll()).doesNotContain(TOKEN, ACCOUNT, ID, RAW_ID, PRIVATE,
+			assertThat(output.getAll()).doesNotContain(TOKEN, ACCOUNT, ID, RAW_ID, CURSOR, RAW_CURSOR, "private-cursor", PRIVATE,
 					"JsonParseException", "StreamReadException", "Unexpected character", "column:");
 			assertThat(logs.list).isEmpty();
 		}
@@ -87,7 +93,190 @@ class TossOrderClientTest {
 		assertThat(TossOrderClient.class.getConstructors()[0].getParameterCount()).isZero();
 		assertThat(java.util.Arrays.stream(TossOrderClient.class.getDeclaredMethods())
 				.filter(method -> java.lang.reflect.Modifier.isPublic(method.getModifiers()))
-				.map(java.lang.reflect.Method::getName)).containsExactlyInAnyOrder("getOrder", "close");
+				.map(java.lang.reflect.Method::getName)).containsExactlyInAnyOrder("getOrder", "getClosedOrders", "close");
+	}
+
+	@Test
+	void closedPageSendsOnlySpecifiedFiltersOnceAndNeverCreatesDateBoundaries() throws Exception {
+		List<URI> uris = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			uris.add(exchange.getRequestURI());
+			assertThat(exchange.getRequestMethod()).isEqualTo("GET");
+			assertThat(exchange.getRequestBody().readAllBytes()).isEmpty();
+			assertThat(exchange.getRequestHeaders().get("Accept")).containsExactly("application/json");
+			assertThat(exchange.getRequestHeaders().get("Authorization")).containsExactly("Bearer " + TOKEN);
+			assertThat(exchange.getRequestHeaders().get("X-Tossinvest-Account")).containsExactly(ACCOUNT);
+			reply(exchange, 200, page(null, false));
+		})) {
+			record QueryCase(TossClosedOrdersRequest request, String raw) { }
+			List<QueryCase> cases = List.of(
+					new QueryCase(new TossClosedOrdersRequest(), "status=CLOSED&limit=20"),
+					new QueryCase(new TossClosedOrdersRequest(null, null, null, null, 1), "status=CLOSED&limit=1"),
+					new QueryCase(new TossClosedOrdersRequest(null, null, null, null, 100), "status=CLOSED&limit=100"),
+					new QueryCase(new TossClosedOrdersRequest("brK.b-1", null, null, null, null),
+							"status=CLOSED&limit=20&symbol=brK%2Eb-1"),
+					new QueryCase(new TossClosedOrdersRequest(null, "2026-03-28", null, null, null),
+							"status=CLOSED&limit=20&from=2026-03-28"),
+					new QueryCase(new TossClosedOrdersRequest(null, null, "2026-03-28", null, null),
+							"status=CLOSED&limit=20&to=2026-03-28"),
+					new QueryCase(new TossClosedOrdersRequest(null, "2026-03-28", "2026-03-28", null, null),
+							"status=CLOSED&limit=20&from=2026-03-28&to=2026-03-28"),
+					new QueryCase(new TossClosedOrdersRequest("aApL", "2026-03-01", "2026-03-28", CURSOR, 100),
+							"status=CLOSED&limit=100&symbol=aApL&from=2026-03-01&to=2026-03-28&cursor=" + RAW_CURSOR));
+			var client = server.client();
+			for (QueryCase entry : cases) {
+				int before = uris.size();
+				assertThat(client.getClosedOrders(entry.request()).orders()).isEmpty();
+				assertThat(uris).hasSize(before + 1);
+				URI uri = uris.getLast();
+				assertThat(uri.getRawPath()).isEqualTo("/api/v1/orders");
+				assertThat(uri.getRawQuery()).isEqualTo(entry.raw());
+				assertThat(uri.getRawFragment()).isNull();
+				if (entry.request().symbol() != null) {
+					String raw = java.util.Arrays.stream(uri.getRawQuery().split("&"))
+							.filter(pair -> pair.startsWith("symbol=")).findFirst().orElseThrow().substring(7);
+					assertThat(URLDecoder.decode(raw, StandardCharsets.UTF_8)).isEqualTo(entry.request().symbol());
+				}
+			}
+		}
+	}
+
+	@Test
+	void opaqueCursorSurvivesRawQueryWithoutDecodingOrInjectingParameters() throws Exception {
+		List<URI> uris = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			uris.add(exchange.getRequestURI());
+			reply(exchange, 200, page(null, false));
+		})) {
+			var client = server.client();
+			Map<String, String> cases = Map.ofEntries(Map.entry(CURSOR, RAW_CURSOR),
+					Map.entry("%2F", "%252F"), Map.entry("/", "%2F"), Map.entry("+", "%2B"),
+					Map.entry("=", "%3D"), Map.entry("%", "%25"), Map.entry(" x ", "%20x%20"),
+					Map.entry("한😀", "%ED%95%9C%F0%9F%98%80"),
+					Map.entry("&status=OPEN?limit=1#fragment", "%26status%3DOPEN%3Flimit%3D1%23fragment"));
+			for (var entry : cases.entrySet()) {
+				int before = uris.size();
+				client.getClosedOrders(new TossClosedOrdersRequest(null, null, null, entry.getKey(), null));
+				assertThat(uris).hasSize(before + 1);
+				URI uri = uris.getLast();
+				assertThat(uri.getRawPath()).isEqualTo("/api/v1/orders");
+				assertThat(uri.getRawFragment()).isNull();
+				assertThat(uri.getRawQuery()).isEqualTo("status=CLOSED&limit=20&cursor=" + entry.getValue());
+				String[] pairs = uri.getRawQuery().split("&");
+				assertThat(pairs).hasSize(3);
+				assertThat(URLDecoder.decode(pairs[2].substring("cursor=".length()), StandardCharsets.UTF_8))
+						.isEqualTo(entry.getKey());
+			}
+		}
+	}
+
+	@Test
+	void mapsOneShortPageWithNextCursorAndEmptyLastPageWithoutAdditionalRequests() throws Exception {
+		String domestic = fixture("domestic");
+		String partial = fixture("us-partial").replace("005930", "AAPL").replace("KRW", "USD")
+				.replace("FILLED", "PARTIAL_FILLED").replace("69999.5000", "0.1234567890123456789000")
+				.replace("699995.0000", "0.3703703670370370367000")
+				.replace("\"filledQuantity\":\"10.00\"", "\"filledQuantity\":\"3.00\"")
+				.replace("2026-03-28T09:30:00.123456789+09:00", "2026-07-01T09:30:00-04:00");
+		String canceled = partial.replace("us-partial", "canceled").replace("PARTIAL_FILLED", "CANCELED");
+		AtomicReference<String> json = new AtomicReference<>(page("\"" + CURSOR + "\"", true, domestic, partial, canceled));
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, json.get());
+		})) {
+			var client = server.client();
+			var result = client.getClosedOrders(new TossClosedOrdersRequest());
+			assertThat(calls).hasValue(1);
+			assertThat(result.nextCursor()).isEqualTo(CURSOR);
+			assertThat(result.hasNext()).isTrue();
+			assertThat(result.orders()).extracting(TossOrderSnapshot::orderId)
+					.containsExactly("domestic", "us-partial", "canceled");
+			var kr = result.orders().getFirst();
+			assertThat(kr.status()).isEqualTo("FILLED");
+			assertThat(kr.price()).isEqualTo("70000.00");
+			assertThat(kr.quantity()).isEqualTo("10.00");
+			assertThat(kr.orderAmount()).isEqualTo("900.00");
+			assertThat(kr.orderedAt()).isEqualTo(Instant.parse("2026-03-28T00:30:00.123456789Z"));
+			assertThat(kr.execution().averageFilledPrice()).isEqualTo("69999.5000");
+			assertThat(kr.execution().filledAmount()).isEqualTo("699995.0000");
+			assertThat(kr.execution().commission()).isEqualTo("1400.00");
+			assertThat(kr.execution().tax()).isEqualTo("12.30");
+			assertThat(kr.execution().filledAt()).isEqualTo(Instant.parse("2026-03-28T00:31:15Z"));
+			assertThat(kr.execution().settlementDate()).isEqualTo(LocalDate.of(2026, 3, 30));
+			var us = result.orders().get(1);
+			assertThat(us.symbol()).isEqualTo("AAPL");
+			assertThat(us.currency()).isEqualTo("USD");
+			assertThat(us.status()).isEqualTo("PARTIAL_FILLED");
+			assertThat(us.orderedAt()).isEqualTo(Instant.parse("2026-07-01T13:30:00Z"));
+			assertThat(us.execution().filledQuantity()).isEqualTo("3.00");
+			assertThat(us.execution().averageFilledPrice()).isEqualTo("0.1234567890123456789000");
+			assertThat(us.execution().filledAmount()).isEqualTo("0.3703703670370370367000");
+			assertThat(result.orders().getLast().status()).isEqualTo("CANCELED");
+			assertThat(result.orders().getLast().execution()).isEqualTo(us.execution());
+			assertThat(result.orders().getLast().canceledAt()).isEqualTo(Instant.parse("2026-03-28T00:32:00Z"));
+			json.set(page(null, false));
+			var last = client.getClosedOrders(new TossClosedOrdersRequest(null, null, null, result.nextCursor(), null));
+			assertThat(last.orders()).isEmpty();
+			assertThat(last.nextCursor()).isNull();
+			assertThat(last.hasNext()).isFalse();
+			assertThat(calls).hasValue(2);
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"1", "20", "100"})
+	void closedPageEnforcesRequestedLimitWithoutTruncating(int limit) throws Exception {
+		String[] orders = java.util.stream.IntStream.range(0, limit).mapToObj(i -> fixture("order-" + i)).toArray(String[]::new);
+		AtomicReference<String> json = new AtomicReference<>(page(null, false, orders));
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, json.get());
+		})) {
+			var client = server.client();
+			var request = new TossClosedOrdersRequest(null, null, null, null, limit == 20 ? null : limit);
+			assertThat(client.getClosedOrders(request).orders()).hasSize(limit);
+			String[] excessive = java.util.Arrays.copyOf(orders, limit + 1);
+			excessive[limit] = fixture("extra");
+			json.set(page(null, false, excessive));
+			expect(TossErrorCode.INVALID_RESPONSE, () -> client.getClosedOrders(request));
+			assertThat(calls).hasValue(2);
+		}
+	}
+
+	@Test
+	void invalidClosedPageJsonMetadataLastItemAndUtf8FailWithoutPartialResults() throws Exception {
+		String valid = page(null, false, fixture(ID));
+		List<String> invalid = List.of("null", "[]", "{}", "{\"error\":\"" + PRIVATE + "\"}",
+				page(null, false, fixture(ID), fixture(ID)),
+				page(null, false, fixture(ID), fixture("damaged").replace("\"tax\":\"12.30\"", "\"tax\":false")),
+				page("\"" + CURSOR + "\"", true, fixture(ID), fixture(PRIVATE).replace("\"quantity\":\"10.00\"", "\"quantity\":false")),
+				page(null, true, fixture(ID)), page("\"next\"", false, fixture(ID)),
+				page("\" \"", true, fixture(ID)), valid.replace("\"hasNext\":false", "\"hasNext\":0"),
+				valid.replace("\"nextCursor\":null,", ""), valid.replace(",\"hasNext\":false", ""),
+				valid.replace("\"orders\":[", "\"orders\":[null,"),
+				valid.replace("\"tax\":", "\"tax\":null,\"tax\":"),
+				valid + " {}", valid + PRIVATE, valid.substring(0, valid.length() - 1));
+		AtomicReference<byte[]> body = new AtomicReference<>();
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			exchange.sendResponseHeaders(200, body.get().length);
+			try (var stream = exchange.getResponseBody()) { stream.write(body.get()); }
+		})) {
+			var client = server.client();
+			for (String json : invalid) {
+				body.set(json.getBytes(StandardCharsets.UTF_8));
+				expect(TossErrorCode.INVALID_RESPONSE, () -> client.getClosedOrders(new TossClosedOrdersRequest()));
+			}
+			for (byte[] utf8 : List.of(new byte[] {(byte) 0xc3, 0x28},
+					new byte[] {(byte) 0xed, (byte) 0xa0, (byte) 0x80}, new byte[] {(byte) 0xf0, (byte) 0x9f})) {
+				body.set(utf8);
+				expect(TossErrorCode.INVALID_RESPONSE, () -> client.getClosedOrders(new TossClosedOrdersRequest()));
+			}
+			assertThat(calls).hasValue(invalid.size() + 3);
+		}
 	}
 
 	@Test
@@ -136,6 +325,7 @@ class TossOrderClientTest {
 		})) {
 			var client = server.client(() -> { reads.incrementAndGet(); return KEYS; });
 			expect(TossErrorCode.BAD_REQUEST, () -> client.getOrder(null));
+			expect(TossErrorCode.BAD_REQUEST, () -> client.getClosedOrders(null));
 			for (String id : List.of("\ud800", "\udc00", "x\ud800y", "\ud800\ud800", "😀\udc00")) {
 				expect(TossErrorCode.BAD_REQUEST, () -> client.getOrder(new TossOrderRequest(id)));
 			}
@@ -144,63 +334,65 @@ class TossOrderClientTest {
 		}
 	}
 
-	@Test
-	void rereadsEnvironmentAndPreservesCanonicalInt64HeadersExactly() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void rereadsEnvironmentAndPreservesCanonicalInt64HeadersExactly(Lookup lookup) throws Exception {
 		AtomicInteger reads = new AtomicInteger();
 		AtomicReference<Map<String, String>> values = new AtomicReference<>(KEYS);
 		List<String> headers = new CopyOnWriteArrayList<>();
 		try (LocalServer server = new LocalServer(exchange -> {
 			headers.add(exchange.getRequestHeaders().getFirst("Authorization") + "|"
 					+ exchange.getRequestHeaders().getFirst("X-Tossinvest-Account"));
-			reply(exchange, 200, fixture(ID));
+			reply(exchange, 200, lookup.response(ID));
 		})) {
 			var client = server.client(() -> { reads.incrementAndGet(); return values.get(); });
 			for (String account : List.of(ACCOUNT, "9223372036854775807", "-9223372036854775808", "-1", "0")) {
 				String token = TOKEN + headers.size();
 				values.set(credentials(token, account));
-				client.getOrder(request());
+				lookup.get(client);
 				assertThat(headers.getLast()).isEqualTo("Bearer " + token + "|" + account);
 			}
 			String boundaryToken = "t".repeat(8192);
 			values.set(credentials(boundaryToken, ACCOUNT));
-			client.getOrder(request());
+			lookup.get(client);
 			assertThat(headers.getLast()).isEqualTo("Bearer " + boundaryToken + "|" + ACCOUNT);
 			assertThat(reads).hasValue(6);
 			assertThat(headers).hasSize(6);
 		}
 	}
 
-	@Test
-	void invalidOrMissingCredentialsAndSupplierFailuresNeverSend() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void invalidOrMissingCredentialsAndSupplierFailuresNeverSend(Lookup lookup) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		AtomicInteger reads = new AtomicInteger();
 		AtomicReference<Map<String, String>> values = new AtomicReference<>();
 		try (LocalServer server = new LocalServer(exchange -> {
 			calls.incrementAndGet();
-			reply(exchange, 200, fixture(ID));
+			reply(exchange, 200, lookup.response(ID));
 		})) {
 			var client = server.client(() -> { reads.incrementAndGet(); return values.get(); });
 			for (Map<String, String> missing : List.of(Map.<String, String>of(),
 					Map.of("TOSS_ACCESS_TOKEN", TOKEN), Map.of("TOSS_ACCOUNT_SEQ", ACCOUNT),
 					credentials("", ACCOUNT), credentials(TOKEN, ""))) {
 				values.set(missing);
-				expect(TossErrorCode.MISSING_CREDENTIALS, () -> client.getOrder(request()));
+				expect(TossErrorCode.MISSING_CREDENTIALS, () -> lookup.get(client));
 			}
 			values.set(null);
-			expect(TossErrorCode.MISSING_CREDENTIALS, () -> client.getOrder(request()));
+			expect(TossErrorCode.MISSING_CREDENTIALS, () -> lookup.get(client));
 			for (String invalid : List.of(" ", "a b", "a\tb", "a\rb", "a\nb", "a\u0000b", "a\u007fb",
 					"한", "😀", "t".repeat(8193))) {
 				values.set(credentials(invalid, ACCOUNT));
-				expect(TossErrorCode.INVALID_CREDENTIALS, () -> client.getOrder(request()));
+				expect(TossErrorCode.INVALID_CREDENTIALS, () -> lookup.get(client));
 			}
 			for (String invalid : List.of(" ", "01", "-0", "+1", "1.0", "1e2", "１", "١", "1\r\n",
 					"9223372036854775808", "-9223372036854775809", "1".repeat(21))) {
 				values.set(credentials(TOKEN, invalid));
-				expect(TossErrorCode.INVALID_CREDENTIALS, () -> client.getOrder(request()));
+				expect(TossErrorCode.INVALID_CREDENTIALS, () -> lookup.get(client));
 			}
 			assertThat(reads).hasValue(28);
 			var failing = server.client(() -> { throw new IllegalStateException(TOKEN + ACCOUNT + PRIVATE); });
-			expect(TossErrorCode.MISSING_CREDENTIALS, () -> failing.getOrder(request()));
+			expect(TossErrorCode.MISSING_CREDENTIALS, () -> lookup.get(failing));
 			assertThat(calls).hasValue(0);
 		}
 	}
@@ -268,15 +460,16 @@ class TossOrderClientTest {
 		}
 	}
 
-	@Test
-	void classifiesOnlyHttpStatusAndNeverFollowsRedirectsOrParsesErrorMessages() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void classifiesOnlyHttpStatusAndNeverFollowsRedirectsOrParsesErrorMessages(Lookup lookup) throws Exception {
 		AtomicInteger forwarded = new AtomicInteger();
 		AtomicInteger calls = new AtomicInteger();
 		AtomicInteger status = new AtomicInteger();
 		AtomicReference<byte[]> body = new AtomicReference<>();
 		try (LocalServer target = new LocalServer(exchange -> {
 			forwarded.incrementAndGet();
-			reply(exchange, 200, fixture(ID));
+			reply(exchange, 200, lookup.response(ID));
 		}); LocalServer server = new LocalServer(exchange -> {
 			calls.incrementAndGet();
 			exchange.getResponseHeaders().set("Location", target.uri().toString());
@@ -297,10 +490,10 @@ class TossOrderClientTest {
 					Map.entry(201, TossErrorCode.UNEXPECTED_STATUS), Map.entry(418, TossErrorCode.UNEXPECTED_STATUS));
 			for (var entry : cases.entrySet()) {
 				status.set(entry.getKey());
-				for (byte[] response : List.of(("{\"error\":\"" + PRIVATE + TOKEN + ACCOUNT + ID + "\"}")
+				for (byte[] response : List.of(("{\"error\":\"" + PRIVATE + TOKEN + ACCOUNT + ID + CURSOR + "\"}")
 						.getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xc3, (byte) 0x28})) {
 					body.set(response);
-					expect(entry.getValue(), () -> client.getOrder(request()));
+					expect(entry.getValue(), () -> lookup.get(client));
 				}
 			}
 			assertThat(calls).hasValue(cases.size() * 2);
@@ -339,11 +532,11 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void boundsActualFixedAndChunkedUtf8BytesAtExactlyOneMiB(boolean chunked) throws Exception {
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	void boundsActualFixedAndChunkedUtf8BytesAtExactlyOneMiB(Lookup lookup, boolean chunked) throws Exception {
 		AtomicInteger size = new AtomicInteger(TossOrderClient.MAX_RESPONSE_BYTES);
 		AtomicInteger calls = new AtomicInteger();
-		String json = fixture("한😀");
+		String json = lookup.response("한😀");
 		byte[] prefix = json.getBytes(StandardCharsets.UTF_8);
 		try (LocalServer server = new LocalServer(exchange -> {
 			calls.incrementAndGet();
@@ -360,9 +553,9 @@ class TossOrderClientTest {
 			}
 		})) {
 			var client = server.client();
-			assertThat(client.getOrder(new TossOrderRequest("한😀")).orderId()).isEqualTo("한😀");
+			assertThat(lookup.get(client, "한😀").orderId()).isEqualTo("한😀");
 			size.incrementAndGet();
-			expect(TossErrorCode.RESPONSE_TOO_LARGE, () -> client.getOrder(new TossOrderRequest("한😀")));
+			expect(TossErrorCode.RESPONSE_TOO_LARGE, () -> lookup.get(client, "한😀"));
 			assertThat(calls).hasValue(2);
 		}
 	}
@@ -391,8 +584,9 @@ class TossOrderClientTest {
 		assertThat(canceled).hasValue(3);
 	}
 
-	@Test
-	void oversizedChunkClosesActualConnectionBeforeClientClose() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void oversizedChunkClosesActualConnectionBeforeClientClose(Lookup lookup) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
 				var client = new TossOrderClient(uri(server), () -> KEYS)) {
@@ -400,7 +594,7 @@ class TossOrderClientTest {
 				try (var socket = server.accept()) {
 					socket.setSoTimeout(3000);
 					var input = reader(socket);
-					readRequest(input, calls);
+					readRequest(input, calls, lookup);
 					var stream = socket.getOutputStream();
 					stream.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
 					int length = TossOrderClient.MAX_RESPONSE_BYTES + 1;
@@ -411,15 +605,15 @@ class TossOrderClientTest {
 				}
 				return null;
 			});
-			expect(TossErrorCode.RESPONSE_TOO_LARGE, () -> client.getOrder(request()));
+			expect(TossErrorCode.RESPONSE_TOO_LARGE, () -> lookup.get(client));
 			receiver.get(3, TimeUnit.SECONDS);
 			assertThat(calls).hasValue(1);
 		}
 	}
 
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void wholeBodyDeadlineClosesDelayedOrUnfinishedStream(boolean partialBody) throws Exception {
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	void wholeBodyDeadlineClosesDelayedOrUnfinishedStream(Lookup lookup, boolean partialBody) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
 				var client = new TossOrderClient(uri(server), () -> KEYS)) {
@@ -427,7 +621,7 @@ class TossOrderClientTest {
 				try (var socket = server.accept()) {
 					socket.setSoTimeout(15000);
 					var input = reader(socket);
-					readRequest(input, calls);
+					readRequest(input, calls, lookup);
 					socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
 							+ (partialBody ? "1\r\n{\r\n" : "")).getBytes(StandardCharsets.US_ASCII));
 					socket.getOutputStream().flush();
@@ -438,7 +632,7 @@ class TossOrderClientTest {
 			assertThat(TossOrderClient.CONNECT_TIMEOUT).isEqualTo(Duration.ofSeconds(3));
 			assertThat(TossOrderClient.REQUEST_TIMEOUT).isEqualTo(Duration.ofSeconds(10));
 			long started = System.nanoTime();
-			expect(TossErrorCode.TIMEOUT, () -> client.getOrder(request()));
+			expect(TossErrorCode.TIMEOUT, () -> lookup.get(client));
 			assertThat(Duration.ofNanos(System.nanoTime() - started)).isBetween(Duration.ofSeconds(9), Duration.ofSeconds(12));
 			receiver.get(3, TimeUnit.SECONDS);
 			assertThat(calls).hasValue(1);
@@ -446,8 +640,8 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void neverResendsOnDisconnectBeforeHeadersOnFreshOrReusedConnection(boolean reused) throws Exception {
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	void neverResendsOnDisconnectBeforeHeadersOnFreshOrReusedConnection(Lookup lookup, boolean reused) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 			var receiver = executor.submit(() -> {
@@ -455,14 +649,14 @@ class TossOrderClientTest {
 					try (var socket = server.accept()) {
 						socket.setSoTimeout(3000);
 						var input = reader(socket);
-						if (!readRequest(input, calls)) { continue; }
+						if (!readRequest(input, calls, lookup)) { continue; }
 						if (reused && calls.get() == 1) {
-							byte[] json = fixture(ID).getBytes(StandardCharsets.UTF_8);
+							byte[] json = lookup.response(ID).getBytes(StandardCharsets.UTF_8);
 							socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Length: " + json.length + "\r\n\r\n")
 									.getBytes(StandardCharsets.US_ASCII));
 							socket.getOutputStream().write(json);
 							socket.getOutputStream().flush();
-							assertThat(readRequest(input, calls)).isTrue();
+							assertThat(readRequest(input, calls, lookup)).isTrue();
 						}
 						// Close before any response headers; count any unexpected retry too.
 					}
@@ -474,11 +668,11 @@ class TossOrderClientTest {
 			});
 			try (var client = new TossOrderClient(uri(server), () -> KEYS)) {
 				if (reused) {
-					assertThat(client.getOrder(request()).orderId()).isEqualTo(ID);
+					assertThat(lookup.get(client).orderId()).isEqualTo(ID);
 					assertThat(calls).hasValue(1);
 				}
 				int before = calls.get();
-				expect(TossErrorCode.NETWORK_ERROR, () -> client.getOrder(request()));
+				expect(TossErrorCode.NETWORK_ERROR, () -> lookup.get(client));
 				assertThat(calls.get() - before).isEqualTo(1);
 			}
 			finally { server.close(); }
@@ -487,8 +681,8 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
-	void interruptOrClientCloseCancelsWaitAndActualConnection(boolean closeClient) throws Exception {
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	void interruptOrClientCloseCancelsWaitAndActualConnection(Lookup lookup, boolean closeClient) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		CountDownLatch headers = new CountDownLatch(1);
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -497,7 +691,7 @@ class TossOrderClientTest {
 				try (var socket = server.accept()) {
 					socket.setSoTimeout(3000);
 					var input = reader(socket);
-					readRequest(input, calls);
+					readRequest(input, calls, lookup);
 					socket.getOutputStream().write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n"
 							.getBytes(StandardCharsets.US_ASCII));
 					socket.getOutputStream().flush();
@@ -510,7 +704,7 @@ class TossOrderClientTest {
 			Thread worker = Thread.ofVirtual().start(() -> {
 				try {
 					expect(closeClient ? TossErrorCode.NETWORK_ERROR : TossErrorCode.INTERRUPTED,
-							() -> client.getOrder(request()));
+							() -> lookup.get(client));
 					assertThat(Thread.currentThread().isInterrupted()).isEqualTo(!closeClient);
 				}
 				catch (Throwable exception) { failure.set(exception); }
@@ -529,12 +723,38 @@ class TossOrderClientTest {
 		}
 	}
 
-	@Test
-	void connectionFailureIsSanitized() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void connectionFailureIsSanitized(Lookup lookup) throws Exception {
 		URI unavailable;
 		try (ServerSocket socket = loopbackSocket()) { unavailable = uri(socket); }
 		try (var client = new TossOrderClient(unavailable, () -> KEYS)) {
-			expect(TossErrorCode.NETWORK_ERROR, () -> client.getOrder(request()));
+			expect(TossErrorCode.NETWORK_ERROR, () -> lookup.get(client));
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	void disconnectDuringFixedOrChunkedBodyIsSanitizedWithoutResending(Lookup lookup, boolean chunked) throws Exception {
+		AtomicInteger calls = new AtomicInteger();
+		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
+				var client = new TossOrderClient(uri(server), () -> KEYS)) {
+			var receiver = executor.submit(() -> {
+				try (var socket = server.accept()) {
+					socket.setSoTimeout(3000);
+					readRequest(reader(socket), calls, lookup);
+					String headers = chunked ? "Transfer-Encoding: chunked\r\n\r\n1000\r\n"
+							: "Content-Length: 4096\r\n\r\n";
+					socket.getOutputStream().write(("HTTP/1.1 200 OK\r\n" + headers + PRIVATE)
+							.getBytes(StandardCharsets.US_ASCII));
+					socket.getOutputStream().flush();
+					// Close before the promised bytes and, for chunked encoding, before the final chunk.
+				}
+				return null;
+			});
+			expect(TossErrorCode.NETWORK_ERROR, () -> lookup.get(client));
+			receiver.get(3, TimeUnit.SECONDS);
+			assertThat(calls).hasValue(1);
 		}
 	}
 
@@ -554,12 +774,13 @@ class TossOrderClientTest {
 		}
 	}
 
-	@Test
-	void independentJvmsRejectUnsafeStartupAndLateSettingsBeforeEnvironmentOrSending() throws Exception {
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void independentJvmsRejectUnsafeStartupAndLateSettingsBeforeEnvironmentOrSending(Lookup lookup) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (LocalServer server = new LocalServer(exchange -> {
 			calls.incrementAndGet();
-			reply(exchange, 200, fixture(ID));
+			reply(exchange, 200, lookup.response(ID));
 		})) {
 			List<List<String>> invalid = List.of(List.of(), List.of("-D" + DISABLE + "=true"),
 					List.of("-D" + RETRIES + "=1"), List.of("-D" + DISABLE + "=false", "-D" + RETRIES + "=1"),
@@ -568,37 +789,37 @@ class TossOrderClientTest {
 					List.of("-D" + DISABLE + "=true", "-D" + RETRIES + "=5", "-D" + RETRIES + "=1"),
 					List.of("-D" + DISABLE, "-D" + DISABLE + "=true", "-D" + RETRIES + "=1"));
 			for (List<String> options : invalid) {
-				assertThat(runProbe(server.uri(), options, "blocked")).isEqualTo("BLOCKED\n");
+				assertThat(runProbe(server.uri(), options, "blocked", lookup)).isEqualTo("BLOCKED\n");
 				assertThat(calls).hasValue(0);
 			}
 			List<String> valid = List.of("-D" + DISABLE + "=true", "-D" + RETRIES + "=1");
 			for (String mode : List.of("mutated", "lateLogging", "beforeSend", "loggingBeforeSend")) {
-				assertThat(runProbe(server.uri(), valid, mode)).isEqualTo("BLOCKED\n");
+				assertThat(runProbe(server.uri(), valid, mode, lookup)).isEqualTo("BLOCKED\n");
 				assertThat(calls).hasValue(0);
 			}
 			List<String> logging = new ArrayList<>(valid);
 			logging.add("-D" + HTTP_LOG + "=requests,headers,content,errors");
-			assertThat(runProbe(server.uri(), logging, "logging")).isEqualTo("BLOCKED\n");
-			assertThat(runProbe(server.uri(), logging, "clearedLogging")).isEqualTo("BLOCKED\n");
+			assertThat(runProbe(server.uri(), logging, "logging", lookup)).isEqualTo("BLOCKED\n");
+			assertThat(runProbe(server.uri(), logging, "clearedLogging", lookup)).isEqualTo("BLOCKED\n");
 			logging.add("-D" + HTTP_LOG + "=");
-			assertThat(runProbe(server.uri(), logging, "logging")).isEqualTo("BLOCKED\n");
+			assertThat(runProbe(server.uri(), logging, "logging", lookup)).isEqualTo("BLOCKED\n");
 			assertThat(calls).hasValue(0);
-			assertThat(runProbe(server.uri(), valid, "success")).isEqualTo("SUCCESS\n");
+			assertThat(runProbe(server.uri(), valid, "success", lookup)).isEqualTo("SUCCESS\n");
 			assertThat(calls).hasValue(1);
 			List<String> emptyLogging = new ArrayList<>(valid);
 			emptyLogging.add("-D" + HTTP_LOG + "=");
-			assertThat(runProbe(server.uri(), emptyLogging, "success")).isEqualTo("SUCCESS\n");
+			assertThat(runProbe(server.uri(), emptyLogging, "success", lookup)).isEqualTo("SUCCESS\n");
 			assertThat(calls).hasValue(2);
 		}
 	}
 
-	private static String runProbe(URI endpoint, List<String> options, String mode) throws Exception {
+	private static String runProbe(URI endpoint, List<String> options, String mode, Lookup lookup) throws Exception {
 		String classpath = System.getProperty("upbit.test.runtimeClasspath");
 		assertThat(classpath).isNotBlank();
 		List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-Xms16m", "-Xmx96m", "-Xss256k", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1", "-Xint"));
 		command.addAll(options);
-		command.addAll(List.of("-cp", classpath, StartupProbe.class.getName(), endpoint.toString(), mode));
+		command.addAll(List.of("-cp", classpath, StartupProbe.class.getName(), endpoint.toString(), mode, lookup.name()));
 		ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
 		for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) {
 			builder.environment().remove(variable);
@@ -639,11 +860,12 @@ class TossOrderClientTest {
 			try {
 				URI endpoint = URI.create(args[0]);
 				String mode = args[1];
+				Lookup lookup = Lookup.valueOf(args[2]);
 				AtomicInteger reads = new AtomicInteger();
 				Supplier<Map<String, String>> environment = () -> { reads.incrementAndGet(); return KEYS; };
 				if (mode.equals("success")) {
 					try (var client = new TossOrderClient(endpoint, environment)) {
-						if (!client.getOrder(request()).orderId().equals(ID) || reads.get() != 1) { throw new AssertionError(); }
+						if (!lookup.get(client).orderId().equals(ID) || reads.get() != 1) { throw new AssertionError(); }
 					}
 					System.out.println("SUCCESS");
 					return;
@@ -652,7 +874,7 @@ class TossOrderClientTest {
 					try (var client = new TossOrderClient(endpoint, environment)) {
 						System.setProperty(mode.equals("mutated") ? RETRIES : HTTP_LOG,
 								mode.equals("mutated") ? "2" : "requests,headers,content,errors");
-						assertBlocked(() -> client.getOrder(request()));
+						assertBlocked(() -> lookup.get(client));
 					}
 				}
 				else if (mode.equals("beforeSend") || mode.equals("loggingBeforeSend")) {
@@ -663,7 +885,7 @@ class TossOrderClientTest {
 								mode.equals("beforeSend") ? "2" : "requests,headers");
 						return KEYS;
 					})) {
-						assertBlocked(() -> client.getOrder(request()));
+						assertBlocked(() -> lookup.get(client));
 					}
 					if (reads.get() != 1) { throw new AssertionError(); }
 					System.out.println("BLOCKED");
@@ -672,13 +894,13 @@ class TossOrderClientTest {
 				else {
 					if (mode.equals("clearedLogging")) { System.clearProperty(HTTP_LOG); }
 					assertBlocked(() -> { try (var client = new TossOrderClient(endpoint, environment)) {
-						client.getOrder(request());
+						lookup.get(client);
 					} });
 					if (mode.equals("blocked")) {
 						System.setProperty(DISABLE, "true");
 						System.setProperty(RETRIES, "1");
 						assertBlocked(() -> { try (var client = new TossOrderClient(endpoint, environment)) {
-							client.getOrder(request());
+							lookup.get(client);
 						} });
 					}
 				}
@@ -701,6 +923,30 @@ class TossOrderClientTest {
 		}
 	}
 
+	private enum Lookup {
+		ORDER, CLOSED;
+
+		TossOrderSnapshot get(TossOrderClient client) { return get(client, ID); }
+
+		TossOrderSnapshot get(TossOrderClient client, String id) {
+			return this == ORDER ? client.getOrder(new TossOrderRequest(id))
+					: client.getClosedOrders(new TossClosedOrdersRequest(null, null, null, CURSOR, null)).orders().getFirst();
+		}
+
+		String response(String id) { return this == ORDER ? fixture(id) : page(null, false, fixture(id)); }
+
+		String target() {
+			return this == ORDER ? PATH + RAW_ID : "/api/v1/orders?status=CLOSED&limit=20&cursor=" + RAW_CURSOR;
+		}
+	}
+
+	private static String page(String cursorJson, boolean hasNext, String... wrappedOrders) {
+		List<String> orders = java.util.Arrays.stream(wrappedOrders)
+				.map(json -> json.substring("{\"result\":".length(), json.length() - 1)).toList();
+		return "{\"result\":{\"orders\":[" + String.join(",", orders) + "],\"nextCursor\":"
+				+ cursorJson + ",\"hasNext\":" + hasNext + "}}";
+	}
+
 	private static Map<String, String> credentials(String token, String account) {
 		return Map.of("TOSS_ACCESS_TOKEN", token, "TOSS_ACCOUNT_SEQ", account);
 	}
@@ -719,10 +965,10 @@ class TossOrderClientTest {
 		return new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
 	}
 
-	private static boolean readRequest(BufferedReader input, AtomicInteger calls) throws IOException {
+	private static boolean readRequest(BufferedReader input, AtomicInteger calls, Lookup lookup) throws IOException {
 		String line = input.readLine();
 		if (line == null) { return false; }
-		assertThat(line).isEqualTo("GET " + PATH + RAW_ID + " HTTP/1.1");
+		assertThat(line).isEqualTo("GET " + lookup.target() + " HTTP/1.1");
 		calls.incrementAndGet();
 		while ((line = input.readLine()) != null && !line.isEmpty()) { }
 		return true;
@@ -736,7 +982,7 @@ class TossOrderClientTest {
 			assertThat(exception.getSuppressed()).isEmpty();
 			StringWriter trace = new StringWriter();
 			exception.printStackTrace(new PrintWriter(trace));
-			assertThat(trace.toString()).doesNotContain(TOKEN, ACCOUNT, ID, RAW_ID, PRIVATE,
+			assertThat(trace.toString()).doesNotContain(TOKEN, ACCOUNT, ID, RAW_ID, CURSOR, RAW_CURSOR, "private-cursor", PRIVATE,
 					"http://", "https://", "tools.jackson", "Unexpected character", "column:");
 			exception.addSuppressed(new IllegalStateException(PRIVATE));
 			assertThat(exception.getSuppressed()).isEmpty();

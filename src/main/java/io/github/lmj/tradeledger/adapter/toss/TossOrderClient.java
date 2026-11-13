@@ -23,11 +23,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
+import io.github.lmj.tradeledger.application.model.TossClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
 
 /**
- * One read-only GET to the fixed Toss order endpoint. Reads externally issued
- * TOSS_ACCESS_TOKEN and TOSS_ACCOUNT_SEQ from the process environment per call.
+ * One read-only GET for an order or one CLOSED page at the fixed Toss origin.
+ * Reads externally issued TOSS_ACCESS_TOKEN and TOSS_ACCOUNT_SEQ per call.
  * No token issuance/refresh, account discovery, redirects, retries or pagination.
  *
  * <p>Requires JVM startup options {@code -Djdk.httpclient.disableRetryConnect=true}
@@ -111,6 +112,44 @@ public final class TossOrderClient implements AutoCloseable {
 		}
 		// Encode before reading any environment values; reject malformed UTF-16.
 		String segment = encodeSegment(request.orderId());
+		String json = send(authenticatedRequest(URI.create(endpoint.toASCIIString() + segment)));
+		try {
+			return mapper.map(request, json);
+		}
+		catch (RuntimeException exception) {
+			throw new TossApiException(TossErrorCode.INVALID_RESPONSE);
+		}
+	}
+
+	/** Retrieves exactly one CLOSED page; the caller owns any subsequent page request. */
+	public TossClosedOrdersSnapshot getClosedOrders(TossClosedOrdersRequest request) {
+		if (request == null) {
+			throw new TossApiException(TossErrorCode.BAD_REQUEST);
+		}
+		StringBuilder query = new StringBuilder("status=CLOSED&limit=").append(request.limit());
+		appendQuery(query, "symbol", request.symbol());
+		appendQuery(query, "from", request.from());
+		appendQuery(query, "to", request.to());
+		appendQuery(query, "cursor", request.cursor());
+		// Absolute path on the already validated origin; never resolve a caller-supplied URI.
+		URI uri = endpoint.resolve("/api/v1/orders?" + query);
+		String json = send(authenticatedRequest(uri));
+		try {
+			return mapper.mapClosedOrders(request, json);
+		}
+		catch (RuntimeException exception) {
+			throw new TossApiException(TossErrorCode.INVALID_RESPONSE);
+		}
+	}
+
+	private static void appendQuery(StringBuilder query, String name, String value) {
+		if (value != null) {
+			// The same UTF-8 escaping protects opaque path segments and query values.
+			query.append('&').append(name).append('=').append(encodeSegment(value));
+		}
+	}
+
+	private HttpRequest authenticatedRequest(URI uri) {
 		checkTransportConfiguration();
 		String token;
 		String account;
@@ -130,21 +169,13 @@ public final class TossOrderClient implements AutoCloseable {
 				|| !validAccount(account)) {
 			throw new TossApiException(TossErrorCode.INVALID_CREDENTIALS);
 		}
-		HttpRequest outgoing;
 		try {
-			outgoing = HttpRequest.newBuilder(URI.create(endpoint.toASCIIString() + segment))
+			return HttpRequest.newBuilder(uri)
 					.timeout(REQUEST_TIMEOUT).header("Authorization", "Bearer " + token)
 					.header("X-Tossinvest-Account", account).header("Accept", "application/json").GET().build();
 		}
 		catch (RuntimeException exception) {
 			throw new TossApiException(TossErrorCode.INVALID_CREDENTIALS);
-		}
-		String json = send(outgoing);
-		try {
-			return mapper.map(request, json);
-		}
-		catch (RuntimeException exception) {
-			throw new TossApiException(TossErrorCode.INVALID_RESPONSE);
 		}
 	}
 

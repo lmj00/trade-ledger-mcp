@@ -531,19 +531,36 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 오프셋을 포함한 주문·취소·최종 체결 시각은 `Instant`로 변환하며 오프셋 없는 시각은 거부합니다. 결제 예정일은 유효한 `YYYY-MM-DD`의 `LocalDate`로 보존합니다. 이 예정일과 주문 누적 체결 요약은 실제 결제 거래내역이나 개별 체결 목록을 대신하지 않습니다. 취소·대체·거부 상태여도 누적 체결은 보존합니다. 가상 체결 ID·개별 체결·완결 `Trade`·손익을 만들지 않으며 기존 `OrderExecutionSnapshot`·`CommonExecutionSnapshot`으로 변환하지 않습니다. `/api/v1/trades`의 종목별 시장 체결도 개인 계좌 체결로 사용하지 않습니다.
 
-### 종료 주문 한 페이지: 순수 모델과 매퍼
+### 종료 주문 한 페이지: HTTP 클라이언트와 매퍼
 
-[공식 주문 목록 계약](https://openapi.tossinvest.com/openapi-docs/latest/api-reference/Apis/OrderHistoryApi.md)과 [공식 OpenAPI의 PaginatedOrderResponse·Order 스키마](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)를 기준으로 `CLOSED` 한 페이지의 순수 변환을 제공합니다. [TossClosedOrdersRequest](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossClosedOrdersRequest.java)는 선택적 `symbol`·`from`·`to`·`cursor`·`limit`만 받고 `status()`는 항상 `CLOSED`입니다. limit은 생략 시 20, 허용 범위는 1~100입니다. `OPEN`은 서버가 limit·cursor를 무시하고 전량 반환하므로 이 모델에서 제공하지 않습니다. 그룹 필터 `CLOSED`와 각 주문의 status는 별개이며 `PARTIAL_FILLED`와 미지 status도 원문 그대로 보존합니다.
+[공식 주문 목록 계약](https://openapi.tossinvest.com/openapi-docs/latest/api-reference/Apis/OrderHistoryApi.md)과 [공식 OpenAPI의 PaginatedOrderResponse·Order 스키마](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)를 기준으로 `CLOSED` 한 페이지를 조회합니다. 공식 조회 범위는 Open API가 지원하는 지정가·시장가·장마감지정가 유형으로 접수된 주문입니다. 장후시간외 종가·장전시간외 종가 등 Open API로 주문할 수 없는 호가 유형은 목록과 상세 조회 모두에서 제외되므로 전체 계좌 주문 내역을 뜻하지 않습니다. [TossClosedOrdersRequest](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossClosedOrdersRequest.java)는 선택적 `symbol`·`from`·`to`·`cursor`·`limit`만 받고 `status()`는 항상 `CLOSED`입니다. limit은 생략 시 20, 허용 범위는 1~100입니다. `OPEN`은 서버가 limit·cursor를 무시하고 전량 반환하므로 이 모델에서 제공하지 않습니다. 그룹 필터 `CLOSED`와 각 주문의 status는 별개이며 `PARTIAL_FILLED`와 미지 status도 원문 그대로 보존합니다.
 
 symbol은 공식 패턴 `[A-Za-z0-9.\-]+`를 적용하고 대소문자를 보존합니다. from·to는 각각 독립적으로 생략 가능한 엄격한 `YYYY-MM-DD` 날짜이며, 둘 다 있으면 from≤to입니다. 양끝을 포함하는 `orderedAt`의 **KST 날짜** 필터이며 누락 경계·최대 기간을 로컬에서 만들지 않습니다. cursor는 불투명 문자열로 trim·디코딩·생성·Base64 제한 없이 `=`·`+`·`/`·`%`·정상 Unicode와 앞뒤 공백을 그대로 보존합니다. symbol·cursor의 256 UTF-16 코드 단위 상한, cursor의 빈 값·공백뿐인 값·제어문자·짝이 맞지 않는 surrogate 거부는 공식 보장과 구별되는 프로젝트 입력 정책입니다.
 
-흐름은 **검증된 요청 + 합성 성공 JSON → 기존 TossOrderMapper.mapClosedOrders → TossClosedOrdersSnapshot**입니다. `result` 객체에는 `orders` 배열, nullable `nextCursor`, boolean `hasNext` 키가 모두 필요합니다. hasNext=true이면 유효한 비어 있지 않은 cursor, false이면 null을 요구하며 항목 수에서 hasNext를 계산하지 않습니다. 빈 페이지와 짧은 다음 페이지도 허용합니다. 목록은 원문 순서의 불변 `TossOrderSnapshot` 목록이며 요청 limit 및 100건을 초과하면 자르지 않고 실패합니다. null 항목·같은 원문 orderId 중복·마지막 항목 손상도 전체 실패합니다. ID 대소문자는 정규화하지 않으며 중복 거부는 프로젝트 정확성 정책입니다.
+[TossOrderClient](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossOrderClient.java)의 `getClosedOrders(request)`는 고정된 `https://openapi.tossinvest.com/api/v1/orders`로 본문 없는 GET을 정확히 한 번 보냅니다. 검증된 기존 endpoint와 같은 origin의 고정 경로를 사용하며 목적지를 인자로 받지 않습니다. `status=CLOSED`와 정규화된 limit은 항상, symbol·from·to·cursor는 지정된 값만 각각 한 번 전송합니다. 값은 trim·디코딩 없이 UTF-8 퍼센트 인코딩하며 `%2F`는 `%252F`, `+`는 `%2B`, 공백은 `%20`으로 보냅니다. cursor의 `&`·`?`·`#`도 값으로 인코딩하여 파라미터·경로·fragment 변경을 막습니다. null 요청은 환경 조회·전송 전에 `BAD_REQUEST`입니다.
+
+아래 Java 사용 예시는 첫 한 페이지만 반환합니다. JVM 시작 옵션과 환경변수는 아래 '토스 HTTP 운영 설정과 제한'을 따릅니다. 인증정보를 예시 코드에 넣지 않습니다.
+
+```java
+try (var client = new TossOrderClient()) {
+    var request = new TossClosedOrdersRequest("AAPL", "2026-03-01", "2026-03-28", null, 20);
+    TossClosedOrdersSnapshot page = client.getClosedOrders(request);
+    // page.orders(), page.nextCursor(), page.hasNext(): 이 페이지의 주문과 서버 메타데이터
+}
+```
+
+흐름은 **검증된 요청 → 기존 인증·제한 전송 → TossOrderMapper.mapClosedOrders → TossClosedOrdersSnapshot**입니다. 인증정보를 호출마다 다시 읽고 Bearer·계좌·Accept 헤더, 전송 직전 설정 재검사, 상태별 오류 분류와 자원 종료를 단건 조회와 공유합니다. 성공 응답의 잘못된 UTF-8·JSON·페이지는 원문 없는 `INVALID_RESPONSE`이며 부분 결과가 없습니다. `result` 객체에는 `orders` 배열, nullable `nextCursor`, boolean `hasNext` 키가 모두 필요합니다. hasNext=true이면 유효한 비어 있지 않은 cursor, false이면 null을 요구하며 항목 수에서 hasNext를 계산하지 않습니다. 빈 페이지와 짧은 다음 페이지도 허용합니다. 목록은 원문 순서의 불변 `TossOrderSnapshot` 목록이며 요청 limit 및 100건을 초과하면 자르지 않고 실패합니다. null 항목·같은 원문 orderId 중복·마지막 항목 손상도 전체 실패합니다. ID 대소문자는 정규화하지 않으며 중복 거부는 프로젝트 정확성 정책입니다.
 
 단건과 목록은 동일한 주문 객체 변환을 사용하며 단건의 요청 ID 일치 검사를 유지합니다. 아래 파싱 자원 제한은 목록에도 적용하고 `result.orders` 항목 수까지 트리 생성 전에 제한합니다. 요청·페이지 모델 오류는 각각 `Invalid Toss closed orders request`·`Invalid Toss closed orders summary`이며 매퍼 오류는 기존 `Invalid Toss order response`입니다. 원문·파서 진단·cause·suppressed 예외·수집 로그를 남기지 않습니다.
 
-이 단계는 합성 fixture로 검사하는 요청·페이지 모델과 매퍼 확장입니다. 목록용 HTTP 호출·환경 조회·Spring 빈·MCP 도구는 추가하지 않으며 등록 도구는 기존 여덟 개입니다. 전체 수집·자동 페이지 순회·기간 분할·결제 거래내역·개별 체결·완결 Trade·손익 생성은 후속 범위입니다. commission·tax·통화를 합산·배분·환산하거나 가상 체결 ID를 만들지 않습니다. 실제 주문·취소·자금 이동 기능은 없습니다. 실계정 주문 목록·권한·누락 여부 대조는 미검증입니다.
+목록 HTTP 메서드는 MCP에 연결하지 않았으며 등록 도구는 기존 여덟 개입니다. 자동 페이지 순회·기간 분할·주문별 상세 추가 조회를 하지 않으므로 한 페이지의 결과는 전체 수집을 보장하지 않습니다. 결제 거래내역·개별 체결·완결 Trade·손익을 생성하지 않으며 commission·tax·통화를 합산·배분·환산하거나 가상 체결 ID를 만들지 않습니다. 실제 주문·취소·자금 이동 기능은 없습니다. 실계정 주문 목록·권한·누락 여부 대조는 미검증입니다.
 
-`TossClosedOrdersRequestTest`·`TossClosedOrdersSnapshotTest`·`TossOrderMapperTest`에는 입력·페이지 메타데이터·항목 수·중복·불변성, 국내 완료·해외 부분 체결·무체결 거부·체결이 남은 취소·대체 주문, 마지막 항목 실패와 파싱 경계의 합성 검사가 있습니다. 재현은 Java 21과 준비된 의존성 캐시에서 위 오프라인 전체 `test` 명령을 사용합니다. 두 `JAVA_TOOL_OPTIONS` 시작 옵션을 유지하고 실행 환경의 자원 제한을 적용해야 합니다. 실행별 검증 결과는 프로젝트 문서와 별도로 관리합니다.
+`TossClosedOrdersRequestTest`·`TossClosedOrdersSnapshotTest`·`TossOrderMapperTest`에는 입력·페이지 메타데이터·항목 수·중복·불변성, 국내 완료·해외 부분 체결·무체결 거부·체결이 남은 취소·대체 주문, 마지막 항목 실패와 파싱 경계의 합성 검사가 있습니다. `TossOrderClientTest`는 가상 인증정보와 로컬 서버로 raw query·단일 전송·매퍼 연결을 검사하며 목록 경로에도 기존 상태 오류·본문 제한·타임아웃·취소·독립 JVM 안전 설정 검사를 적용합니다. 재현은 Java 21과 준비된 Gradle·의존성 캐시 및 실행 환경의 자원 제한에서 다음 명령을 사용합니다. Gradle 배포본의 설치 경로가 다르면 같은 옵션을 유지해 해당 실행 파일을 사용합니다. 실행별 검증 결과는 프로젝트 문서와 별도로 관리합니다.
+
+```bash
+JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1' \
+  /opt/gradle/bin/gradle --offline --no-daemon --max-workers=1 --no-watch-fs --no-build-cache --console=plain test
+```
 
 ### 파싱 제한과 합성 검증 범위
 
