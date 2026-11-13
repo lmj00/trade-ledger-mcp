@@ -6,11 +6,16 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +37,7 @@ import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
+import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
@@ -49,8 +55,14 @@ import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ComponentScan;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestContext;
@@ -70,6 +82,7 @@ class UpbitOrderToolsTest {
 	private static final String ACCESS = "fake-mcp-access-key";
 	private static final String SECRET = "fake-mcp-secret-key";
 	private static final String MARKER = "private-mcp-response-marker";
+	private static final String HTTP_LOG = "jdk.httpclient.HttpClient.log";
 	private static final Map<String, String> KEYS = Map.of(
 			"UPBIT_ACCESS_KEY", ACCESS, "UPBIT_SECRET_KEY", SECRET);
 	private static final String ORDER = """
@@ -100,8 +113,13 @@ class UpbitOrderToolsTest {
 		server.status.set(200);
 		server.body.set(ORDER);
 		server.requests.set(0);
+		server.credentialReads.set(0);
 		server.tokens.clear();
 		server.paths.clear();
+		startCapturingLogs();
+	}
+
+	private void startCapturingLogs() {
 		logs.start();
 		((Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME)).addAppender(logs);
 		for (String name : List.of("io.github.lmj.tradeledger", "org.springframework.ai.mcp",
@@ -416,13 +434,177 @@ class UpbitOrderToolsTest {
 	}
 
 	private CallToolResult call(String name, Map<String, Object> arguments) {
-		Object specs = context.getBean("toolSpecs");
+		return call(context, name, arguments);
+	}
+
+	private static CallToolResult call(ApplicationContext application, String name, Map<String, Object> arguments) {
+		Object specs = application.getBean("toolSpecs");
 		assertThat(specs).isInstanceOf(List.class);
 		SyncToolSpecification tool = ((List<?>) specs).stream()
 				.filter(SyncToolSpecification.class::isInstance).map(SyncToolSpecification.class::cast)
 				.filter(specification -> specification.tool().name().equals(name))
 				.findFirst().orElseThrow();
 		return tool.callHandler().apply(null, CallToolRequest.builder(name).arguments(arguments).build());
+	}
+
+	@Test
+	void independentJvmsKeepBothRegisteredHandlersSafeAndCalculationToolsLazy() throws Exception {
+		List<String> valid = List.of("-Djdk.httpclient.disableRetryConnect=true",
+				"-Djdk.httpclient.redirects.retrylimit=1");
+		assertThat(runLoggingProbe(List.of(), "missing")).isEqualTo("PROBE_OK\n");
+		List<String> logging = new ArrayList<>(valid);
+		logging.add("-D" + HTTP_LOG + "=requests,headers,content,errors");
+		assertThat(runLoggingProbe(logging, "logging")).isEqualTo("PROBE_OK\n");
+		assertThat(runLoggingProbe(logging, "clearedLogging")).isEqualTo("PROBE_OK\n");
+		logging.add("-D" + HTTP_LOG + "=");
+		assertThat(runLoggingProbe(logging, "logging")).isEqualTo("PROBE_OK\n");
+		assertThat(runLoggingProbe(valid, "lateLogging")).isEqualTo("PROBE_OK\n");
+	}
+
+	private static String runLoggingProbe(List<String> options, String mode) throws Exception {
+		String classpath = System.getProperty("upbit.test.runtimeClasspath");
+		assertThat(classpath).isNotBlank();
+		List<String> command = new ArrayList<>(List.of(
+				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+				"-Xms16m", "-Xmx96m", "-Xss256k", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"));
+		command.addAll(options);
+		command.addAll(List.of("-cp", classpath, LoggingProbe.class.getName(), mode));
+		ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+		for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
+				"UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY", "BINANCE_API_KEY", "BINANCE_SECRET_KEY")) {
+			builder.environment().remove(variable);
+		}
+		Process process = builder.start();
+		try (var input = process.getInputStream()) {
+			process.getOutputStream().close();
+			ByteArrayOutputStream output = new ByteArrayOutputStream();
+			byte[] buffer = new byte[1024];
+			long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+			boolean exited = false;
+			while (true) {
+				int available;
+				while ((available = input.available()) > 0) {
+					int count = input.read(buffer, 0, Math.min(available, buffer.length));
+					if (count < 0) { break; }
+					output.write(buffer, 0, count);
+					assertThat(output.size()).as("Child JVM output bytes").isLessThanOrEqualTo(8192);
+				}
+				if (exited) { break; }
+				assertThat(System.nanoTime() < deadline).as("Child JVM must finish within 20 seconds").isTrue();
+				exited = process.waitFor(25, TimeUnit.MILLISECONDS);
+			}
+			String observed = output.toString(StandardCharsets.UTF_8);
+			assertThat(observed).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ");
+			assertThat(process.exitValue()).as("Child JVM exit status; bounded output: %s", observed).isZero();
+			return observed;
+		}
+		finally {
+			if (process.isAlive()) {
+				process.destroyForcibly();
+				assertThat(process.waitFor(5, TimeUnit.SECONDS)).as("Child JVM cleanup").isTrue();
+			}
+		}
+	}
+
+	/** Isolated JVM, fake credentials and loopback only, including registered MCP handlers. */
+	public static final class LoggingProbe {
+		public static void main(String[] args) {
+			UpbitOrderToolsTest fixture = new UpbitOrderToolsTest();
+			AtomicReference<CallToolResult> lastResult = new AtomicReference<>();
+			try {
+				// Capture application logs in memory; stdout/stderr (including JDK logs)
+				// remain captured by the parent process with its separate 8192-byte bound.
+				((Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME)).detachAndStopAllAppenders();
+				fixture.startCapturingLogs();
+				new ApplicationContextRunner()
+						.withUserConfiguration(ProbeConfiguration.class, ProbeLocalConfiguration.class)
+						.withPropertyValues("trade-ledger.journal.root=src/test/resources/journals",
+								"spring.ai.mcp.server.type=SYNC", "spring.ai.mcp.server.stdio=true",
+								"logging.console.enabled=false", "spring.main.banner-mode=off")
+						.run(application -> {
+							assertThat(application).hasNotFailed();
+							assertThat(application).doesNotHaveBean("localBinanceClient");
+							fixture.context = application;
+							fixture.server = application.getBean(LocalUpbit.class);
+							LocalUpbit local = fixture.server;
+							if (args[0].equals("missing")) { local.keys.set(Map.of()); }
+							assertClientsAreLazy(application);
+							CallToolResult summary = fixture.call("summarize_journal", Map.of("journalName", "sample-trades"));
+							assertThat(summary.isError()).isNotEqualTo(Boolean.TRUE);
+							assertThat(asMap(summary.structuredContent())).containsEntry("totalNetPnl", "355.78645");
+							Map<String, Object> trade = Map.ofEntries(
+									Map.entry("tradeId", "probe-trade"), Map.entry("symbol", "BTC-USDT"),
+									Map.entry("market", "CRYPTO"), Map.entry("direction", "LONG"),
+									Map.entry("quantity", "1"), Map.entry("entryPrice", "100"),
+									Map.entry("exitPrice", "110"), Map.entry("fees", "1"),
+									Map.entry("currency", "USDT"), Map.entry("openedAt", "2026-07-01T00:00:00Z"),
+									Map.entry("closedAt", "2026-07-01T01:00:00Z"), Map.entry("strategy", "probe"));
+							CallToolResult analysis = fixture.call("analyze_trades", Map.of("trades", List.of(trade)));
+							assertThat(analysis.isError()).isNotEqualTo(Boolean.TRUE);
+							assertThat(asMap(analysis.structuredContent())).containsEntry("totalNetPnl", "9");
+							assertClientsAreLazy(application);
+							if (args[0].equals("clearedLogging")) { System.clearProperty(HTTP_LOG); }
+							if (args[0].equals("lateLogging")) {
+								application.getBean("localUpbitClient", UpbitOrderClient.class);
+								assertThat(local.clientCreations).hasValue(1);
+								assertThat(local.credentialReads).hasValue(0);
+								System.setProperty(HTTP_LOG, "requests,headers,content,errors");
+							}
+							int creations = local.clientCreations.get();
+							fixture.assertSafeError(fixture.call(MARKER + ACCESS + SECRET), "INVALID_UUID");
+							for (Map<String, Object> invalid : invalidClosedRequests().toList()) {
+								fixture.assertSafeError(fixture.callClosed(invalid), "BAD_REQUEST");
+							}
+							assertThat(local.clientCreations).hasValue(creations);
+							local.body.set(MARKER); // An accidental send would echo fake keys and the JWT too.
+							for (CallToolResult result : List.of(fixture.call(ID), fixture.callClosed(Map.of()))) {
+								fixture.assertSafeError(result, "UNSAFE_TRANSPORT_CONFIGURATION");
+								assertThat(result.content().toString()).doesNotContain("Exception", "Caused by:", "\tat ");
+								lastResult.set(result);
+							}
+							assertThat(local.credentialReads).hasValue(0);
+							assertThat(local.requests).hasValue(0);
+							assertThat(local.tokens).isEmpty();
+							// Check the real lazy-construction/current-setting failures for cause/stack leaks too.
+							UpbitOrderTools tools = application.getBean(UpbitOrderTools.class);
+							assertSafeFailure(() -> tools.getUpbitOrder(ID));
+							assertSafeFailure(() -> tools.getUpbitClosedOrders(null, null, null, null, null, null, null));
+							assertThat(local.credentialReads).hasValue(0);
+							assertThat(local.requests).hasValue(0);
+						});
+				assertThat(fixture.server.closed).isTrue();
+				if (fixture.server.transport != null) {
+					assertThat(fixture.server.transport.isTerminated()).isTrue();
+				}
+				// Include logs emitted during context shutdown in the leak assertions.
+				fixture.assertNoSecrets(lastResult.get());
+				System.out.println("PROBE_OK");
+			}
+			catch (Throwable failure) {
+				System.err.println("PROBE_FAILED:" + failure.getClass().getSimpleName());
+				System.exit(1);
+			}
+			finally {
+				fixture.stopCapturingLogs();
+			}
+		}
+
+		private static void assertClientsAreLazy(ConfigurableApplicationContext application) {
+			for (String name : List.of("upbitOrderClient", "binanceAccountTradesClient", "localUpbitClient")) {
+				assertThat(application.getBeanFactory().containsSingleton(name)).isFalse();
+			}
+		}
+
+		private static void assertSafeFailure(Runnable action) {
+			assertThatThrownBy(action::run).isInstanceOf(IllegalStateException.class)
+					.hasMessage("Upbit request failed: UNSAFE_TRANSPORT_CONFIGURATION").hasNoCause()
+					.satisfies(failure -> {
+						assertThat(failure.getSuppressed()).isEmpty();
+						StringWriter trace = new StringWriter();
+						failure.printStackTrace(new PrintWriter(trace));
+						assertThat(trace.toString()).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ");
+					});
+		}
 	}
 
 	private void assertSafeError(CallToolResult result, String category) {
@@ -443,7 +625,7 @@ class UpbitOrderToolsTest {
 			}
 		}
 		for (String observation : observations) {
-			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ");
+			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ");
 			for (String token : server.tokens) {
 				assertThat(observation).doesNotContain(token, token.substring(7));
 			}
@@ -486,6 +668,27 @@ class UpbitOrderToolsTest {
 		}
 	}
 
+	// Restrict the runner's scan to production configuration; test fixtures must be explicit.
+	@TestConfiguration(proxyBeanMethods = false)
+	@EnableAutoConfiguration
+	@ComponentScan(basePackageClasses = TradeJournalProperties.class)
+	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class})
+	static class ProbeConfiguration {
+	}
+
+	@TestConfiguration(proxyBeanMethods = false)
+	static class ProbeLocalConfiguration extends LocalConfiguration {
+		// Only the isolated startup probe needs lazy creation; keep the existing
+		// SpringBootTest fixture's eager transport and after-context assertions.
+		@Override
+		@Bean
+		@Primary
+		@Lazy
+		UpbitOrderClient localUpbitClient(LocalUpbit server) throws ReflectiveOperationException {
+			return super.localUpbitClient(server);
+		}
+	}
+
 	@TestConfiguration(proxyBeanMethods = false)
 	static class LocalConfiguration {
 		@Bean(destroyMethod = "close")
@@ -500,8 +703,11 @@ class UpbitOrderToolsTest {
 			// a configurable endpoint or credential argument to the production API.
 			var constructor = UpbitOrderClient.class.getDeclaredConstructor(URI.class, Supplier.class);
 			constructor.setAccessible(true);
-			UpbitOrderClient client = constructor.newInstance(server.uri(),
-					(Supplier<Map<String, String>>) server.keys::get);
+			server.clientCreations.incrementAndGet();
+			UpbitOrderClient client = constructor.newInstance(server.uri(), (Supplier<Map<String, String>>) () -> {
+				server.credentialReads.incrementAndGet();
+				return server.keys.get();
+			});
 			// Retain the owned transport for the existing after-context termination assertion.
 			var transport = UpbitOrderClient.class.getDeclaredField("http");
 			transport.setAccessible(true);
@@ -515,11 +721,14 @@ class UpbitOrderToolsTest {
 		final AtomicInteger status = new AtomicInteger(200);
 		final AtomicReference<String> body = new AtomicReference<>(ORDER);
 		final AtomicInteger requests = new AtomicInteger();
+		final AtomicInteger credentialReads = new AtomicInteger();
+		final AtomicInteger clientCreations = new AtomicInteger();
 		final List<String> tokens = new CopyOnWriteArrayList<>();
 		final List<String> paths = new CopyOnWriteArrayList<>();
 		final CountDownLatch releaseBody = new CountDownLatch(1);
 		private final HttpServer http;
 		private HttpClient transport;
+		private boolean closed;
 
 		LocalUpbit() throws IOException {
 			http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -572,6 +781,7 @@ class UpbitOrderToolsTest {
 			}
 			finally {
 				http.stop(0);
+				closed = true;
 			}
 		}
 	}

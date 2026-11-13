@@ -47,6 +47,7 @@ class UpbitOrderClientTest {
 	private static final String BODY_MARKER = "private-response-marker";
 	private static final String DISABLE_RETRY = "jdk.httpclient.disableRetryConnect";
 	private static final String RETRY_LIMIT = "jdk.httpclient.redirects.retrylimit";
+	private static final String HTTP_LOG = "jdk.httpclient.HttpClient.log";
 	private static final Map<String, String> KEYS = Map.of("UPBIT_ACCESS_KEY", UpbitJwtSignerTest.ACCESS,
 			"UPBIT_SECRET_KEY", UpbitJwtSignerTest.SECRET);
 	private static final String ORDER = """
@@ -98,18 +99,57 @@ class UpbitOrderClientTest {
 	}
 
 	private static List<String> runStartupProbe(URI endpoint, boolean startupOptions) throws Exception {
+		return runStartupProbe(endpoint, startupOptions
+				? List.of("-D" + DISABLE_RETRY + "=true", "-D" + RETRY_LIMIT + "=1") : List.of(),
+				startupOptions ? "startup" : "missing");
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void rejectsDiagnosticLoggingAcrossIndependentJvmsBeforeCredentialsAndHttp(boolean closed) throws Exception {
+		AtomicInteger requests = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			reply(exchange, 200, successBody(closed).replace("\"uuid\":",
+					"\"private\":\"" + BODY_MARKER + "\",\"uuid\":"));
+		})) {
+			List<String> valid = List.of("-D" + DISABLE_RETRY + "=true", "-D" + RETRY_LIMIT + "=1");
+			List<String> logging = new ArrayList<>(valid);
+			logging.add("-D" + HTTP_LOG + "=requests,headers,content,errors");
+			for (String mode : List.of("logging", "clearedLogging")) {
+				assertThat(runStartupProbe(server.uri(closed), logging, mode))
+						.containsExactly("LOGGING:UNSAFE_TRANSPORT_CONFIGURATION");
+				assertThat(requests).hasValue(0);
+			}
+			logging.add("-D" + HTTP_LOG + "=");
+			assertThat(runStartupProbe(server.uri(closed), logging, "logging"))
+					.containsExactly("LOGGING:UNSAFE_TRANSPORT_CONFIGURATION");
+			assertThat(requests).hasValue(0);
+			assertThat(runStartupProbe(server.uri(closed), valid, "lateLogging"))
+					.containsExactly("LOGGING:UNSAFE_TRANSPORT_CONFIGURATION");
+			assertThat(requests).hasValue(0);
+			// A deterministic change in the fake supplier exercises the final send guard.
+			assertThat(runStartupProbe(server.uri(closed), valid, "signingLogging"))
+					.containsExactly("LOGGING:UNSAFE_TRANSPORT_CONFIGURATION");
+			assertThat(requests).hasValue(0);
+			List<String> empty = new ArrayList<>(valid);
+			empty.add("-D" + HTTP_LOG + "=");
+			assertThat(runStartupProbe(server.uri(closed), empty, "startup"))
+					.containsExactly("STARTUP:" + (closed ? "CLOSED:" : "ORDER:") + ID);
+			assertThat(requests).hasValue(1);
+		}
+	}
+
+	private static List<String> runStartupProbe(URI endpoint, List<String> options, String mode) throws Exception {
 		String classpath = System.getProperty("upbit.test.runtimeClasspath");
 		assertThat(classpath).as("Gradle test runtime classpath for the child JVM").isNotBlank();
 		// Avoid compiler and parallel GC threads in the extra JVM on constrained test hosts.
 		List<String> command = new ArrayList<>(List.of(
 				Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-Xms16m", "-Xmx96m", "-Xss256k", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1", "-Xint"));
-		if (startupOptions) {
-			command.add("-D" + DISABLE_RETRY + "=true");
-			command.add("-D" + RETRY_LIMIT + "=1");
-		}
+		command.addAll(options);
 		command.addAll(List.of("-cp", classpath, StartupOptionsProbe.class.getName(),
-				endpoint.toString(), startupOptions ? "startup" : "missing"));
+				endpoint.toString(), mode));
 		ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
 		for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) {
 			builder.environment().remove(variable);
@@ -141,6 +181,8 @@ class UpbitOrderClientTest {
 				exited = process.waitFor(25, TimeUnit.MILLISECONDS);
 			}
 			String result = output.toString(StandardCharsets.UTF_8);
+			assertThat(result).doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET,
+					BODY_MARKER, "Bearer ", "eyJ");
 			assertThat(process.exitValue()).as("Child JVM exit status; bounded output: %s", result).isZero();
 			return result.lines().toList();
 		}
@@ -158,15 +200,56 @@ class UpbitOrderClientTest {
 			try {
 				URI endpoint = URI.create(arguments[0]);
 				if ("startup".equals(arguments[1])) {
-					try (UpbitOrderClient client = new UpbitOrderClient(endpoint, () -> KEYS)) {
+					AtomicInteger credentials = new AtomicInteger();
+					try (UpbitOrderClient client = new UpbitOrderClient(endpoint, () -> {
+						credentials.incrementAndGet();
+						return KEYS;
+					})) {
 						boolean closed = endpoint.getPath().equals("/v1/orders/closed");
 						String orderId = closed ? client.getClosedOrders(new UpbitClosedOrdersRequest())
 								.orders().getFirst().orderId() : client.getOrder(ID).orderId();
 						if (!ID.equals(orderId)) {
 							throw new AssertionError("Unexpected fake order");
 						}
+						assertThat(credentials).hasValue(1);
 						System.out.println("STARTUP:" + (closed ? "CLOSED:" : "ORDER:") + orderId);
 					}
+				}
+				else if (List.of("logging", "clearedLogging", "lateLogging", "signingLogging")
+						.contains(arguments[1])) {
+					String mode = arguments[1];
+					AtomicInteger credentials = new AtomicInteger();
+					Supplier<Map<String, String>> keys = () -> {
+						credentials.incrementAndGet();
+						if (mode.equals("signingLogging")) {
+							System.setProperty(HTTP_LOG, "requests,headers,content,errors");
+						}
+						return KEYS;
+					};
+					if (mode.equals("lateLogging") || mode.equals("signingLogging")) {
+						try (UpbitOrderClient client = new UpbitOrderClient(endpoint, keys)) {
+							if (mode.equals("lateLogging")) {
+								System.setProperty(HTTP_LOG, "requests,headers,content,errors");
+							}
+							// Invalid inputs retain precedence over transport configuration.
+							expect(UpbitErrorCode.INVALID_UUID, () -> client.getOrder(BODY_MARKER));
+							expect(UpbitErrorCode.BAD_REQUEST, () -> client.getClosedOrders(null));
+							expect(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION,
+									() -> get(client, endpoint.getPath().equals("/v1/orders/closed")));
+						}
+					}
+					else {
+						if (mode.equals("clearedLogging")) {
+							System.clearProperty(HTTP_LOG);
+						}
+						expect(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION, () -> {
+							try (UpbitOrderClient ignored = new UpbitOrderClient(endpoint, keys)) {
+								throw new AssertionError("Unsafe construction was accepted");
+							}
+						});
+					}
+					assertThat(credentials).hasValue(mode.equals("signingLogging") ? 1 : 0);
+					System.out.println("LOGGING:UNSAFE_TRANSPORT_CONFIGURATION");
 				}
 				else if ("missing".equals(arguments[1])) {
 					if (System.getProperty(DISABLE_RETRY) != null || System.getProperty(RETRY_LIMIT) != null) {

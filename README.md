@@ -47,13 +47,13 @@ TRADE_LEDGER_JOURNAL_ROOT=/absolute/path/to/journals java \
 
 조회 프로세스는 시작부터 `-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1`을 지정해야 합니다. JDK HTTP 클라이언트의 암묵적 재전송까지 차단하기 위한 기존 보호 장치이며 시작 후 속성을 바꾸는 것으로 대체할 수 없습니다. 옵션이 없으면 조회는 `UNSAFE_TRANSPORT_CONFIGURATION`으로 실패하고 계산 도구는 계속 사용할 수 있습니다. 옵션이 올바르고 키가 없으면 `MISSING_CREDENTIALS`로 실패합니다. **자동 재시도와 리다이렉트 추적은 없습니다.** 테스트의 로컬 HTTP 클라이언트에도 같은 시작 옵션이 필요하므로 위 테스트 명령은 이를 테스트 JVM에도 전달합니다. `build`도 테스트를 실행하므로 같은 `JAVA_TOOL_OPTIONS`를 적용합니다.
 
-**HTTP 진단 로깅을 활성화하지 마십시오.** `jdk.httpclient.HttpClient.log`의 요청·헤더·본문 로깅은 API 키·서명·응답 원문을 노출할 수 있습니다. 바이낸스 클라이언트는 이 속성의 비어 있지 않은 현재 설정 또는 JVM 시작 인자를 `UNSAFE_TRANSPORT_CONFIGURATION`으로 거부합니다. 시작 후 지우거나 빈 설정을 덧붙여도 비어 있지 않았던 시작 설정을 허용하지 않습니다. 애플리케이션 콘솔 로깅을 끄는 것만으로 JDK HTTP 진단 로깅을 차단할 수는 없습니다.
+**HTTP 진단 로깅을 활성화하지 마십시오.** `jdk.httpclient.HttpClient.log`의 요청·헤더·본문 로깅은 API 키·JWT·서명·응답 원문을 노출할 수 있습니다. 바이낸스와 업비트 클라이언트는 이 속성의 비어 있지 않은 현재 설정 또는 JVM 시작 인자를 원인 예외 없이 `UNSAFE_TRANSPORT_CONFIGURATION`으로 거부합니다. 업비트는 단건 주문(`get_upbit_order`)과 종료 주문(`get_upbit_closed_orders`) 모두 HTTP 클라이언트 생성 전, 유효 조회의 인증정보 조회·서명 전, 실제 전송 직전에 검사합니다. 시작 후 지우거나 뒤에 빈 설정을 덧붙여도 비어 있지 않았던 시작 설정을 허용하지 않습니다. 미설정 또는 빈 값만 허용하며 **프로세스 실행 중 진단 로깅 설정을 변경하지 않는 운영 조건**이 필요합니다. 검사 사이의 임의 동시 속성 변경까지 방지하지는 않습니다. 애플리케이션 콘솔 로깅을 끄는 것만으로 JDK HTTP 진단 로깅을 차단할 수는 없습니다. [Java 21 공식 문서](https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/module-summary.html)는 진단 로깅 대상과 실행 중 `System.setProperty()` 적용이 보장되지 않음을 설명합니다.
 
 이전 후보의 실제 서버 검증 기록: Java **21.0.11**, Gradle **9.5.1**에서 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'`을 적용해 `/opt/gradle/bin/gradle --offline --no-daemon --max-workers=1 --no-watch-fs --no-build-cache --console=plain --init-script /opt/hub-test/limits.gradle --info test`를 실행했습니다. 서버가 지정한 `GRADLE_USER_HOME`, 읽기 전용 의존성 캐시, `JAVA_OPTS`와 `-Dorg.gradle.jvmargs`의 JVM 접근·메모리·CPU 제한도 적용된 결과입니다. **467개 테스트 중 3개 실패, 종료 코드 1, OOM 없음**으로 기록되었으며 통과하지 못했습니다. 제공된 실패 스택에서는 독립 JVM의 `ApplicationContextRunner`가 다른 테스트의 `UpbitOrderToolsTest.LocalConfiguration`을 스캔해 업비트 로컬 클라이언트를 즉시 생성했고, `UNSAFE_TRANSPORT_CONFIGURATION`으로 컨텍스트 시작이 실패했습니다. 나머지 두 실패의 상세 원인은 잘린 서버 출력으로 확인할 수 없습니다.
 
 수정 반영 기록: 직접 생성하는 테스트 컨텍스트의 스캔을 운영 구성 패키지로 제한하고 도구를 명시적으로 등록해 테스트용 로컬 구성이 유입되지 않도록 했습니다. 오류 주입 컨텍스트와 저널 오류 검증 컨텍스트에도 같은 격리를 적용하고 다른 로컬 클라이언트 Bean이 없다는 단언을 추가했습니다. 기존 단일 전송·독립 JVM·`@DirtiesContext`·자원 종료 단언은 유지합니다.
 
-신규 검증 상태: **수정 후보의 테스트는 이 개발 단계에서 실행하지 않았으며 서버 재검증과 독립 검토 대기입니다.** 위 실패 기록은 수정 전 후보의 결과입니다. 같은 Java 21 도구 체인, 필수 `JAVA_TOOL_OPTIONS`와 서버의 오프라인·자원 제한을 유지한 전체 테스트 결과를 별도로 받아야 합니다. 실행 불가나 미실행, 과거 후보의 성공 기록은 수정 후보의 통과 근거가 아닙니다.
+신규 검증 상태: **업비트 진단 로깅 차단 후보의 테스트는 이 개발 단계에서 실행하지 않았으며 서버 검증과 독립 검토 대기입니다.** 개발 환경에서 `java -version`은 `java: command not found`(종료 코드 127)로 실행 불가였으며, 위 실패 기록은 이번 후보의 결과가 아닙니다. 독립 JVM 회귀 검사에는 두 조회의 시작 로깅 설정·설정 삭제·빈 값 덮어쓰기·생성 후 활성화 거부, 인증정보 조회와 전송 0회, 빈 로깅 설정의 합성 응답 성공 및 등록 MCP 핸들러의 안전한 오류를 추가했습니다. 같은 Java 21 도구 체인, 필수 `JAVA_TOOL_OPTIONS`와 서버의 오프라인·자원 제한을 유지한 `/opt/gradle/bin/gradle test` 전체 실행 결과를 별도로 받아야 합니다. 실행 불가나 미실행, 과거 후보의 성공 기록은 수정 후보의 통과 근거가 아니며 실계정도 검증하지 않았습니다.
 
 ## CSV 저널 계약
 

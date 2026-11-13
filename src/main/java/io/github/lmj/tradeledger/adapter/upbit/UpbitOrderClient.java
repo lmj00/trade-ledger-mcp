@@ -38,6 +38,11 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code -Djdk.httpclient.redirects.retrylimit=1}; otherwise construction fails closed.
  * Setting properties here would be unsafe because JDK HTTP classes cache them and
  * another client may already have initialized those classes.
+ * {@code jdk.httpclient.HttpClient.log} must remain unset or empty for the process
+ * lifetime. Nonempty current or startup settings are rejected before transport
+ * creation, credential lookup/signing and sending; clearing a startup setting
+ * cannot prove that the JDK never cached it. Do not change logging at runtime:
+ * these checks do not prevent arbitrary concurrent property changes between checks.
  */
 public final class UpbitOrderClient implements AutoCloseable {
 
@@ -47,6 +52,7 @@ public final class UpbitOrderClient implements AutoCloseable {
 	static final int MAX_RESPONSE_BYTES = 1024 * 1024;
 	private static final URI ENDPOINT = URI.create("https://api.upbit.com/v1/order");
 	private static final URI CLOSED_ENDPOINT = URI.create("https://api.upbit.com/v1/orders/closed");
+	private static final String HTTP_LOG_PROPERTY = "jdk.httpclient.HttpClient.log";
 	private static final Pattern UUID = Pattern.compile(
 			"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 	private static final JsonMapper JSON = JsonMapper.builder().build();
@@ -81,6 +87,7 @@ public final class UpbitOrderClient implements AutoCloseable {
 		this.endpoint = endpoint.resolve(ENDPOINT.getRawPath());
 		this.closedEndpoint = endpoint.resolve(CLOSED_ENDPOINT.getRawPath());
 		this.environment = environment;
+		requireNoDiagnosticLogging();
 		try {
 			requireNoRetryConfiguration(ManagementFactory.getRuntimeMXBean().getInputArguments(),
 					System.getProperty("jdk.httpclient.disableRetryConnect"),
@@ -98,6 +105,21 @@ public final class UpbitOrderClient implements AutoCloseable {
 	@Override
 	public void close() {
 		http.close();
+	}
+
+	private static void requireNoDiagnosticLogging() {
+		try {
+			String option = "-D" + HTTP_LOG_PROPERTY + "=";
+			if (!System.getProperty(HTTP_LOG_PROPERTY, "").isEmpty()
+					|| ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+							.anyMatch(argument -> argument.startsWith(option) && argument.length() > option.length())) {
+				throw new UpbitApiException(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION);
+			}
+		}
+		catch (RuntimeException exception) {
+			// Never retain a cause or a possibly sensitive property value.
+			throw new UpbitApiException(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION);
+		}
 	}
 
 	// Startup values matter: checking only mutable system properties cannot establish
@@ -168,6 +190,7 @@ public final class UpbitOrderClient implements AutoCloseable {
 	}
 
 	private String get(URI destination, List<Map.Entry<String, String>> parameters) {
+		requireNoDiagnosticLogging();
 		// Both strings use the same ordered entries; repeated array keys must survive.
 		String unencoded = parameters.stream().map(entry -> entry.getKey() + "=" + entry.getValue())
 				.collect(Collectors.joining("&"));
@@ -203,6 +226,7 @@ public final class UpbitOrderClient implements AutoCloseable {
 		BoundedBodySubscriber body = new BoundedBodySubscriber();
 		CompletableFuture<HttpResponse<byte[]>> response = null;
 		try {
+			requireNoDiagnosticLogging();
 			long started = System.nanoTime();
 			response = http.sendAsync(request, info -> body);
 			// Unlike an InputStream body handler, this future completes only after the full body.
