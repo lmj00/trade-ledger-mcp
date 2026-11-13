@@ -116,6 +116,7 @@ class UpbitOrderToolsTest {
 		server.keys.set(KEYS);
 		server.status.set(200);
 		server.body.set(ORDER);
+		server.ignoredBytes.set(null);
 		server.requests.set(0);
 		server.credentialReads.set(0);
 		server.tokens.clear();
@@ -398,6 +399,135 @@ class UpbitOrderToolsTest {
 		server.keys.set(Map.of());
 		assertSafeError(callExecutions("main", ID), "MISSING_CREDENTIALS");
 		assertThat(server.requests).hasValue(0);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void registeredHandlersRejectMalformedUtf8InIgnoredFieldsWithoutPartialResults(String name) {
+		server.body.set(utf8SuccessBody(name));
+		// The same fields and secrets must pass when only the injected bytes are valid.
+		server.ignoredBytes.set("valid".getBytes(StandardCharsets.UTF_8));
+		CallToolResult control = callValidTool(name);
+		assertThat(control.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> snapshot = asMap(control.structuredContent());
+		assertThat(snapshot).containsEntry("serviceId", "upbit");
+		if (name.equals("get_upbit_closed_orders")) {
+			assertThat((List<?>) snapshot.get("orders")).hasSize(2);
+		}
+		else {
+			assertThat(snapshot).containsEntry("orderId", ID);
+		}
+		assertMatchingSuccessContent(control);
+		assertNoSecrets(control);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.credentialReads).hasValue(1);
+		int calls = 1;
+		for (byte[] bytes : malformedUtf8()) {
+			server.ignoredBytes.set(bytes);
+			CallToolResult result = callValidTool(name);
+			assertSafeError(result, "INVALID_RESPONSE");
+			assertThat(result.toString()).doesNotContain(ID, "123e4567-e89b-12d3-a456-426614174001",
+					"fill-1", "fill-2", "0.12345678901234567800");
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths).hasSize(calls).allSatisfy(path -> assertThat(path).isEqualTo(
+					name.equals("get_upbit_closed_orders")
+							? "GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=100&order_by=desc"
+							: "GET /v1/order?uuid=" + ID));
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void registeredHandlersAcceptValidNonAsciiAndEncodedReplacementCharacter(String name) {
+		server.body.set(utf8SuccessBody(name));
+		int calls = 0;
+		for (String text : List.of("한글 \uD83D\uDE00", "\uFFFD")) {
+			server.ignoredBytes.set(text.getBytes(StandardCharsets.UTF_8));
+			CallToolResult result = callValidTool(name);
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			Map<String, Object> snapshot = asMap(result.structuredContent());
+			assertThat(snapshot).containsEntry("serviceId", "upbit");
+			if (name.equals("get_upbit_closed_orders")) {
+				assertThat((List<?>) snapshot.get("orders")).hasSize(2);
+			}
+			else {
+				assertThat(snapshot).containsEntry("orderId", ID);
+			}
+			assertMatchingSuccessContent(result);
+			assertNoSecrets(result);
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"400,BAD_REQUEST", "401,AUTHENTICATION_FAILED", "403,PERMISSION_DENIED",
+			"404,ORDER_NOT_FOUND", "418,IP_BLOCKED", "429,RATE_LIMITED", "302,REDIRECT_REJECTED",
+			"307,REDIRECT_REJECTED", "500,SERVER_ERROR", "503,SERVER_ERROR", "599,SERVER_ERROR"})
+	void registeredHandlersKeepHttpCategoriesForMalformedUtf8ErrorBodies(int status, String category) {
+		server.status.set(status);
+		server.body.set("{\"error\":{\"name\":\"out_of_scope\",\"message\":\"" + MARKER + "\"}}");
+		int calls = 0;
+		for (byte[] bytes : malformedUtf8()) {
+			server.ignoredBytes.set(bytes);
+			for (String name : List.of("get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders")) {
+				assertSafeError(callValidTool(name), category);
+				assertThat(server.requests).hasValue(++calls);
+				assertThat(server.credentialReads).hasValue(calls);
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {401, 403})
+	void registeredHandlersKeepPermissionCategoryForValidUtf8ErrorBodies(int status) {
+		server.status.set(status);
+		server.body.set("{\"error\":{\"name\":\"out_of_scope\",\"message\":\"권한 \uFFFD\"}}");
+		int calls = 0;
+		for (String name : List.of("get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders")) {
+			assertSafeError(callValidTool(name), "PERMISSION_DENIED");
+			assertThat(server.requests).hasValue(++calls);
+		}
+	}
+
+	private CallToolResult callValidTool(String name) {
+		return switch (name) {
+			case "get_upbit_order" -> call(ID);
+			case "get_upbit_order_executions" -> callExecutions("main", ID);
+			case "get_upbit_closed_orders" -> callClosed(Map.of());
+			default -> throw new AssertionError("Unknown test tool");
+		};
+	}
+
+	private static String utf8SuccessBody(String name) {
+		return name.equals("get_upbit_closed_orders")
+				? "[" + summary(ID, "done", "2", "0.3000") + ","
+						+ summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "0", "0") + "]"
+				: ORDER;
+	}
+
+	private static List<byte[]> malformedUtf8() {
+		return List.of(new byte[] {(byte) 0x80}, new byte[] {(byte) 0xC3, 0x28},
+				new byte[] {(byte) 0xC0, (byte) 0xAF}, new byte[] {(byte) 0xE2, (byte) 0x82});
+	}
+
+	private static byte[] withIgnoredBytes(String json, byte[] value, String secrets) {
+		// Damage the second closed order after a valid first result; otherwise use the root object.
+		int start = (json.startsWith("[") ? json.lastIndexOf("{\"uuid\":") : json.indexOf('{')) + 1;
+		// Keep each ignored string below the closed-order mapper's existing length limit.
+		StringBuilder fields = new StringBuilder();
+		JsonMapper jsonMapper = JsonMapper.builder().build();
+		for (int offset = 0; offset < secrets.length(); offset += 128) {
+			fields.append("\"private").append(offset / 128).append("\":")
+					.append(jsonMapper.writeValueAsString(
+							secrets.substring(offset, Math.min(offset + 128, secrets.length())))).append(',');
+		}
+		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+		bytes.writeBytes((json.substring(0, start) + "\"ignored\":\"").getBytes(StandardCharsets.UTF_8));
+		bytes.writeBytes(value);
+		bytes.writeBytes(("\"," + fields + json.substring(start)).getBytes(StandardCharsets.UTF_8));
+		return bytes.toByteArray();
 	}
 
 	@ParameterizedTest
@@ -999,7 +1129,8 @@ class UpbitOrderToolsTest {
 			}
 		}
 		for (String observation : observations) {
-			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ");
+			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ",
+					"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length");
 			for (String token : server.tokens) {
 				assertThat(observation).doesNotContain(token, token.substring(7));
 			}
@@ -1099,6 +1230,7 @@ class UpbitOrderToolsTest {
 		final AtomicReference<Map<String, String>> keys = new AtomicReference<>(KEYS);
 		final AtomicInteger status = new AtomicInteger(200);
 		final AtomicReference<String> body = new AtomicReference<>(ORDER);
+		final AtomicReference<byte[]> ignoredBytes = new AtomicReference<>();
 		final AtomicInteger requests = new AtomicInteger();
 		final AtomicInteger credentialReads = new AtomicInteger();
 		final AtomicInteger clientCreations = new AtomicInteger();
@@ -1142,6 +1274,10 @@ class UpbitOrderToolsTest {
 								: payload + secrets;
 					}
 					byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
+					byte[] ignored = ignoredBytes.get();
+					if (ignored != null) {
+						bytes = withIgnoredBytes(payload, ignored, MARKER + ACCESS + SECRET + token);
+					}
 					exchange.sendResponseHeaders(status.get(), bytes.length);
 					exchange.getResponseBody().write(bytes);
 				}

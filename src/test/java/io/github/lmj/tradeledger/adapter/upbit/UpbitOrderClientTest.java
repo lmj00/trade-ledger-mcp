@@ -39,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import tools.jackson.databind.json.JsonMapper;
 
 class UpbitOrderClientTest {
 
@@ -682,6 +683,127 @@ class UpbitOrderClientTest {
 
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
+	void rejectsMalformedUtf8InIgnoredSuccessFieldsWithoutPartialResults(boolean closed) throws Exception {
+		AtomicReference<byte[]> invalid = new AtomicReference<>();
+		AtomicInteger requests = new AtomicInteger();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			// For closed orders, the damaged field follows a complete, valid first result.
+			String json = closed ? "[" + CLOSED_ORDER + ","
+					+ CLOSED_ORDER.replace(ID, "123e4567-e89b-12d3-a456-426614174001") + "]" : ORDER;
+			reply(exchange, 200, withIgnoredBytes(json, invalid.get(),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client(closed);
+			// The same fields and secrets must pass when only the injected bytes are valid.
+			invalid.set("valid".getBytes(StandardCharsets.UTF_8));
+			if (closed) {
+				assertThat(client.getClosedOrders(new UpbitClosedOrdersRequest()).orders())
+						.extracting(order -> order.orderId())
+						.containsExactly(ID, "123e4567-e89b-12d3-a456-426614174001");
+			}
+			else {
+				assertSuccessfulGet(client, false);
+			}
+			assertThat(requests).hasValue(1);
+			int calls = 1;
+			for (byte[] bytes : malformedUtf8()) {
+				invalid.set(bytes);
+				expect(UpbitErrorCode.INVALID_RESPONSE, () -> get(client, closed), tokens);
+				assertThat(requests).hasValue(++calls);
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void acceptsValidNonAsciiAndEncodedReplacementCharacterInIgnoredFields(boolean closed) throws Exception {
+		AtomicReference<byte[]> value = new AtomicReference<>();
+		AtomicInteger requests = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			reply(exchange, 200, withIgnoredBytes(successBody(closed), value.get(), BODY_MARKER));
+		})) {
+			UpbitOrderClient client = server.client(closed);
+			int calls = 0;
+			for (String text : List.of("한글 \uD83D\uDE00", "\uFFFD")) {
+				value.set(text.getBytes(StandardCharsets.UTF_8));
+				assertSuccessfulGet(client, closed);
+				assertThat(requests).hasValue(++calls);
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void preservesHttpCategoriesWhenPermissionErrorBodyHasMalformedUtf8(boolean closed) throws Exception {
+		Map<Integer, UpbitErrorCode> cases = Map.ofEntries(
+				Map.entry(400, UpbitErrorCode.BAD_REQUEST), Map.entry(401, UpbitErrorCode.AUTHENTICATION_FAILED),
+				Map.entry(403, UpbitErrorCode.PERMISSION_DENIED), Map.entry(404, UpbitErrorCode.ORDER_NOT_FOUND),
+				Map.entry(418, UpbitErrorCode.IP_BLOCKED), Map.entry(429, UpbitErrorCode.RATE_LIMITED),
+				Map.entry(302, UpbitErrorCode.REDIRECT_REJECTED), Map.entry(307, UpbitErrorCode.REDIRECT_REJECTED),
+				Map.entry(500, UpbitErrorCode.SERVER_ERROR), Map.entry(503, UpbitErrorCode.SERVER_ERROR),
+				Map.entry(599, UpbitErrorCode.SERVER_ERROR));
+		AtomicInteger status = new AtomicInteger();
+		AtomicReference<byte[]> invalid = new AtomicReference<>();
+		AtomicInteger requests = new AtomicInteger();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			reply(exchange, status.get(), withIgnoredBytes("{\"error\":{\"name\":\"out_of_scope\"}}",
+					invalid.get(), BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client(closed);
+			int calls = 0;
+			// With valid bytes, the same escaped fields must preserve permission parsing.
+			invalid.set("권한 \uFFFD".getBytes(StandardCharsets.UTF_8));
+			for (int permissionStatus : List.of(401, 403)) {
+				status.set(permissionStatus);
+				expect(UpbitErrorCode.PERMISSION_DENIED, () -> get(client, closed), tokens);
+				assertThat(requests).hasValue(++calls);
+			}
+			for (byte[] bytes : malformedUtf8()) {
+				invalid.set(bytes);
+				for (var entry : cases.entrySet()) {
+					status.set(entry.getKey());
+					expect(entry.getValue(), () -> get(client, closed), tokens);
+					assertThat(requests).hasValue(++calls);
+				}
+			}
+		}
+	}
+
+	private static List<byte[]> malformedUtf8() {
+		return List.of(new byte[] {(byte) 0x80}, new byte[] {(byte) 0xC3, 0x28},
+				new byte[] {(byte) 0xC0, (byte) 0xAF}, new byte[] {(byte) 0xE2, (byte) 0x82});
+	}
+
+	private static byte[] withIgnoredBytes(String json, byte[] value, String secrets) {
+		// Insert in the final order for arrays, leaving an earlier valid result intact.
+		int object = json.lastIndexOf("{\"uuid\":");
+		int start = (object >= 0 ? object : json.indexOf('{')) + 1;
+		// Keep each ignored string below the closed-order mapper's existing length limit.
+		StringBuilder fields = new StringBuilder();
+		JsonMapper jsonMapper = JsonMapper.builder().build();
+		for (int offset = 0; offset < secrets.length(); offset += 128) {
+			fields.append("\"private").append(offset / 128).append("\":")
+					.append(jsonMapper.writeValueAsString(
+							secrets.substring(offset, Math.min(offset + 128, secrets.length())))).append(',');
+		}
+		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+		bytes.writeBytes((json.substring(0, start) + "\"ignored\":\"").getBytes(StandardCharsets.UTF_8));
+		bytes.writeBytes(value);
+		bytes.writeBytes(("\"," + fields + json.substring(start)).getBytes(StandardCharsets.UTF_8));
+		return bytes.toByteArray();
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
 	void classifiesHttpFailuresAndNeverRetainsResponseCredentialsOrToken(boolean closed) throws Exception {
 		Map<Integer, UpbitErrorCode> cases = Map.ofEntries(
 				Map.entry(400, UpbitErrorCode.BAD_REQUEST), Map.entry(401, UpbitErrorCode.AUTHENTICATION_FAILED),
@@ -939,7 +1061,8 @@ class UpbitOrderClientTest {
 			StringWriter trace = new StringWriter();
 			exception.printStackTrace(new PrintWriter(trace));
 			assertThat(exception.getMessage() + exception + trace)
-					.doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET, BODY_MARKER);
+					.doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET, BODY_MARKER,
+							"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length");
 			if (responseIds.length > 0) {
 				assertThat(exception.getMessage() + exception + trace).doesNotContain(responseIds);
 			}
@@ -950,7 +1073,10 @@ class UpbitOrderClientTest {
 	}
 
 	private static void reply(HttpExchange exchange, int status, String body) throws IOException {
-		byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+		reply(exchange, status, body.getBytes(StandardCharsets.UTF_8));
+	}
+
+	private static void reply(HttpExchange exchange, int status, byte[] bytes) throws IOException {
 		exchange.sendResponseHeaders(status, status == 204 ? -1 : bytes.length);
 		try (var output = exchange.getResponseBody()) {
 			if (status != 204) {

@@ -9,6 +9,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -232,7 +234,18 @@ public final class UpbitOrderClient implements AutoCloseable {
 			// Unlike an InputStream body handler, this future completes only after the full body.
 			HttpResponse<byte[]> received = response.get(
 					Math.max(1, REQUEST_TIMEOUT.toNanos() - (System.nanoTime() - started)), TimeUnit.NANOSECONDS);
-			String json = new String(received.body(), StandardCharsets.UTF_8);
+			String json;
+			try {
+				json = StandardCharsets.UTF_8.newDecoder()
+						.onMalformedInput(CodingErrorAction.REPORT)
+						.onUnmappableCharacter(CodingErrorAction.REPORT)
+						.decode(ByteBuffer.wrap(received.body())).toString();
+			}
+			catch (CharacterCodingException exception) {
+				// Never retain decoder diagnostics or use a damaged body for permission checks.
+				throw new UpbitApiException(received.statusCode() == 200
+						? UpbitErrorCode.INVALID_RESPONSE : statusCode(received.statusCode(), ""));
+			}
 			if (received.statusCode() != 200) {
 				throw new UpbitApiException(statusCode(received.statusCode(), json));
 			}
