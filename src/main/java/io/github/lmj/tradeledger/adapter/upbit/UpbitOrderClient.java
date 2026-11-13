@@ -29,7 +29,10 @@ import java.util.stream.Collectors;
 
 import io.github.lmj.tradeledger.application.model.ClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot;
-import tools.jackson.databind.JsonNode;
+import tools.jackson.core.JsonToken;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.StreamReadFeature;
+import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -52,12 +55,19 @@ public final class UpbitOrderClient implements AutoCloseable {
 	static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(3);
 	static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
 	static final int MAX_RESPONSE_BYTES = 1024 * 1024;
+	private static final int MAX_ERROR_DEPTH = 64; // Includes the root object.
+	private static final int MAX_ERROR_STRING_LENGTH = 256; // Decoded UTF-16 code units, including names.
+	private static final int MAX_ERROR_NUMBER_LENGTH = 128; // Original token, before normalization.
 	private static final URI ENDPOINT = URI.create("https://api.upbit.com/v1/order");
 	private static final URI CLOSED_ENDPOINT = URI.create("https://api.upbit.com/v1/orders/closed");
 	private static final String HTTP_LOG_PROPERTY = "jdk.httpclient.HttpClient.log";
 	private static final Pattern UUID = Pattern.compile(
 			"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
-	private static final JsonMapper JSON = JsonMapper.builder().build();
+	private static final JsonMapper JSON = JsonMapper.builder(JsonFactory.builder()
+			.streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(MAX_ERROR_DEPTH)
+					.maxStringLength(MAX_ERROR_STRING_LENGTH).maxNameLength(MAX_ERROR_STRING_LENGTH)
+					.maxNumberLength(MAX_ERROR_NUMBER_LENGTH).build()).build())
+			.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build();
 	private static final Set<String> PERMISSION_ERRORS = Set.of("out_of_scope", "insufficient_permission",
 			"insufficient_permissions", "permission_denied", "no_authorization_ip");
 
@@ -305,13 +315,62 @@ public final class UpbitOrderClient implements AutoCloseable {
 	}
 
 	private static boolean permissionError(String json) {
-		try {
-			JsonNode root = JSON.readTree(json);
-			JsonNode error = root == null ? null : root.get("error");
-			JsonNode name = error == null ? null : error.get("name");
-			return name != null && name.isString() && PERMISSION_ERRORS.contains(name.asString());
+		// One linear pass validates ignored fields too, without constructing a tree.
+		// A candidate name is trusted only after the entire single document is valid.
+		try (var parser = JSON.createParser(json)) {
+			if (parser.nextToken() != JsonToken.START_OBJECT) {
+				return false;
+			}
+			int depth = 1;
+			boolean errorField = false;
+			boolean errorObject = false;
+			boolean nameField = false;
+			boolean permission = false;
+			JsonToken token;
+			while ((token = parser.nextToken()) != null) {
+				if (depth == 0) {
+					return false; // A second document is ambiguous, even if syntactically valid.
+				}
+				// Exact lengths complement Jackson's potentially approximate constraints.
+				if ((token == JsonToken.PROPERTY_NAME || token == JsonToken.VALUE_STRING)
+						&& parser.getString().length() > MAX_ERROR_STRING_LENGTH) {
+					return false;
+				}
+				if ((token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT)
+						&& parser.getString().length() > MAX_ERROR_NUMBER_LENGTH) {
+					return false;
+				}
+				if (errorField) {
+					if (token != JsonToken.START_OBJECT) {
+						return false;
+					}
+					errorObject = true;
+				}
+				if (nameField) {
+					if (token != JsonToken.VALUE_STRING) {
+						return false;
+					}
+					permission = PERMISSION_ERRORS.contains(parser.getString());
+				}
+				errorField = depth == 1 && token == JsonToken.PROPERTY_NAME && "error".equals(parser.getString());
+				nameField = errorObject && depth == 2 && token == JsonToken.PROPERTY_NAME
+						&& "name".equals(parser.getString());
+				if (token == JsonToken.START_ARRAY || token == JsonToken.START_OBJECT) {
+					if (++depth > MAX_ERROR_DEPTH) {
+						return false;
+					}
+				}
+				else if (token == JsonToken.END_ARRAY || token == JsonToken.END_OBJECT) {
+					if (depth == 2) {
+						errorObject = false;
+					}
+					depth--;
+				}
+			}
+			return depth == 0 && permission;
 		}
 		catch (RuntimeException exception) {
+			// Discard input and parser diagnostics; keep the existing HTTP category.
 			return false;
 		}
 	}

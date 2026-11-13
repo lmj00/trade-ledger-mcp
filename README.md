@@ -226,6 +226,12 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 오류는 `isError=true`와 `Upbit request failed: <안전한 범주>` 메시지로 반환합니다. `INVALID_UUID`, `MISSING_CREDENTIALS`, `AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `ORDER_NOT_FOUND`, `RATE_LIMITED`, `NETWORK_ERROR`, `TIMEOUT`, `INVALID_RESPONSE` 등이 있으며 알려지지 않은 내부 실패는 `INTERNAL_ERROR`로 처리합니다. 클라이언트 초기화 예외도 원인을 제거한 뒤 전달해 키·JWT·원문 응답과 파서 예외가 MCP 오류 원인으로 따라가지 않게 합니다. 오류의 `structuredContent`에 별도 오류 객체가 존재한다고 가정하지 않습니다.
 
+401·403 오류 본문은 클라이언트 내부에서 트리 생성 없이 토큰을 선형 순회합니다. 루트 객체의 `error` 객체 안에 직접 있는 문자열 `name`만 검사하고, `out_of_scope`, `insufficient_permission`, `insufficient_permissions`, `permission_denied`, `no_authorization_ip`를 `PERMISSION_DENIED`로 분류합니다. 이스케이프된 속성명과 문자열은 디코딩 후 같은 규칙을 적용하며 다른 위치의 `name`은 근거로 사용하지 않습니다. 이름을 먼저 찾더라도 **전체 단일 JSON 문서의 검증이 끝난 뒤** 판정합니다.
+
+오류 본문의 프로젝트 파싱 정책은 **루트 객체 포함 깊이 64**, **디코딩된 문자열·속성명 256 UTF-16 코드 단위**, **정규화 전 숫자 원본 토큰 128 코드 단위**입니다. 무시되는 필드에도 설치된 Jackson의 `StreamReadConstraints`와 정확한 길이 검사를 적용하고, 모든 객체의 중복 키를 거부합니다. 중복 키·두 번째 문서·손상된 꼬리·잘못된 루트/`error`/`name` 유형·제한 초과·잘못된 UTF-8이면 본문 기반 판별을 포기합니다. 이때 401은 `AUTHENTICATION_FAILED`, 403은 `PERMISSION_DENIED`이며 400·404·418·429·3xx·5xx도 기존 HTTP 상태 범주를 유지합니다. 파서 진단·cause·suppressed 예외는 전달하거나 로그로 남기지 않습니다. 이 제한은 거래소 공식 규격이 아닌 프로젝트 정책이며 기존 1 MiB 전송 상한을 함께 적용합니다.
+
+같은 처리는 두 HTTP 경로와 세 업비트 MCP 도구에 적용됩니다. 유효 조회 호출당 GET은 한 번이며 추가 요청·공통 파서 계층·의존성을 추가하지 않았습니다. 실패 응답은 `isError=true`이고 부분 `structuredContent`를 반환하지 않습니다. 클라이언트와 등록 핸들러 회귀 테스트에 정상·이스케이프 이름, 중복 키·후행 데이터, 무시되는 필드의 64/65·256/257·128/129 경계와 비밀값·파서 진단 비노출 검사를 추가했습니다. **이번 엄격한 권한 오류 파싱 후보의 테스트는 개발 환경에서 미실행입니다.** `java -version`은 `java: command not found`(종료 코드 127)였으며 Java·Gradle 실행기를 PATH에서 찾지 못했습니다. 서버 지정 Java 21·오프라인·자원 제한 및 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'` 환경의 `/opt/gradle/bin/gradle test` 결과와 독립 검토는 대기입니다. 변경 전 실패 재현과 실계정 동작도 미검증이며 성능 개선 수치를 주장하지 않습니다.
+
 프로젝트 상한은 연결 **3초**, 본문 수신까지 요청 전체 **10초**, 응답 본문 **1 MiB(1,048,576바이트)**, 단건 주문당 체결 **0~1,000건**, 십진 문자열 **128자**, 기타 원문 문자열 **256자**입니다. UUID는 공백 없이 36자이며 초과 데이터는 부분 반환하지 않습니다. 이 상한은 업비트의 공식 서비스 상한과 구별됩니다. 단건 조회와 아래의 한 기간 종료 주문 요약 조회를 지원하며 페이지 순회·기간 분할 수집·자동 재시도·호출 속도 조절기는 구현하지 않았습니다.
 
 제공 규격에 따른 공식 호출 제한은 **`default` 그룹 초당 30회 공유 한도**입니다. 이 단건 주문 조회만의 전용 30회가 아니며 같은 계정의 해당 그룹 API 사용량과 공유합니다. 호출자는 다른 클라이언트의 사용량도 함께 조정해야 하며 429는 `RATE_LIMITED`로 반환합니다.

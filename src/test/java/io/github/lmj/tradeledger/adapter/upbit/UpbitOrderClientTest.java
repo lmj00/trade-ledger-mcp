@@ -1018,19 +1018,135 @@ class UpbitOrderClientTest {
 
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
+	void rejectsAmbiguousOrIncompletePermissionDocuments(boolean closed) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		AtomicInteger requests = new AtomicInteger();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			assertThat(exchange.getRequestMethod() + " " + exchange.getRequestURI()).isEqualTo(requestTargetWithMethod(closed));
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			// Prepend bounded secrets without repairing malformed tails or changing duplicate keys.
+			reply(exchange, 401, body.get().startsWith("{")
+					? withIgnoredBytes(body.get(), "valid".getBytes(StandardCharsets.UTF_8),
+							BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token)
+					: body.get().getBytes(StandardCharsets.UTF_8));
+		})) {
+			UpbitOrderClient client = server.client(closed);
+			int calls = 0;
+			for (String json : rejectedPermissionBodies()) {
+				body.set(json);
+				expect(UpbitErrorCode.AUTHENTICATION_FAILED, () -> get(client, closed), tokens);
+				assertThat(requests).hasValue(++calls);
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void boundsEveryPermissionTokenBeforeAndAfterTheName(boolean closed) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		AtomicInteger requests = new AtomicInteger();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			assertThat(exchange.getRequestMethod() + " " + exchange.getRequestURI()).isEqualTo(requestTargetWithMethod(closed));
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			reply(exchange, 401, withIgnoredBytes(body.get(), "valid".getBytes(StandardCharsets.UTF_8),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client(closed);
+			int calls = 0;
+			for (int overflow : List.of(0, 1)) {
+				for (String field : permissionPolicyFields(overflow)) {
+					for (boolean permissionFirst : List.of(false, true)) {
+						String permission = "\"error\":{\"name\":\"out_of_scope\"}";
+						body.set("{" + (permissionFirst ? permission + "," + field : field + "," + permission) + "}");
+						expect(overflow == 0 ? UpbitErrorCode.PERMISSION_DENIED : UpbitErrorCode.AUTHENTICATION_FAILED,
+								() -> get(client, closed), tokens);
+						assertThat(requests).hasValue(++calls);
+					}
+				}
+			}
+		}
+	}
+
+	private static String requestTargetWithMethod(boolean closed) {
+		return "GET " + requestTarget(closed);
+	}
+
+	private static List<String> permissionPolicyFields(int overflow) {
+		int length = 256 + overflow;
+		int numberLength = 128 + overflow;
+		int arrays = 63 + overflow; // Root object is depth one.
+		return List.of("\"policyBoundary\":\"" + "x".repeat(length) + "\"",
+				"\"policyBoundary\":\"" + "\\u0078".repeat(length) + "\"",
+				"\"policyBoundary\":\"" + "\\uD83D\\uDE00".repeat(128) + "x".repeat(overflow) + "\"",
+				"\"" + "x".repeat(length) + "\":null",
+				"\"" + "\\u0078".repeat(length) + "\":null",
+				"\"policyBoundary\":{\"nested\":[{\"value\":\"" + "x".repeat(length) + "\"}]}",
+				"\"policyBoundary\":" + "1".repeat(numberLength),
+				"\"policyBoundary\":-" + "1".repeat(numberLength - 1),
+				"\"policyBoundary\":1." + "0".repeat(numberLength - 6) + "e+00",
+				"\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays),
+				"\"policyBoundary\":" + "{\"x\":".repeat(arrays) + "0" + "}".repeat(arrays));
+	}
+
+	private static List<String> rejectedPermissionBodies() {
+		String permission = "{\"error\":{\"name\":\"out_of_scope\"}}";
+		return List.of("", "null", "[]", "[" + permission + "]", "\"out_of_scope\"", "0", "true", "{}",
+				"{\"error\":null}", "{\"error\":[]}", "{\"error\":\"out_of_scope\"}", "{\"error\":1}",
+				"{\"error\":true}", "{\"error\":{}}", "{\"error\":{\"name\":null}}",
+				"{\"error\":{\"name\":[\"out_of_scope\"]}}", "{\"error\":{\"name\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":1}}", "{\"error\":{\"name\":true}}",
+				"{\"error\":{\"name\":\"OUT_OF_SCOPE\"}}", "{\"error\":{\"name\":\"out_of_scope \"}}",
+				"{\"name\":\"out_of_scope\"}", "{\"other\":{\"error\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"nested\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":\"unknown\",\"nested\":{\"name\":\"out_of_scope\"}}}",
+				"{\"error\":{\"name\":\"unknown\"},\"other\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"error\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{},\"error\":{\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"error\":{}}",
+				"{\"error\":{\"name\":\"unknown\",\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\",\"name\":\"out_of_scope\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\",\"na\\u006de\":\"unknown\"}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"err\\u006fr\":{}}",
+				"{\"error\":{\"name\":\"out_of_scope\"},\"extra\":{\"x\":1,\"x\":2}}",
+				permission + " {}", permission + " []", permission + " null", permission + " 0",
+				permission + " true", permission + " {", permission + " garbage", permission + " \"",
+				permission.substring(0, permission.length() - 1),
+				"{\"error\":{\"name\":\"out_of_scope\"},\"tail\":[}");
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
 	void recognizesPermissionErrorsInBoth401And403(boolean closed) throws Exception {
 		AtomicInteger status = new AtomicInteger(401);
+		AtomicReference<String> body = new AtomicReference<>();
 		AtomicInteger requests = new AtomicInteger();
 		try (LocalServer server = new LocalServer(exchange -> {
 			requests.incrementAndGet();
-			reply(exchange, status.get(),
-					"{\"error\":{\"name\":\"out_of_scope\",\"message\":\"" + BODY_MARKER + "\"}}");
+			assertThat(exchange.getRequestMethod() + " " + exchange.getRequestURI()).isEqualTo(requestTargetWithMethod(closed));
+			reply(exchange, status.get(), body.get());
 		})) {
 			UpbitOrderClient client = server.client(closed);
-			expect(UpbitErrorCode.PERMISSION_DENIED, () -> get(client, closed));
-			status.set(403);
-			expect(UpbitErrorCode.PERMISSION_DENIED, () -> get(client, closed));
-			assertThat(requests).hasValue(2);
+			int calls = 0;
+			for (int code : List.of(401, 403)) {
+				status.set(code);
+				for (String name : List.of("out_of_scope", "insufficient_permission", "insufficient_permissions",
+						"permission_denied", "no_authorization_ip")) {
+					for (String fields : List.of("\"error\":{\"name\":\"" + name + "\"}",
+							"\"error\":{\"nested\":{\"name\":\"unknown\"},\"name\":\"" + name + "\"}",
+							"\"err\\u006fr\":{\"na\\u006de\":\"" + name.replace("_", "\\u005f") + "\"}")) {
+						body.set("{" + fields + ",\"message\":\"" + BODY_MARKER + "\","
+								+ "\"name\":\"unknown\",\"other\":{\"name\":\"unknown\"}} \n\t");
+						expect(UpbitErrorCode.PERMISSION_DENIED, () -> get(client, closed));
+						assertThat(requests).hasValue(++calls);
+					}
+				}
+			}
 		}
 	}
 
@@ -1248,6 +1364,7 @@ class UpbitOrderClientTest {
 			exception.printStackTrace(new PrintWriter(trace));
 			assertThat(exception.getMessage() + exception + trace)
 					.doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET, BODY_MARKER,
+							"Bearer ", "eyJ", "StreamReadException", "Duplicate Object property",
 							"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length",
 							"StreamConstraintsException", "JsonParseException", "[Source:", "line: ", "column: ");
 			if (responseIds.length > 0) {
