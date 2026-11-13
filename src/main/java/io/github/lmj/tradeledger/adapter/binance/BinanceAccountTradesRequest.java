@@ -3,10 +3,10 @@ package io.github.lmj.tradeledger.adapter.binance;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Immutable input for one recent Spot account trade query for a single symbol.
- * Only symbol and limit are retained: no keys, signatures, account aliases or URLs.
- * Order IDs, from IDs, time filters and pagination are deliberately unsupported.
- * HTTP calls, MCP registration and live-account integration are not implemented.
+ * Immutable input for one Spot account trade query for a single symbol.
+ * Only symbol, limit and optional inclusive fromId are retained, without credentials.
+ * Order IDs, time filters and automatic pagination are unsupported.
+ * fromId follows project policy: canonical ASCII decimal, 0 through Long.MAX_VALUE.
  *
  * <p>Project policy, not Binance symbol grammar: symbol must be nonblank,
  * contain at most 256 UTF-16 code units (consistent with the response mapper),
@@ -19,17 +19,23 @@ import java.nio.charset.StandardCharsets;
 public final class BinanceAccountTradesRequest {
 	private final String symbol;
 	private final int limit;
+	private final Long fromId;
 
 	public BinanceAccountTradesRequest(String symbol) {
 		this(symbol, 500);
 	}
 
 	public BinanceAccountTradesRequest(String symbol, int limit) {
+		this(symbol, limit, null);
+	}
+
+	public BinanceAccountTradesRequest(String symbol, int limit, String fromId) {
 		if (!validSymbol(symbol) || limit < 1 || limit > 1000) {
 			throw invalid();
 		}
 		this.symbol = symbol;
 		this.limit = limit;
+		this.fromId = parseFromId(fromId);
 	}
 
 	public String symbol() {
@@ -40,9 +46,29 @@ public final class BinanceAccountTradesRequest {
 		return limit;
 	}
 
+	public Long fromId() {
+		return fromId;
+	}
+
+	private static Long parseFromId(String value) {
+		if (value == null) {
+			return null;
+		}
+		// Bound work before grammar checks and integer parsing; never use floating point.
+		if (value.isEmpty() || value.length() > 19 || !value.matches("0|[1-9][0-9]*")) {
+			throw invalid();
+		}
+		try {
+			return Long.parseLong(value);
+		}
+		catch (NumberFormatException exception) {
+			throw invalid();
+		}
+	}
+
 	/**
 	 * Returns the exact UTF-8 percent-encoded query to sign, without a leading '?'
-	 * or signature. A future transport must append {@code &signature=} directly
+	 * or signature. The transport must append {@code &signature=} directly
 	 * to this returned string, without re-encoding it. The caller supplies a
 	 * nonnegative epoch-millisecond timestamp; no clock or floating point is used.
 	 */
@@ -50,7 +76,8 @@ public final class BinanceAccountTradesRequest {
 		if (timestamp < 0) {
 			throw invalid();
 		}
-		return "symbol=" + encode(symbol) + "&limit=" + limit + "&recvWindow=5000&timestamp=" + timestamp;
+		return "symbol=" + encode(symbol) + "&limit=" + limit
+				+ (fromId == null ? "" : "&fromId=" + fromId) + "&recvWindow=5000&timestamp=" + timestamp;
 	}
 
 	private static boolean validSymbol(String value) {

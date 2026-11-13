@@ -66,6 +66,59 @@ class BinanceAccountTradesClientTest {
 			""".strip();
 
 	@Test
+	void signsFromIdExactlyOnceAndAcceptsEqualIds(CapturedOutput output) throws Exception {
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> signatures = new ArrayList<>();
+		AtomicReference<String> body = new AtomicReference<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			reply(exchange, 200, body.get());
+		})) {
+			var client = server.client();
+			for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+				body.set("[" + FILL.replace("\"id\":9007199254740993", "\"id\":" + id) + "]");
+				int before = requests.size();
+				var result = client.getAccountTrades(ALIAS, new BinanceAccountTradesRequest("BTCUSDT", 1, id));
+				assertThat(requests).hasSize(before + 1);
+				assertThat(requests.getLast()).startsWith("GET " + PATH + "?");
+				String raw = URI.create(requests.getLast().substring(4)).getRawQuery();
+				int boundary = raw.indexOf("&signature=");
+				String query = raw.substring(0, boundary);
+				String signature = raw.substring(boundary + "&signature=".length());
+				signatures.add(signature);
+				assertThat(query).isEqualTo("symbol=BTCUSDT&limit=1&fromId=" + id
+						+ "&recvWindow=5000&timestamp=1700000000123");
+				assertThat(query.split("&")).filteredOn(value -> value.startsWith("fromId="))
+						.containsExactly("fromId=" + id);
+				assertThat(signature).isEqualTo(hmac(query));
+				assertThat(result.trades().getFirst().id()).isEqualTo(Long.parseLong(id));
+				assertThat(result.possiblyTruncated()).isTrue();
+			}
+		}
+		assertSafeOutput(output, signatures);
+	}
+
+	@Test
+	void rejectsOutOfRangeFillAtAnyPositionWithoutPartialResults(CapturedOutput output) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, body.get());
+		})) {
+			var client = server.client();
+			var request = new BinanceAccountTradesRequest("BTCUSDT", 2, "9007199254740993");
+			String below = FILL.replace("\"id\":9007199254740993", "\"id\":9007199254740992");
+			for (String invalid : List.of("[" + below + "]", "[" + FILL + "," + below + "]")) {
+				body.set(invalid);
+				expect(BinanceErrorCode.INVALID_RESPONSE, () -> client.getAccountTrades(ALIAS, request));
+			}
+			assertThat(calls).hasValue(2);
+		}
+		assertSafeOutput(output, List.of());
+	}
+
+	@Test
 	void signsExactReceivedBytesAndSendsExactlyOneGetPerCall(CapturedOutput output) throws Exception {
 		List<String> requests = new CopyOnWriteArrayList<>();
 		List<String> headers = new CopyOnWriteArrayList<>();

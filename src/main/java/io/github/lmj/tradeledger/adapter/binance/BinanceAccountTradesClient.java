@@ -32,7 +32,7 @@ import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
- * One recent Spot account trade GET for one symbol, using JDK HttpClient and Jackson.
+ * One Spot account trade GET for one symbol, using JDK HttpClient and Jackson.
  * Reads BINANCE_API_KEY and BINANCE_SECRET_KEY from the process environment on each
  * call; the local, non-secret account alias is never transmitted. Aliases must be
  * nonblank, at most 256 UTF-16 code units, without ISO controls or unpaired surrogates.
@@ -49,7 +49,8 @@ import tools.jackson.databind.json.JsonMapper;
  * Project limits: connection 3 seconds, whole body 10 seconds, body 1 MiB.
  * Close this client to release its owned connections and workers.
  *
- * <p>Only the most recent limit (default 500, maximum 1000) is requested. A limit-sized
+ * <p>Without fromId the most recent fills are requested; otherwise fromId is inclusive.
+ * One result up to limit (default 500, maximum 1000) is requested. A limit-sized
  * snapshot may be truncated; this is not full history, completed trades or PnL.
  * Live accounts have not been verified.
  *
@@ -180,7 +181,7 @@ public final class BinanceAccountTradesClient implements AutoCloseable {
 		}
 		String json = send(outgoing);
 		try {
-			return mapper.map(accountAlias, request.symbol(), request.limit(), json);
+			return mapper.map(accountAlias, request, json);
 		}
 		catch (RuntimeException exception) {
 			throw new BinanceApiException(BinanceErrorCode.INVALID_RESPONSE);

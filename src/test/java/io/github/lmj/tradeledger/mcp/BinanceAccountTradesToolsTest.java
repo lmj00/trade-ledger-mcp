@@ -145,6 +145,93 @@ class BinanceAccountTradesToolsTest {
 	}
 
 	@Test
+	void registersOptionalStringFromIdAndKeepsAllSevenTools() {
+		List<?> specs = (List<?>) context.getBean("toolSpecs");
+		List<SyncToolSpecification> tools = specs.stream().filter(SyncToolSpecification.class::isInstance)
+				.map(SyncToolSpecification.class::cast).toList();
+		assertThat(tools).extracting(spec -> spec.tool().name()).containsExactlyInAnyOrder(
+				"summarize_journal", "analyze_trades", "get_upbit_order", "get_upbit_closed_orders",
+				NAME, "get_upbit_order_executions", EXECUTIONS_NAME);
+		var mapper = JsonMapper.builder().build();
+		var schema = mapper.valueToTree(tools.stream().filter(spec -> spec.tool().name().equals(NAME))
+				.findFirst().orElseThrow().tool().inputSchema());
+		assertThat(asMap(tools.stream().filter(spec -> spec.tool().name().equals(NAME))
+				.findFirst().orElseThrow().tool().inputSchema().get("properties")))
+				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId");
+		assertThat(schema.get("properties").get("accountAlias").get("type").asString()).isEqualTo("string");
+		assertThat(schema.get("properties").get("symbol").get("type").asString()).isEqualTo("string");
+		assertThat(schema.get("properties").get("limit").get("type").asString()).isEqualTo("integer");
+		assertThat(schema.get("properties").get("fromId").get("type").asString()).isEqualTo("string");
+		assertThat(schema.get("required")).isEqualTo(mapper.valueToTree(List.of("accountAlias", "symbol")));
+		var commonSchema = mapper.valueToTree(tools.stream()
+				.filter(spec -> spec.tool().name().equals(EXECUTIONS_NAME)).findFirst().orElseThrow()
+				.tool().inputSchema());
+		assertThat(commonSchema.get("properties").has("fromId")).isFalse();
+	}
+
+	@Test
+	void registeredFromIdAcceptsExactBoundaryIdsAndKeepsResponseShape() {
+		for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+			server.body.set("[" + FILL.replace("\"id\":9007199254740993", "\"id\":" + id) + "]");
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 1);
+			args.put("fromId", id);
+			int before = server.requests.get();
+			CallToolResult result = call(args);
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			Map<String, Object> response = asMap(result.structuredContent());
+			assertThat(response).containsOnlyKeys("serviceId", "accountAlias", "symbol", "trades", "possiblyTruncated")
+					.containsEntry("possiblyTruncated", true);
+			assertThat(asMap(((List<?>) response.get("trades")).getFirst())).containsEntry("id", id);
+			assertThat(server.requests).hasValue(before + 1);
+			assertThat(server.paths.getLast()).startsWith("GET /api/v3/myTrades?symbol=BTCUSDT&limit=1&fromId="
+					+ id + "&recvWindow=5000&timestamp=1700000000123&signature=");
+			assertMatchingSuccessContent(result);
+			assertNoSecrets(result);
+		}
+		server.body.set("[]");
+		Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 1);
+		args.put("fromId", "9223372036854775807");
+		CallToolResult empty = call(args);
+		assertThat(empty.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(empty.structuredContent())).containsEntry("trades", List.of())
+				.containsEntry("possiblyTruncated", false);
+		assertThat(server.requests).hasValue(4);
+		assertNoSecrets(empty);
+	}
+
+	@Test
+	void rejectsInvalidFromIdBeforeLazyProviderAndHttp() {
+		@SuppressWarnings("unchecked")
+		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
+		var tools = new BinanceAccountTradesTools(provider);
+		for (String id : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+			assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null, id))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
+			args.put("fromId", id);
+			assertSafeError(call(args), "BAD_REQUEST");
+		}
+		verifyNoInteractions(provider);
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@Test
+	void registeredFromIdRejectsBelowBoundWithoutPartialResults() {
+		String below = FILL.replace("\"id\":9007199254740993", "\"id\":9007199254740992");
+		Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
+		args.put("fromId", "9007199254740993");
+		for (String body : List.of("[" + below + "]", "[" + FILL + "," + below + "]")) {
+			server.body.set(body);
+			CallToolResult result = call(args);
+			assertSafeError(result, "INVALID_RESPONSE");
+			assertThat(result.structuredContent()).isNull();
+		}
+		assertThat(server.requests).hasValue(2);
+	}
+
+	@Test
 	void registeredHandlerPreservesEveryFillFieldAndExactStringIds() {
 		String sell = FILL.replace("9007199254740993,", "9223372036854775807,")
 				.replace("\"orderListId\":-1", "\"orderListId\":9007199254740993")

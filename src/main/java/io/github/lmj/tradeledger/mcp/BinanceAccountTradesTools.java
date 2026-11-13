@@ -25,8 +25,9 @@ public final class BinanceAccountTradesTools {
 
 	@McpTool(
 			name = "get_binance_account_trades",
-			title = "Get recent Binance Spot account trades for one symbol",
-			description = "Read one result of recent Spot fills for one symbol, default 500 and maximum 1000. "
+			title = "Get Binance Spot account trades for one symbol",
+			description = "Read one result of Spot fills for one symbol, default 500 and maximum 1000. "
+					+ "Optional fromId is an inclusive trade ID lower bound; omitted means recent fills. "
 					+ "accountAlias is a non-secret local display label and does not select the authenticated account. "
 					+ "Even short or empty results do not establish complete history. "
 					+ "No pagination, retries, fee conversion, trade matching, PnL, orders or funds movement.",
@@ -42,14 +43,21 @@ public final class BinanceAccountTradesTools {
 			@McpToolParam(description = "Required single Spot symbol, for example BTCUSDT.", required = true)
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
-			Integer limit) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit);
+			Integer limit,
+			@McpToolParam(description = "Optional inclusive trade ID lower bound: canonical decimal string from 0 through 9223372036854775807, without signs, spaces or leading zeroes.", required = false)
+			String fromId) {
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId);
 		try {
 			return BinanceAccountTradesResponse.from(client.getObject().getAccountTrades(accountAlias, request));
 		}
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);
 		}
+	}
+
+	/** Preserve existing Java callers; only the four-argument method is registered. */
+	public BinanceAccountTradesResponse getBinanceAccountTrades(String accountAlias, String symbol, Integer limit) {
+		return getBinanceAccountTrades(accountAlias, symbol, limit, null);
 	}
 
 	@McpTool(
@@ -72,7 +80,7 @@ public final class BinanceAccountTradesTools {
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
 			Integer limit) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit);
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null);
 		try {
 			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromBinance(
 					client.getObject().getAccountTrades(accountAlias, request)));
@@ -82,15 +90,14 @@ public final class BinanceAccountTradesTools {
 		}
 	}
 
-	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit) {
+	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId) {
 		try {
 			// Match the client's alias policy before obtaining the lazy client. The
-			// request model owns symbol/limit validation for every MCP call too.
+			// request model owns symbol/limit/fromId validation for every MCP call too.
 			if (!validAlias(accountAlias)) {
 				throw new IllegalArgumentException();
 			}
-			return limit == null ? new BinanceAccountTradesRequest(symbol)
-					: new BinanceAccountTradesRequest(symbol, limit);
+			return new BinanceAccountTradesRequest(symbol, limit == null ? 500 : limit, fromId);
 		}
 		catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Binance request failed: BAD_REQUEST");

@@ -131,17 +131,18 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	@Test
-	void binanceSchemaExposesOnlyAliasSymbolAndOptionalLimitWithStringIds() {
+	void binanceSchemaExposesOnlyAliasSymbolAndOptionalLimitAndFromIdWithStringIds() {
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_binance_account_trades"))
 				.findFirst().orElseThrow();
 		Map<String, Object> properties = asMap(specification.tool().inputSchema().get("properties"));
-		assertThat(properties).containsOnlyKeys("accountAlias", "symbol", "limit");
+		assertThat(properties).containsOnlyKeys("accountAlias", "symbol", "limit", "fromId");
 		assertThat(specification.tool().inputSchema().get("required"))
 				.isEqualTo(List.of("accountAlias", "symbol"));
 		assertThat(asMap(properties.get("accountAlias"))).containsEntry("type", "string");
 		assertThat(asMap(properties.get("symbol"))).containsEntry("type", "string");
 		assertThat(asMap(properties.get("limit"))).containsEntry("type", "integer");
+		assertThat(asMap(properties.get("fromId"))).containsEntry("type", "string");
 		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
 		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
 		assertThat(specification.tool().annotations().idempotentHint()).isTrue();

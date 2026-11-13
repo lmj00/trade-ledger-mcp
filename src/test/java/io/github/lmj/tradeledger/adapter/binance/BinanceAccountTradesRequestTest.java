@@ -105,20 +105,42 @@ class BinanceAccountTradesRequestTest {
 	}
 
 	@Test
-	void exposesOnlySymbolLimitAndTimestampAndRetainsOnlyImmutableRequestInput() {
+	void exposesOnlyRequestInputsAndRetainsOnlyImmutableRequestInput() {
 		Class<BinanceAccountTradesRequest> type = BinanceAccountTradesRequest.class;
 		assertThat(Modifier.isFinal(type.getModifiers())).isTrue();
 		assertThat(Arrays.stream(type.getDeclaredConstructors())
 				.map(constructor -> Arrays.asList(constructor.getParameterTypes())).toList())
-				.containsExactlyInAnyOrder(List.of(String.class), List.of(String.class, int.class));
+				.containsExactlyInAnyOrder(List.of(String.class), List.of(String.class, int.class),
+						List.of(String.class, int.class, String.class));
 		assertThat(Arrays.stream(type.getDeclaredFields()).map(field -> field.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId");
 		assertThat(Arrays.stream(type.getDeclaredFields())
 				.allMatch(field -> Modifier.isPrivate(field.getModifiers()) && Modifier.isFinal(field.getModifiers())))
 				.isTrue();
 		assertThat(Arrays.stream(type.getDeclaredMethods())
 				.filter(method -> Modifier.isPublic(method.getModifiers())).map(method -> method.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit", "toQueryString");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "toQueryString");
+	}
+
+	@Test
+	void preservesCanonicalFromIdBoundariesAndOmittedQuery() {
+		for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+			var request = new BinanceAccountTradesRequest("BTCUSDT", 1000, id);
+			assertThat(request.fromId()).isEqualTo(Long.valueOf(id));
+			assertThat(request.toQueryString(123)).isEqualTo("symbol=BTCUSDT&limit=1000&fromId="
+					+ id + "&recvWindow=5000&timestamp=123");
+		}
+		assertThat(new BinanceAccountTradesRequest("BTCUSDT", 500, null).toQueryString(0))
+				.isEqualTo(new BinanceAccountTradesRequest("BTCUSDT").toQueryString(0));
+		assertThat(new BinanceAccountTradesRequest("BTCUSDT").fromId()).isNull();
+	}
+
+	@Test
+	void rejectsNoncanonicalOrOutOfRangeFromIdsSafely() {
+		for (String id : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 500, id));
+		}
 	}
 
 	private static void assertSafeFailure(ThrowingCallable action) {
