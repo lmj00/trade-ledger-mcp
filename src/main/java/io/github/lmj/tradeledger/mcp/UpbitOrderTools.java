@@ -7,6 +7,7 @@ import java.util.regex.Pattern;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitClosedOrdersRequest;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
+import io.github.lmj.tradeledger.application.model.CommonExecutionSnapshot;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.beans.factory.ObjectProvider;
@@ -44,6 +45,39 @@ public final class UpbitOrderTools {
 		}
 		try {
 			return UpbitOrderResponse.from(client.getObject().getOrder(uuid));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	@McpTool(
+			name = "get_upbit_order_executions",
+			title = "Get common executions for one Upbit order",
+			description = "Read one Upbit order by UUID as common executions and one order-level fee. "
+					+ "accountAlias is a non-secret local display label, does not select credentials and is not sent to Upbit. "
+					+ "At most 1000 fills, no additional queries, retries, fee currency inference, matching or PnL. "
+					+ "A single order does not establish complete account history.",
+			generateOutputSchema = true,
+			annotations = @McpTool.McpAnnotations(
+					readOnlyHint = true,
+					destructiveHint = false,
+					idempotentHint = true,
+					openWorldHint = true))
+	public CommonExecutionResponse getUpbitOrderExecutions(
+			@McpToolParam(description = "Required non-secret local display label; does not select credentials or account.", required = true)
+			String accountAlias,
+			@McpToolParam(description = "One order UUID in canonical 8-4-4-4-12 hexadecimal form.", required = true)
+			String uuid) {
+		if (uuid == null || !UUID.matcher(uuid).matches()) {
+			throw new IllegalArgumentException("Upbit request failed: INVALID_UUID");
+		}
+		if (!validAlias(accountAlias)) {
+			throw new IllegalArgumentException("Upbit request failed: BAD_REQUEST");
+		}
+		try {
+			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromUpbit(
+					accountAlias, client.getObject().getOrder(uuid)));
 		}
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);
@@ -90,6 +124,25 @@ public final class UpbitOrderTools {
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);
 		}
+	}
+
+	// Match the Binance tool and common model before lazy client/credential access.
+	// Keep this boundary guard even though the pure common converter validates too.
+	private static boolean validAlias(String value) {
+		if (value == null || value.length() > 256 || value.isBlank()) {
+			return false;
+		}
+		for (int i = 0; i < value.length(); i++) {
+			char character = value.charAt(i);
+			if (Character.isISOControl(character) || Character.isLowSurrogate(character)) {
+				return false;
+			}
+			if (Character.isHighSurrogate(character)
+					&& (++i == value.length() || !Character.isLowSurrogate(value.charAt(i)))) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private static IllegalStateException safeFailure(RuntimeException exception) {

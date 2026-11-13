@@ -62,10 +62,10 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndThreeReadOnlyLookups() {
+	void registersOnlyTwoCalculationToolsAndFourReadOnlyLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
 				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
-						"get_upbit_closed_orders", "get_binance_account_trades");
+						"get_upbit_closed_orders", "get_binance_account_trades", "get_upbit_order_executions");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -79,6 +79,43 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
 		assertThat(asMap(specification.tool().outputSchema().get("properties")))
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
+	}
+
+	@Test
+	void commonOrderSchemaRequiresOnlyAliasAndUuidAndAllowsExplicitNulls() {
+		SyncToolSpecification specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_upbit_order_executions"))
+				.findFirst().orElseThrow();
+		Map<String, Object> input = asMap(specification.tool().inputSchema().get("properties"));
+		assertThat(input).containsOnlyKeys("accountAlias", "uuid");
+		assertThat(specification.tool().inputSchema().get("required"))
+				.isEqualTo(List.of("accountAlias", "uuid"));
+		input.values().forEach(property -> assertThat(asMap(property)).containsEntry("type", "string"));
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		Map<String, Object> output = asMap(specification.tool().outputSchema().get("properties"));
+		assertThat(output).containsOnlyKeys("serviceId", "accountAlias", "symbol", "queryScope", "orderId",
+				"possiblyTruncated", "executions", "fees");
+		assertNullableType(output.get("orderId"), "string");
+		assertNullableType(output.get("possiblyTruncated"), "boolean");
+		Map<String, Object> execution = asMap(asMap(asMap(output.get("executions")).get("items")).get("properties"));
+		assertThat(execution).containsOnlyKeys("serviceId", "accountAlias", "symbol", "executionId", "orderId",
+				"side", "price", "quantity", "amount", "executedAt");
+		execution.values().forEach(property -> assertThat(asMap(property)).containsEntry("type", "string"));
+		Map<String, Object> fee = asMap(asMap(asMap(output.get("fees")).get("items")).get("properties"));
+		assertThat(fee).containsOnlyKeys("scope", "targetId", "amount", "currency");
+		assertNullableType(fee.get("currency"), "string");
+		for (String field : List.of("scope", "targetId", "amount")) {
+			assertThat(asMap(fee.get(field))).containsEntry("type", "string");
+		}
+	}
+
+	private static void assertNullableType(Object property, String type) {
+		Object types = asMap(property).get("type");
+		assertThat(types).isInstanceOf(List.class);
+		assertThat(new java.util.HashSet<>((List<?>) types)).isEqualTo(Set.of(type, "null"));
 	}
 
 	@Test

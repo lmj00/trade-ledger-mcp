@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -37,6 +40,7 @@ import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
+import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
@@ -116,6 +120,7 @@ class UpbitOrderToolsTest {
 		server.credentialReads.set(0);
 		server.tokens.clear();
 		server.paths.clear();
+		server.headers.clear();
 		startCapturingLogs();
 	}
 
@@ -192,6 +197,218 @@ class UpbitOrderToolsTest {
 				assertThat(content).isInstanceOfSatisfying(TextContent.class, text ->
 						assertThat(mapper.readTree(text.text()))
 								.isEqualTo(mapper.valueToTree(result.structuredContent()))));
+	}
+
+	@ParameterizedTest
+	@CsvSource({"bid,done,BUY", "ask,done,SELL", "bid,cancel,BUY", "ask,cancel,SELL"})
+	void commonHandlerPreservesEveryExecutionAndSingleOrderFee(String side, String state, String commonSide) {
+		String alias = " 로컬 Main \uD83D\uDE00 ";
+		server.body.set(ORDER.replace("\"bid\"", "\"" + side + "\"")
+				.replace("\"done\"", "\"" + state + "\""));
+		CallToolResult result = callExecutions(alias, ID);
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> snapshot = asMap(result.structuredContent());
+		assertThat(snapshot).containsOnlyKeys("serviceId", "accountAlias", "symbol", "queryScope", "orderId",
+				"possiblyTruncated", "executions", "fees")
+				.containsEntry("serviceId", "upbit").containsEntry("accountAlias", alias)
+				.containsEntry("symbol", "KRW-BTC").containsEntry("queryScope", "SINGLE_ORDER")
+				.containsEntry("orderId", ID).containsEntry("possiblyTruncated", null);
+		assertThat(snapshot.get("executions")).isInstanceOf(List.class);
+		List<?> executions = (List<?>) snapshot.get("executions");
+		assertThat(executions).hasSize(2);
+		for (int index = 0; index < executions.size(); index++) {
+			assertThat(asMap(executions.get(index))).containsOnlyKeys("serviceId", "accountAlias", "symbol",
+					"executionId", "orderId", "side", "price", "quantity", "amount", "executedAt")
+					.containsEntry("serviceId", "upbit").containsEntry("accountAlias", alias)
+					.containsEntry("symbol", "KRW-BTC").containsEntry("executionId", "fill-" + (index + 1))
+					.containsEntry("orderId", ID).containsEntry("side", commonSide)
+					.containsEntry("price", "9007199254740993.123456789")
+					.containsEntry("quantity", index == 0 ? "0.100000000000000001" : "0.200000000000000002")
+					.containsEntry("amount", index == 0 ? "900719925474099.321352878154740993123456789"
+							: "1801439850948198.642705756309481986246913578")
+					.containsEntry("executedAt", "2026-07-01T01:00:0" + (index + 1) + "Z");
+		}
+		assertCommonFee(snapshot, "0.12345678901234567800");
+		assertMatchingSuccessContent(result);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.credentialReads).hasValue(1);
+		assertThat(server.paths).containsExactly("GET /v1/order?uuid=" + ID);
+		assertNoSecrets(result);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"wait", "cancel", "done"})
+	void commonHandlerPreservesUnfilledOrderAndZeroFee(String state) {
+		server.body.set(ORDER.substring(0, ORDER.indexOf("\"executed_volume\""))
+				.replace("\"state\":\"done\"", "\"state\":\"" + state + "\"")
+				+ "\"executed_volume\":\"0.0000\",\"paid_fee\":\"0.00\",\"trades\":[]}");
+		CallToolResult result = callExecutions("main", ID);
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> snapshot = asMap(result.structuredContent());
+		assertThat(snapshot).containsEntry("orderId", ID).containsEntry("queryScope", "SINGLE_ORDER")
+				.containsEntry("possiblyTruncated", null).containsEntry("executions", List.of());
+		assertCommonFee(snapshot, "0.00");
+		assertMatchingSuccessContent(result);
+		assertThat(server.requests).hasValue(1);
+		assertNoSecrets(result);
+	}
+
+	private static void assertCommonFee(Map<String, Object> snapshot, String amount) {
+		assertThat(snapshot.get("fees")).isInstanceOf(List.class);
+		List<?> fees = (List<?>) snapshot.get("fees");
+		assertThat(fees).hasSize(1);
+		assertThat(asMap(fees.getFirst())).containsOnlyKeys("scope", "targetId", "amount", "currency")
+				.containsEntry("scope", "ORDER").containsEntry("targetId", ID)
+				.containsEntry("amount", amount).containsEntry("currency", null);
+	}
+
+	@ParameterizedTest
+	@MethodSource("validCommonAliases")
+	void commonHandlerPreservesValidAliasesAtUtf16BoundaryWithoutSendingThem(String alias) {
+		CallToolResult result = callExecutions(alias, ID);
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(result.structuredContent())).containsEntry("accountAlias", alias);
+		assertThat((List<?>) asMap(result.structuredContent()).get("executions"))
+				.allSatisfy(execution -> assertThat(asMap(execution)).containsEntry("accountAlias", alias));
+		assertMatchingSuccessContent(result);
+		assertThat(server.requests).hasValue(1);
+		assertThat(server.paths).containsExactly("GET /v1/order?uuid=" + ID);
+		assertThat(server.headers).hasSize(1).allSatisfy(headers -> assertThat(headers).doesNotContain(alias));
+		assertNoSecrets(result);
+	}
+
+	static Stream<String> validCommonAliases() {
+		return Stream.of("x".repeat(256), "\uD83D\uDE00".repeat(128), " 로컬 Main \uD83D\uDE00 ");
+	}
+
+	static Stream<String> invalidCommonAliases() {
+		return Stream.of(null, "", " \u2003 ", "x".repeat(257), "\uD83D\uDE00".repeat(128) + "x",
+				MARKER + ACCESS + SECRET + "\n", "x\u0000", "x\u007f", "x\u0085",
+				"x\uD800", "\uDC00x", "\uD800x", "\uD800\uD800");
+	}
+
+	@ParameterizedTest
+	@MethodSource("invalidCommonAliases")
+	@SuppressWarnings("unchecked")
+	void commonHandlerRejectsBadAliasBeforeProviderCredentialsOrHttp(String alias) {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		assertThatThrownBy(() -> new UpbitOrderTools(provider).getUpbitOrderExecutions(alias, ID))
+				.isInstanceOf(IllegalArgumentException.class)
+				.hasMessage("Upbit request failed: BAD_REQUEST").hasNoCause();
+		verifyNoInteractions(provider);
+		server.keys.set(Map.of());
+		assertSafeError(callExecutions(alias, ID), "BAD_REQUEST");
+		assertThat(server.requests).hasValue(0);
+		assertThat(server.credentialReads).hasValue(0);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"", "invalid", "123e4567-e89b-12d3-a456-42661417400",
+			"123e4567-e89b-12d3-a456-426614174000 ", "123e4567-e89b-12d3-a456-42661417400g"})
+	@SuppressWarnings("unchecked")
+	void commonHandlerRejectsBadUuidBeforeProviderCredentialsOrHttp(String uuid) {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		assertThatThrownBy(() -> new UpbitOrderTools(provider).getUpbitOrderExecutions("main", uuid))
+				.hasMessage("Upbit request failed: INVALID_UUID").hasNoCause();
+		verifyNoInteractions(provider);
+		assertSafeError(callExecutions("main", uuid), "INVALID_UUID");
+		assertThat(server.requests).hasValue(0);
+		assertThat(server.credentialReads).hasValue(0);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void commonToolCallsExistingClientExactlyOnceAndSafelyDiscardsConversionFailure() {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		UpbitOrderClient client = mock(UpbitOrderClient.class);
+		when(provider.getObject()).thenReturn(client);
+		when(client.getOrder(ID)).thenReturn(new OrderExecutionSnapshot("upbit", ID, "KRW-BTC", MARKER,
+				"limit", "done", java.time.Instant.EPOCH, "0.00", "0.00", List.of()));
+		assertThatThrownBy(() -> new UpbitOrderTools(provider).getUpbitOrderExecutions("main", ID))
+				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
+		verify(provider).getObject();
+		verify(client).getOrder(ID);
+		verifyNoMoreInteractions(provider, client);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void commonToolProjectsOneClientResultWithoutAdditionalCalls() {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		UpbitOrderClient client = mock(UpbitOrderClient.class);
+		when(provider.getObject()).thenReturn(client);
+		when(client.getOrder(ID)).thenReturn(new OrderExecutionSnapshot("upbit", ID, "KRW-BTC", "bid",
+				"limit", "wait", java.time.Instant.EPOCH, "0.00", "0.00", List.of()));
+		CommonExecutionResponse result = new UpbitOrderTools(provider).getUpbitOrderExecutions("main", ID);
+		assertThat(result.orderId()).isEqualTo(ID);
+		assertThat(result.executions()).isEmpty();
+		verify(provider).getObject();
+		verify(client).getOrder(ID);
+		verifyNoMoreInteractions(provider, client);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void commonToolRejectsNullUuidWithoutObtainingClient() {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		assertThatThrownBy(() -> new UpbitOrderTools(provider).getUpbitOrderExecutions("main", null))
+				.hasMessage("Upbit request failed: INVALID_UUID").hasNoCause();
+		verifyNoInteractions(provider);
+		assertSafeError(callExecutions("main", null), "INVALID_UUID");
+		assertThat(server.requests).hasValue(0);
+		assertThat(server.credentialReads).hasValue(0);
+	}
+
+	@Test
+	void commonHandlerDiscardsConversionDetailsWithoutAnotherQuery() {
+		// The existing HTTP mapper accepts text sides; the common model rejects unknown sides.
+		server.body.set(ORDER.replace("\"bid\"", "\"" + MARKER + "\""));
+		assertSafeError(callExecutions("main", ID), "INTERNAL_ERROR");
+		assertThat(server.requests).hasValue(1);
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {1000, 1001})
+	void commonHandlerKeepsTheExistingFillBoundWithoutExtraQueries(int count) {
+		String fills = java.util.stream.IntStream.range(0, count).mapToObj(index ->
+				"{\"uuid\":\"fill-" + index + "\",\"market\":\"KRW-BTC\",\"side\":\"bid\","
+						+ "\"price\":\"1.2300\",\"volume\":\"0.0200\",\"funds\":\"0.024600\","
+						+ "\"created_at\":\"2026-07-01T10:00:01+09:00\"}")
+				.collect(java.util.stream.Collectors.joining(",", "[", "]"));
+		server.body.set(ORDER.substring(0, ORDER.indexOf("\"trades\"")) + "\"trades\":" + fills + "}");
+		CallToolResult result = callExecutions("main", ID);
+		if (count == 1001) {
+			assertSafeError(result, "INVALID_RESPONSE");
+		}
+		else {
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			Map<String, Object> snapshot = asMap(result.structuredContent());
+			assertThat((List<?>) snapshot.get("executions")).hasSize(count).allSatisfy(execution ->
+					assertThat(asMap(execution)).containsEntry("price", "1.2300")
+							.containsEntry("quantity", "0.0200").containsEntry("amount", "0.024600"));
+			assertCommonFee(snapshot, "0.12345678901234567800");
+			assertMatchingSuccessContent(result);
+		}
+		assertThat(server.requests).hasValue(1);
+		assertNoSecrets(result);
+	}
+
+	@Test
+	void commonHandlerRejectsMissingKeysWithoutHttp() {
+		server.keys.set(Map.of());
+		assertSafeError(callExecutions("main", ID), "MISSING_CREDENTIALS");
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@ParameterizedTest
+	@CsvSource({"400,BAD_REQUEST", "401,AUTHENTICATION_FAILED", "403,PERMISSION_DENIED",
+			"404,ORDER_NOT_FOUND", "418,IP_BLOCKED", "429,RATE_LIMITED", "500,SERVER_ERROR",
+			"302,REDIRECT_REJECTED", "200,INVALID_RESPONSE", "-1,NETWORK_ERROR"})
+	void commonHandlerReusesSafeHttpParserAndNetworkErrorsWithoutRetry(int status, String category) {
+		server.status.set(status);
+		server.body.set(MARKER);
+		assertSafeError(callExecutions("main", ID), category);
+		assertThat(server.requests).hasValue(1);
 	}
 
 	@Test
@@ -319,11 +536,15 @@ class UpbitOrderToolsTest {
 					.hasMessage("Upbit request failed: " + code.name()).hasNoCause();
 			assertThatThrownBy(() -> tools.getUpbitOrder(ID))
 					.hasMessage("Upbit request failed: " + code.name()).hasNoCause();
+			assertThatThrownBy(() -> tools.getUpbitOrderExecutions("main", ID))
+					.hasMessage("Upbit request failed: " + code.name()).hasNoCause();
 		}
 		doThrow(new IllegalStateException(MARKER + ACCESS + SECRET)).when(provider).getObject();
 		assertThatThrownBy(() -> tools.getUpbitClosedOrders(null, null, null, null, null, null, null))
 				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
 		assertThatThrownBy(() -> tools.getUpbitOrder(ID))
+				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
+		assertThatThrownBy(() -> tools.getUpbitOrderExecutions("main", ID))
 				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
 	}
 
@@ -427,6 +648,13 @@ class UpbitOrderToolsTest {
 
 	private CallToolResult callClosed(Map<String, Object> arguments) {
 		return call("get_upbit_closed_orders", arguments);
+	}
+
+	private CallToolResult callExecutions(String accountAlias, String uuid) {
+		Map<String, Object> arguments = new java.util.LinkedHashMap<>();
+		arguments.put("accountAlias", accountAlias);
+		arguments.put("uuid", uuid);
+		return call("get_upbit_order_executions", arguments);
 	}
 
 	private CallToolResult call(String uuid) {
@@ -552,12 +780,17 @@ class UpbitOrderToolsTest {
 							}
 							int creations = local.clientCreations.get();
 							fixture.assertSafeError(fixture.call(MARKER + ACCESS + SECRET), "INVALID_UUID");
+							fixture.assertSafeError(fixture.callExecutions("main", MARKER + ACCESS + SECRET), "INVALID_UUID");
+							for (String alias : invalidCommonAliases().toList()) {
+								fixture.assertSafeError(fixture.callExecutions(alias, ID), "BAD_REQUEST");
+							}
 							for (Map<String, Object> invalid : invalidClosedRequests().toList()) {
 								fixture.assertSafeError(fixture.callClosed(invalid), "BAD_REQUEST");
 							}
 							assertThat(local.clientCreations).hasValue(creations);
 							local.body.set(MARKER); // An accidental send would echo fake keys and the JWT too.
-							for (CallToolResult result : List.of(fixture.call(ID), fixture.callClosed(Map.of()))) {
+							for (CallToolResult result : List.of(fixture.call(ID), fixture.callClosed(Map.of()),
+									fixture.callExecutions("main", ID))) {
 								fixture.assertSafeError(result, "UNSAFE_TRANSPORT_CONFIGURATION");
 								assertThat(result.content().toString()).doesNotContain("Exception", "Caused by:", "\tat ");
 								lastResult.set(result);
@@ -568,6 +801,7 @@ class UpbitOrderToolsTest {
 							// Check the real lazy-construction/current-setting failures for cause/stack leaks too.
 							UpbitOrderTools tools = application.getBean(UpbitOrderTools.class);
 							assertSafeFailure(() -> tools.getUpbitOrder(ID));
+							assertSafeFailure(() -> tools.getUpbitOrderExecutions("main", ID));
 							assertSafeFailure(() -> tools.getUpbitClosedOrders(null, null, null, null, null, null, null));
 							assertThat(local.credentialReads).hasValue(0);
 							assertThat(local.requests).hasValue(0);
@@ -725,6 +959,7 @@ class UpbitOrderToolsTest {
 		final AtomicInteger clientCreations = new AtomicInteger();
 		final List<String> tokens = new CopyOnWriteArrayList<>();
 		final List<String> paths = new CopyOnWriteArrayList<>();
+		final List<String> headers = new CopyOnWriteArrayList<>();
 		final CountDownLatch releaseBody = new CountDownLatch(1);
 		private final HttpServer http;
 		private HttpClient transport;
@@ -735,6 +970,7 @@ class UpbitOrderToolsTest {
 			http.createContext("/", exchange -> {
 				requests.incrementAndGet();
 				paths.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+				headers.add(new java.util.LinkedHashMap<>(exchange.getRequestHeaders()).toString());
 				String token = exchange.getRequestHeaders().getFirst("Authorization");
 				tokens.add(token);
 				try (exchange) {

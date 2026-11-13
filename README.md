@@ -1,8 +1,8 @@
 # trade-ledger-mcp
 
-완결된 거래의 실현 손익을 계산하고 업비트 주문·바이낸스 현물 체결을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`, 종료 주문 요약을 조회하는 `get_upbit_closed_orders`, 바이낸스 단일 symbol 최근 체결을 조회하는 `get_binance_account_trades`를 제공합니다. 등록 도구는 이 다섯 개이며 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
+완결된 거래의 실현 손익을 계산하고 업비트 주문·바이낸스 현물 체결을 조회하는 읽기 전용 MCP 서버입니다. 로컬 CSV 저널을 요약하는 `summarize_journal`, 구조화된 완결 거래를 분석하는 `analyze_trades`, 주문 UUID로 주문·실제 체결을 조회하는 `get_upbit_order`, 종료 주문 요약을 조회하는 `get_upbit_closed_orders`, 바이낸스 단일 symbol 최근 체결을 조회하는 `get_binance_account_trades`, 업비트 단건 주문을 공통 체결 형식으로 조회하는 `get_upbit_order_executions`를 제공합니다. 등록 도구는 이 여섯 개이며 주문 실행·취소, 입출금·이체 등 자금 이동 기능은 없습니다.
 
-두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. 이번 후보에는 기존 업비트·바이낸스 스냅샷에서 공통 체결로 옮기는 내부 순수 변환을 추가했습니다. 기존 다섯 MCP 도구와 응답 계약은 유지하며 공통 모델의 MCP 연결은 아직 구현하지 않았습니다. 이는 인증·HTTP 검증 완료를 의미하지 않습니다. 토스증권의 공식 API·내보내기 규격은 제공된 근거상 미확인입니다. 이번 작업은 제공 규격과 저장소 코드에 근거하며 외부 문서 열람·실계정 접근은 하지 않았습니다. **신규 검증 상태: 이번 후보의 서버 테스트와 독립 검토는 대기 상태입니다.**
+두 계산 도구의 입력은 프로젝트가 정의한 **사용자 정의 완결 거래 형식**입니다. 거래소 조회 응답은 별도 주문·체결 또는 종료 주문 요약 스냅샷으로 노출하며 완결 거래나 손익으로 변환하지 않습니다. 이번 후보는 기존 공통 순수 변환을 업비트 단건 주문 MCP 도구에 연결합니다. 기존 다섯 MCP 도구와 거래소별 응답 계약은 유지하며 바이낸스 공통 형식 MCP 연결은 후속 판단으로 남깁니다. 이는 인증·HTTP 검증 완료를 의미하지 않습니다. 토스증권의 공식 API·내보내기 규격은 제공된 근거상 미확인입니다. 이번 작업에서는 공개 라이브러리의 스키마 생성 소스를 확인했으며 실계정에는 접근하지 않았습니다. **신규 검증 상태: 이번 후보의 서버 테스트와 독립 검토는 대기 상태입니다.**
 
 ## 설치·빌드·실행
 
@@ -93,7 +93,7 @@ trade-001,BTC-USDT,CRYPTO,LONG,0.1234,60000.25,62000.75,5.37,USDT,2026-07-01T01:
 
 ## MCP 도구 입력·출력 예시
 
-다섯 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**입니다. 계산 도구의 건수는 정수이고 종료 주문의 `tradesCount`와 바이낸스의 `id`·`orderId`·`orderListId`는 큰 정수의 정밀도를 보존하는 십진 문자열입니다.
+여섯 도구 모두 읽기 전용입니다. 아래 요청은 MCP 초기화 이후 `tools/call`에 전달할 `params` 예시이며, 출력은 응답 DTO의 JSON 데이터 예시입니다. 전체 JSON-RPC 요청·응답 봉투와 MCP `content` 등 전송 계층 필드는 생략했습니다. 금액 출력은 정밀도 손실을 피하도록 일반 십진수 **문자열**입니다. 계산 도구의 건수는 정수이고 종료 주문의 `tradesCount`와 바이낸스의 `id`·`orderId`·`orderListId`는 큰 정수의 정밀도를 보존하는 십진 문자열입니다.
 
 ### `summarize_journal`
 
@@ -219,6 +219,56 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 [UpbitOrderToolsTest](src/test/java/io/github/lmj/tradeledger/mcp/UpbitOrderToolsTest.java)는 가짜 키와 로컬 HTTP 대역을 실제 등록 MCP `callHandler`에 연결합니다. 기존 단건 체결·주문 수수료·정밀도·오류 검사를 유지하고 종료 주문의 기본값·선택 인자·시간 정규화·입력 경계·빈 배열·큰 정수 문자열·잘림 가능성·오류별 단일 전송 검사를 추가했습니다. 성공 텍스트 JSON 전체와 `structuredContent`가 같은지, 응답과 수집한 애플리케이션/MCP 로그·예외 스택에 키·JWT·비공개 원문 표식이 없는지도 검사하도록 작성했습니다. 테스트 작성은 통과 증거가 아니며 이번 후보의 실행 결과는 서버 검증 대기입니다.
 
+### `get_upbit_order_executions`
+
+여섯 번째 도구는 필수 `accountAlias`와 `uuid`만 받습니다. 키·시크릿·URL 인자는 없습니다. `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=true`로 등록합니다. UUID는 기존 단건 주문의 8-4-4-4-12 16진수 정책으로 검증하고 오류는 `INVALID_UUID`입니다. 별칭은 기존 바이낸스 도구·공통 모델과 같은 **최대 256 UTF-16 코드 단위** 정책을 사용합니다. 공백만 있는 값·ISO 제어문자·짝이 맞지 않는 surrogate·257 코드 단위 이상은 `BAD_REQUEST`로 거부하며 유효 비ASCII 문자·대소문자·앞뒤 공백은 그대로 보존합니다. 두 검사는 지연 클라이언트 생성·인증정보 조회·HTTP 전송 전에 수행합니다.
+
+별칭은 비밀정보가 아닌 로컬 표시 이름입니다. 인증 계정을 선택하지 않으며 업비트로 전송하지 않습니다. 실제 계정은 서버 환경의 키로만 정해집니다. 같은 계정에는 일관된 별칭을 사용해야 하며 다른 별칭이 다른 인증 계정이라는 보장은 없습니다.
+
+```json
+{
+  "name": "get_upbit_order_executions",
+  "arguments": {"accountAlias": "spot-main", "uuid": "123e4567-e89b-12d3-a456-426614174000"}
+}
+```
+
+다음은 가상 공통 출력이며 실계정 조회 결과가 아닙니다. 성공 `content`는 단일 JSON `TextContent`이고 파싱한 전체 값이 `structuredContent`와 같습니다. 금액은 후행 0과 정밀도를 보존하는 문자열이며 시각은 UTC ISO8601입니다.
+
+```json
+{
+  "serviceId": "upbit",
+  "accountAlias": "spot-main",
+  "symbol": "KRW-BTC",
+  "queryScope": "SINGLE_ORDER",
+  "orderId": "123e4567-e89b-12d3-a456-426614174000",
+  "possiblyTruncated": null,
+  "executions": [{
+    "serviceId": "upbit",
+    "accountAlias": "spot-main",
+    "symbol": "KRW-BTC",
+    "executionId": "fill-1",
+    "orderId": "123e4567-e89b-12d3-a456-426614174000",
+    "side": "BUY",
+    "price": "50000000.0000",
+    "quantity": "0.10000000",
+    "amount": "5000000.00000000",
+    "executedAt": "2026-07-01T01:00:01Z"
+  }],
+  "fees": [{
+    "scope": "ORDER",
+    "targetId": "123e4567-e89b-12d3-a456-426614174000",
+    "amount": "50.00000000",
+    "currency": null
+  }]
+}
+```
+
+유효 요청은 기존 지연 `UpbitOrderClient.getOrder(uuid)`를 정확히 한 번 호출하고 `CommonExecutionSnapshot.fromUpbit`와 순수 DTO 변환을 적용합니다. `bid`/`ask`는 `BUY`/`SELL`로 옮기며 체결이 있는 `cancel`도 보존합니다. 무체결 주문은 `executions=[]`이고 `paidFee`는 체결 수와 관계없이 `ORDER` 범위·주문 ID를 가진 수수료 한 항목입니다. 통화는 추정하거나 배분하지 않습니다. 단건 조회에서 적용되지 않는 `possiblyTruncated`와 미확인 수수료 `currency`는 **명시적인 JSON null**이며 출력 스키마도 null을 허용합니다. 공통 DTO의 다른 조회 범위에서 비어 있는 `orderId` 역시 null, 확인된 잘림 힌트는 boolean, 확인된 수수료 통화는 문자열로 변환합니다.
+
+체결·수수료 목록은 방어 복사한 불변 목록입니다. 기존 최대 1000건·본문 1 MiB·전체 10초와 단일 GET·리다이렉트 거부·재시도 금지 정책을 유지합니다. 추가 조회·전체 내역 수집·매수/매도 매칭·손익 계산·바이낸스 공통 형식 MCP 지원은 포함하지 않습니다. 단건 조회와 null은 전체 계정 내역 수집 완료를 뜻하지 않습니다. 기존 안전한 오류 범주와 JSON content 보정 경로를 재사용하며 공통 변환에서 예상 밖으로 거부된 응답은 원인 없는 `INTERNAL_ERROR`로 처리합니다.
+
+[CommonExecutionResponseTest](src/test/java/io/github/lmj/tradeledger/mcp/CommonExecutionResponseTest.java), 등록 스키마 테스트와 기존 로컬 HTTP 주입점의 [UpbitOrderToolsTest](src/test/java/io/github/lmj/tradeledger/mcp/UpbitOrderToolsTest.java)에 null·필드 대응·불변성·별칭 경계·단일 전송·안전한 오류·로그 비노출 회귀 검사를 추가했습니다. 모의 테스트 작성과 통과는 별개이며 이번 개발 단계에서는 테스트를 실행하지 않았습니다. 서버는 Java 21, 오프라인·자원 제한과 필수 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'`을 유지한 `/opt/gradle/bin/gradle`의 전체 `test` 결과를 별도로 기록해야 합니다. **현재 후보의 모의 검증 결과·독립 검토는 대기, 실계정 검증은 미수행입니다.**
+
 ### `get_upbit_closed_orders`
 
 종료 주문(`done`, `cancel`)의 **요약만** 한 번 조회합니다. 지정한 일곱 인자는 모두 선택 사항이며 키·시크릿·호스트·URL 인자는 없습니다. 등록 힌트는 `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=true`입니다.
@@ -337,7 +387,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 ## 내부 공통 체결 변환
 
-[CommonExecutionSnapshot](src/main/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshot.java)은 불변 record이며 `fromUpbit(accountAlias, snapshot)`와 `fromBinance(snapshot)` 정적 메서드로 기존 스냅샷만 변환합니다. 별도 서비스·어댑터 인터페이스·의존성이나 HTTP·환경변수·파일 접근, MCP 등록은 추가하지 않습니다. 원본 체결 목록을 한 번 순회해 변환하며 추가 조회를 하지 않습니다. 성능 향상 수치는 측정하거나 주장하지 않습니다.
+[CommonExecutionSnapshot](src/main/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshot.java)은 불변 record이며 `fromUpbit(accountAlias, snapshot)`와 `fromBinance(snapshot)` 정적 메서드로 기존 스냅샷만 변환합니다. 순수 변환 자체에는 별도 서비스·어댑터 인터페이스·의존성이나 HTTP·환경변수·파일 접근이 없습니다. 원본 체결 목록을 한 번 순회해 변환하며 추가 조회를 하지 않습니다. 이번 후보는 업비트 단건 조회에 이 변환과 [CommonExecutionResponse](src/main/java/io/github/lmj/tradeledger/mcp/CommonExecutionResponse.java)를 연결하며 바이낸스 공통 MCP 연결은 남겨 둡니다. 성능 향상 수치는 측정하거나 주장하지 않습니다.
 
 각 체결에는 서비스 ID, 비밀정보가 아닌 계정 별칭, 원본 시장/symbol, 체결 ID, 주문 ID, `BUY`/`SELL`, 가격·수량·체결 금액 문자열과 `Instant`를 담습니다. 업비트 `bid`/`ask`는 각각 `BUY`/`SELL`, 바이낸스 `isBuyer`는 true일 때 `BUY`, false일 때 `SELL`로 옮깁니다. 금액 문자열의 고정밀 값·후행 0과 원본 종목을 변경하지 않고, 바이낸스 long ID는 정확한 십진 문자열로 보존합니다. 체결 ID의 구조적 키는 `(serviceId, accountAlias, symbol, executionId)`이며 다른 서비스·별칭·종목의 같은 ID를 합치지 않습니다. 별칭은 기존 바이낸스 도구와 같은 최대 256 UTF-16 코드 단위·공백만인 값 거부·ISO 제어문자 거부·올바른 surrogate 쌍 정책을 적용하며 유효한 값은 그대로 유지합니다.
 
@@ -347,7 +397,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 
 변환은 누락·잘못된 별칭·알 수 없는 업비트 방향·부모 주문과 체결의 시장/방향 불일치·부모 symbol과 체결 symbol 불일치·중복 키를 부분 결과 없이 거부합니다. 오류는 입력값·원인·suppressed 예외가 없는 고정 메시지 `Invalid common execution snapshot`입니다. 목록은 빈 목록부터 최대 1000건까지 허용하며 결과 체결·수수료 목록은 방어 복사하고 변경을 막습니다.
 
-[CommonExecutionSnapshotTest](src/test/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshotTest.java)에 합성 입력의 필드 대응, 큰 ID·소수 정밀도·UTC 시각, 주문/체결 수수료, 취소·무체결, 키·입력 경계, 불변성과 조회 범위 회귀 테스트를 추가했습니다. **이번 후보의 테스트는 개발 환경에서 실행하지 않았으며 서버 테스트와 독립 검토 대기입니다.** 이번 개발 환경의 `java -version`은 `java: command not found`와 종료 코드 127을 반환했습니다. 서버는 Java 21, 오프라인·자원 제한과 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'`을 유지한 `/opt/gradle/bin/gradle test` 전체 실행 결과를 별도로 기록해야 합니다. 위의 이전 후보 실패 기록은 이번 변경의 검증 결과가 아닙니다. 공통 모델의 MCP 연결과 실계정 원본 대조는 남아 있으며 실계정은 미검증입니다.
+[CommonExecutionSnapshotTest](src/test/java/io/github/lmj/tradeledger/application/model/CommonExecutionSnapshotTest.java)의 합성 입력 필드 대응, 큰 ID·소수 정밀도·UTC 시각, 주문/체결 수수료, 취소·무체결, 키·입력 경계, 불변성과 조회 범위 회귀 테스트는 유지합니다. **이번 후보의 테스트는 개발 환경에서 실행하지 않았으며 서버 테스트와 독립 검토 대기입니다.** 서버는 Java 21, 오프라인·자원 제한과 `JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1'`을 유지한 `/opt/gradle/bin/gradle test` 전체 실행 결과를 별도로 기록해야 합니다. 위의 이전 후보 실패 기록은 이번 변경의 검증 결과가 아닙니다. 바이낸스 공통 MCP 연결과 실계정 원본 대조는 남아 있으며 실계정은 미검증입니다.
 
 ## 현재 Trade로 표현할 수 있는 범위
 

@@ -36,6 +36,7 @@ class TradeLedgerConfiguration {
 				return specifications.stream().map(candidate -> {
 					if (!(candidate instanceof SyncToolSpecification specification)
 							|| !("get_upbit_order".equals(specification.tool().name())
+									|| "get_upbit_order_executions".equals(specification.tool().name())
 									|| "get_upbit_closed_orders".equals(specification.tool().name())
 									|| "get_binance_account_trades".equals(specification.tool().name()))) {
 						return candidate;
