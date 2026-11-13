@@ -66,6 +66,47 @@ class UpbitClosedOrdersMapperTest {
 	}
 
 	@Test
+	void requiresExactRequestedMarketAndRejectsTheWholeResponseOnLaterMismatch() {
+		var request = new UpbitClosedOrdersRequest("KRW-BTC", null, null, null, null, null, null);
+		String matching = order(1, "done");
+		assertThat(mapper.map(array(matching), request).orders()).extracting("market")
+				.containsExactly("KRW-BTC");
+		for (String market : List.of("KRW-ETH", "krw-btc", "KRW-BTC ", "secret-marker")) {
+			String mismatch = text(order(2, "cancel"), "market", market);
+			reject(array(mismatch), request);
+			reject(array(matching, mismatch), request);
+		}
+		assertThat(mapper.map(array(matching, text(order(2, "cancel"), "market", "KRW-ETH")), defaults)
+				.orders()).extracting("market").containsExactly("KRW-BTC", "KRW-ETH");
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"done", "cancel"})
+	void requiresRequestedStateForBothScalarAndSingleElementSelections(String state) {
+		String matching = order(1, state);
+		String mismatch = order(2, state.equals("done") ? "cancel" : "done");
+		for (var request : List.of(
+				new UpbitClosedOrdersRequest(null, state, null, null, null, null, null),
+				new UpbitClosedOrdersRequest(null, null, List.of(state), null, null, null, null))) {
+			var accepted = mapper.map(array(matching), request).orders().getFirst();
+			assertThat(accepted.state()).isEqualTo(state);
+			assertThat(accepted.executedVolume()).isEqualTo("0.0000000000000000000200");
+			reject(array(mismatch), request);
+			reject(array(matching, mismatch), request);
+		}
+	}
+
+	@Test
+	void preservesMixedStatesForDefaultAndBothExplicitStateOrders() {
+		String json = array(order(1, "done"), order(2, "cancel"));
+		for (var request : List.of(defaults,
+				new UpbitClosedOrdersRequest(null, null, List.of("done", "cancel"), null, null, null, null),
+				new UpbitClosedOrdersRequest(null, null, List.of("cancel", "done"), null, null, null, null))) {
+			assertThat(mapper.map(json, request).orders()).extracting("state").containsExactly("done", "cancel");
+		}
+	}
+
+	@Test
 	void flagsOnlyLimitSizedResultsAndEnforcesBothItemCaps() {
 		var one = request(1);
 		assertThat(mapper.map(array(order(1, "done")), one).possiblyTruncated()).isTrue();

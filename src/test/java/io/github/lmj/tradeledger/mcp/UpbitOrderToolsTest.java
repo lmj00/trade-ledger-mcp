@@ -864,6 +864,70 @@ class UpbitOrderToolsTest {
 	}
 
 	@Test
+	void closedOrdersRejectsRequestedScopeMismatchesThroughRegisteredHandler() {
+		record Scope(Map<String, Object> arguments, String matching, String mismatch) { }
+		String done = summary(ID, "done", "2", "0.3000");
+		List<Scope> scopes = new ArrayList<>();
+		scopes.add(new Scope(Map.of("market", "KRW-BTC"), done, done.replace("KRW-BTC", "KRW-ETH")));
+		for (String state : List.of("done", "cancel")) {
+			String matching = summary(ID, state, "2", "0.3000");
+			String mismatch = summary(ID, state.equals("done") ? "cancel" : "done", "2", "0.3000");
+			scopes.add(new Scope(Map.of("state", state), matching, mismatch));
+			scopes.add(new Scope(Map.of("states", List.of(state)), matching, mismatch));
+		}
+		// Include fake keys, the actual request JWT and private text in ignored fields.
+		server.ignoredBytes.set("safe".getBytes(StandardCharsets.UTF_8));
+		int calls = 0;
+		for (Scope scope : scopes) {
+			server.body.set("[" + scope.matching() + "]");
+			CallToolResult accepted = callClosed(scope.arguments());
+			assertThat(accepted.isError()).isNotEqualTo(Boolean.TRUE);
+			List<?> orders = (List<?>) asMap(accepted.structuredContent()).get("orders");
+			assertThat(orders).hasSize(1);
+			assertThat(asMap(orders.getFirst())).containsEntry("market", "KRW-BTC")
+					.containsEntry("executedVolume", "0.3000");
+			assertMatchingSuccessContent(accepted);
+			assertNoSecrets(accepted);
+			assertThat(server.requests).hasValue(++calls);
+			String later = scope.mismatch().replace(ID, "123e4567-e89b-12d3-a456-426614174001");
+			for (String json : List.of("[" + later + "]", "[" + scope.matching() + "," + later + "]")) {
+				server.body.set(json);
+				CallToolResult rejected = callClosed(scope.arguments());
+				assertSafeError(rejected, "INVALID_RESPONSE");
+				assertThat(rejected.content().toString()).doesNotContain("Exception", "Caused by:", "\tat ");
+				assertThat(server.requests).hasValue(++calls);
+			}
+		}
+		assertThat(server.paths).hasSize(calls)
+				.allSatisfy(target -> assertThat(target).startsWith("GET /v1/orders/closed?"));
+	}
+
+	@Test
+	void closedOrdersAllowsMixedMarketsAndBothStatesForDefaultAndExplicitSelections() {
+		server.body.set("[" + summary(ID, "done", "2", "0.3000") + ","
+				+ summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "1", "0.1000")
+						.replace("KRW-BTC", "KRW-ETH") + "]");
+		server.ignoredBytes.set("safe".getBytes(StandardCharsets.UTF_8));
+		int calls = 0;
+		for (Map<String, Object> arguments : List.of(Map.<String, Object>of(),
+				Map.<String, Object>of("states", List.of("done", "cancel")),
+				Map.<String, Object>of("states", List.of("cancel", "done")))) {
+			CallToolResult result = callClosed(arguments);
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			List<?> orders = (List<?>) asMap(result.structuredContent()).get("orders");
+			assertThat(orders).hasSize(2);
+			assertThat(asMap(orders.getFirst())).containsEntry("market", "KRW-BTC").containsEntry("state", "done");
+			assertThat(asMap(orders.get(1))).containsEntry("market", "KRW-ETH").containsEntry("state", "cancel")
+					.containsEntry("executedVolume", "0.1000");
+			assertMatchingSuccessContent(result);
+			assertNoSecrets(result);
+			assertThat(server.requests).hasValue(++calls);
+		}
+		assertThat(server.paths).hasSize(calls)
+				.allSatisfy(target -> assertThat(target).startsWith("GET /v1/orders/closed?"));
+	}
+
+	@Test
 	void closedOrdersRejectsResponseBeyondRequestedLimitWithoutMoreRequests() {
 		server.body.set("[" + summary(ID, "done", "1", "0.1000") + ","
 				+ summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "0", "0.0000") + "]");

@@ -60,6 +60,13 @@ public final class UpbitClosedOrdersMapper {
 				if (!state.equals("done") && !state.equals("cancel")) {
 					throw invalid();
 				}
+				String market = text(node, "market");
+				if (request.market() != null && !request.market().equals(market)) {
+					throw invalid();
+				}
+				if (request.state() != null ? !request.state().equals(state) : !request.states().contains(state)) {
+					throw invalid();
+				}
 				JsonNode count = node.get("trades_count");
 				if (count == null || !count.isIntegralNumber()) {
 					throw invalid();
@@ -68,7 +75,7 @@ public final class UpbitClosedOrdersMapper {
 				if (tradesCount.signum() < 0) {
 					throw invalid();
 				}
-				orders.add(new Order(id, text(node, "market"), text(node, "side"), text(node, "ord_type"),
+				orders.add(new Order(id, market, text(node, "side"), text(node, "ord_type"),
 						state, OffsetDateTime.parse(text(node, "created_at")).toInstant(),
 						decimal(node, "executed_volume"), decimal(node, "paid_fee"), tradesCount));
 			}

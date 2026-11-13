@@ -553,6 +553,70 @@ class UpbitOrderClientTest {
 	}
 
 	@Test
+	void rejectsClosedOrdersOutsideRequestedMarketOrStatesWithOneGetPerCall() throws Exception {
+		record Scope(UpbitClosedOrdersRequest request, String matching, String mismatch) { }
+		List<Scope> scopes = new ArrayList<>();
+		scopes.add(new Scope(new UpbitClosedOrdersRequest("KRW-BTC", null, null, null, null, null, null),
+				CLOSED_ORDER, CLOSED_ORDER.replace("KRW-BTC", "KRW-ETH")));
+		for (String state : List.of("done", "cancel")) {
+			String matching = CLOSED_ORDER.replace("\"done\"", "\"" + state + "\"");
+			String mismatch = CLOSED_ORDER.replace("\"done\"", state.equals("done") ? "\"cancel\"" : "\"done\"");
+			scopes.add(new Scope(new UpbitClosedOrdersRequest(null, state, null, null, null, null, null),
+					matching, mismatch));
+			scopes.add(new Scope(new UpbitClosedOrdersRequest(null, null, List.of(state), null, null, null, null),
+					matching, mismatch));
+		}
+		AtomicReference<String> body = new AtomicReference<>();
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			reply(exchange, 200, withIgnoredBytes(body.get(), "safe".getBytes(StandardCharsets.UTF_8),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client(true);
+			int calls = 0;
+			for (Scope scope : scopes) {
+				body.set("[" + scope.matching() + "]");
+				assertThat(client.getClosedOrders(scope.request()).orders()).hasSize(1);
+				assertThat(requests).hasSize(++calls);
+				String later = scope.mismatch().replace(ID, "123e4567-e89b-12d3-a456-426614174001");
+				for (String json : List.of("[" + later + "]", "[" + scope.matching() + "," + later + "]")) {
+					body.set(json);
+					expect(UpbitErrorCode.INVALID_RESPONSE, () -> client.getClosedOrders(scope.request()), tokens);
+					assertThat(requests).hasSize(++calls);
+				}
+			}
+			assertThat(requests).allSatisfy(target -> assertThat(target).startsWith("GET /v1/orders/closed?"));
+		}
+	}
+
+	@Test
+	void allowsMixedMarketsAndClosedStatesWhenTheRequestSelectsBothStates() throws Exception {
+		String cancelled = CLOSED_ORDER.replace(ID, "123e4567-e89b-12d3-a456-426614174001")
+				.replace("KRW-BTC", "KRW-ETH").replace("\"done\"", "\"cancel\"");
+		AtomicInteger requests = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.incrementAndGet();
+			reply(exchange, 200, "[" + CLOSED_ORDER + "," + cancelled + "]");
+		})) {
+			UpbitOrderClient client = server.client(true);
+			int calls = 0;
+			for (var request : List.of(new UpbitClosedOrdersRequest(),
+					new UpbitClosedOrdersRequest(null, null, List.of("done", "cancel"), null, null, null, null),
+					new UpbitClosedOrdersRequest(null, null, List.of("cancel", "done"), null, null, null, null))) {
+				var orders = client.getClosedOrders(request).orders();
+				assertThat(orders).extracting("market").containsExactly("KRW-BTC", "KRW-ETH");
+				assertThat(orders).extracting("state").containsExactly("done", "cancel");
+				assertThat(orders.get(1).executedVolume()).isEqualTo("0.0000000000000000000200");
+				assertThat(requests).hasValue(++calls);
+			}
+		}
+	}
+
+	@Test
 	void rejectsInvalidClosedResponsesWithoutPartialResultsOrSensitiveDiagnostics() throws Exception {
 		String second = CLOSED_ORDER.replace(ID, "123e4567-e89b-12d3-a456-426614174001");
 		List<String> invalid = new ArrayList<>(List.of("[", "null", "{}", "[{}]", BODY_MARKER,
