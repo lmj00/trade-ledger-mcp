@@ -212,6 +212,81 @@ class UpbitOrderMapperTest {
 		reject(amount("paid_fee", "secret-marker"));
 	}
 
+	@ParameterizedTest
+	@ValueSource(ints = {0, 1, 2})
+	void boundsIgnoredTokensAtRootFillAndNestedLevels(int location) {
+		for (String value : List.of("\"" + "x".repeat(256) + "\"",
+				"\"" + "\\u0078".repeat(256) + "\"", "\"" + "😀".repeat(128) + "\"",
+				"1".repeat(128), "-" + "1".repeat(127),
+				"0." + "0".repeat(125) + "1", "1." + "0".repeat(122) + "e+00")) {
+			assertThat(mapper.map(ignored(location, "ignored", value)).trades()).hasSize(1);
+		}
+		for (String value : List.of("\"" + "x".repeat(257) + "\"",
+				"\"" + "\\u0078".repeat(257) + "\"", "\"" + "😀".repeat(128) + "x\"",
+				"1".repeat(129), "-" + "1".repeat(128),
+				"0." + "0".repeat(126) + "1", "1." + "0".repeat(123) + "e+00")) {
+			reject(ignored(location, "ignored", value));
+		}
+		for (String name : List.of("x".repeat(256), "\\u0078".repeat(256), "😀".repeat(128))) {
+			assertThat(mapper.map(ignored(location, name, "null")).trades()).hasSize(1);
+		}
+		for (String name : List.of("x".repeat(257), "\\u0078".repeat(257), "😀".repeat(128) + "x")) {
+			reject(ignored(location, name, "null"));
+		}
+	}
+
+	@Test
+	void boundsSourceUtf16LengthBeforeParsing() {
+		for (String json : List.of(order("done", fill("first")), ignored(0, "ignored", "\"😀\""))) {
+			String boundary = json + " ".repeat(1_048_576 - json.length());
+			assertThat(mapper.map(boundary).trades()).hasSize(1);
+			reject(boundary + " ");
+		}
+	}
+
+	@Test
+	void boundsDepthIncludingRootAndRejectsVeryDeepInputBeforeTreeCreation() {
+		for (int depth : List.of(64, 65, 10_000)) {
+			for (boolean objects : List.of(false, true)) {
+				String value = (objects ? "{\"n\":" : "[").repeat(depth - 1)
+						+ "0" + (objects ? "}" : "]").repeat(depth - 1);
+				String json = ignored(0, "ignored", value);
+				if (depth == 64) {
+					assertThat(mapper.map(json).trades()).hasSize(1);
+				}
+				else {
+					reject(json);
+				}
+			}
+		}
+	}
+
+	@Test
+	void rejectsLaterIgnoredViolationsAndNestedDuplicateKeysWithoutPartialResults() {
+		reject(order("done", fill("first") + "," + appendField(fill("second"), "ignored",
+				"\"" + "x".repeat(257) + "\"")));
+		reject(ignored(0, "ignored", "{\"n\":1,\"n\":2}"));
+		// Only the root trades array has the execution count policy.
+		assertThat(mapper.map(ignored(0, "ignored", "{\"trades\":[" + "0,".repeat(1000) + "0]}"))
+				.trades()).hasSize(1);
+	}
+
+	private static String ignored(int location, String name, String value) {
+		String trade = fill("first");
+		if (location == 1) {
+			return order("done", appendField(trade, name, value));
+		}
+		if (location == 2) {
+			return appendField(order("done", trade), "ignored", "[{\"nested\":{\"" + name + "\":" + value + "}}]");
+		}
+		return appendField(order("done", trade), name, value);
+	}
+
+	private static String appendField(String json, String name, String value) {
+		int end = json.lastIndexOf('}');
+		return json.substring(0, end) + ",\"" + name + "\":" + value + json.substring(end);
+	}
+
 	private void reject(String json) {
 		assertThatThrownBy(() -> mapper.map(json)).isInstanceOfSatisfying(IllegalArgumentException.class, exception -> {
 			assertThat(exception.getMessage()).startsWith("Invalid Upbit order field:").doesNotContain("secret-marker");

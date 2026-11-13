@@ -11,21 +11,37 @@ import java.util.regex.Pattern;
 import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot;
 import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot.Execution;
 import tools.jackson.core.JacksonException;
+import tools.jackson.core.JsonToken;
+import tools.jackson.core.StreamReadConstraints;
 import tools.jackson.core.StreamReadFeature;
+import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-/** Converts Upbit JSON only; does not infer completed trades or match PnL. */
+/**
+ * Converts Upbit JSON only; does not infer completed trades or match PnL.
+ * Project policy, not exchange limits: at most 1,048,576 UTF-16 code units,
+ * depth 64 including the root object, decoded strings/property names 256 code
+ * units, original number tokens 128 code units, and 1000 trades. Ignored fields
+ * are bounded too, before any tree or execution results are constructed.
+ */
 public final class UpbitOrderMapper {
 
 	// Project policy limits, not claims about limits imposed by Upbit.
 	public static final int MAX_DECIMAL_LENGTH = 128;
 	public static final int MAX_STRING_LENGTH = 256;
 	public static final int MAX_TRADES = 1_000;
+	public static final int MAX_JSON_LENGTH = 1_048_576;
+	public static final int MAX_NESTING_DEPTH = 64;
+	public static final int MAX_NUMBER_LENGTH = 128;
 
 	private static final Pattern DECIMAL = Pattern.compile("[+-]?[0-9]+(?:\\.[0-9]+)?");
-	private static final JsonMapper JSON = JsonMapper.builder()
+	private static final JsonMapper JSON = JsonMapper.builder(JsonFactory.builder()
+			.streamReadConstraints(StreamReadConstraints.builder()
+					.maxNestingDepth(MAX_NESTING_DEPTH).maxStringLength(MAX_STRING_LENGTH)
+					.maxNameLength(MAX_STRING_LENGTH).maxNumberLength(MAX_NUMBER_LENGTH).build())
+			.build())
 			.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
 			.enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
 			.build();
@@ -39,11 +55,12 @@ public final class UpbitOrderMapper {
 		if (serviceId == null || serviceId.isBlank() || serviceId.length() > MAX_STRING_LENGTH) {
 			throw invalid("serviceId");
 		}
-		if (json == null) {
+		if (json == null || json.length() > MAX_JSON_LENGTH) {
 			throw invalid("JSON");
 		}
 		JsonNode order;
 		try {
+			checkTokens(json);
 			order = JSON.readTree(json);
 		}
 		catch (JacksonException exception) {
@@ -85,6 +102,66 @@ public final class UpbitOrderMapper {
 		}
 		return new OrderExecutionSnapshot(serviceId, id, market, side, type, state,
 				createdAt, executedVolume, paidFee, executions);
+	}
+
+	private static void checkTokens(String json) {
+		// A linear token pass checks even ignored values before tree allocation.
+		// Exact lengths complement Jackson's potentially approximate constraints.
+		try (var parser = JSON.createParser(json)) {
+			if (parser.nextToken() != JsonToken.START_OBJECT) {
+				throw invalid("JSON");
+			}
+			int depth = 1;
+			int trades = 0;
+			boolean tradesValue = false;
+			boolean inTrades = false;
+			JsonToken token;
+			while ((token = parser.nextToken()) != null) {
+				if (depth == 0) {
+					throw invalid("JSON");
+				}
+				if (tradesValue) {
+					if (token != JsonToken.START_ARRAY) {
+						throw invalid("trades");
+					}
+					inTrades = true;
+					tradesValue = false;
+				}
+				if (inTrades && depth == 2) {
+					if (token == JsonToken.END_ARRAY) {
+						inTrades = false;
+					}
+					else if (token != JsonToken.START_OBJECT || ++trades > MAX_TRADES) {
+						throw invalid("trades");
+					}
+				}
+				if (token == JsonToken.START_ARRAY || token == JsonToken.START_OBJECT) {
+					if (++depth > MAX_NESTING_DEPTH) {
+						throw invalid("JSON");
+					}
+				}
+				else if (token == JsonToken.END_ARRAY || token == JsonToken.END_OBJECT) {
+					depth--;
+				}
+				else if (token == JsonToken.PROPERTY_NAME || token == JsonToken.VALUE_STRING) {
+					String text = parser.getString();
+					if (text.length() > MAX_STRING_LENGTH) {
+						throw invalid("JSON");
+					}
+					if (depth == 1 && token == JsonToken.PROPERTY_NAME && text.equals("trades")) {
+						tradesValue = true;
+					}
+				}
+				else if (token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT) {
+					if (parser.getString().length() > MAX_NUMBER_LENGTH) {
+						throw invalid("JSON");
+					}
+				}
+			}
+			if (depth != 0) {
+				throw invalid("JSON");
+			}
+		}
 	}
 
 	private static void object(JsonNode node, String field) {

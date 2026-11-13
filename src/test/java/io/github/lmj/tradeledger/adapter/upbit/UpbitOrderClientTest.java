@@ -712,6 +712,49 @@ class UpbitOrderClientTest {
 		}
 	}
 
+	@Test
+	void rejectsOverPolicyTokensInHttp200WithOneGetAndSanitizedErrors() throws Exception {
+		AtomicReference<String> extra = new AtomicReference<>();
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		String fill = """
+				{"uuid":"fill-1","market":"KRW-BTC","side":"bid","price":"1.2300",
+				"volume":"0.0200","funds":"0.024600","created_at":"2026-07-01T01:00:00Z"}
+				""";
+		String order = ORDER.replace("\"trades\":[]", "\"trades\":[" + fill + "]");
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			int end = order.lastIndexOf('}');
+			String body = order.substring(0, end) + "," + extra.get() + order.substring(end);
+			reply(exchange, 200, withIgnoredBytes(body, "valid".getBytes(StandardCharsets.UTF_8),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client();
+			int calls = 0;
+			for (int overflow : List.of(0, 1)) {
+				int stringLength = 256 + overflow;
+				int numberLength = 128 + overflow;
+				int arrays = 63 + overflow; // Root object adds one to the depth.
+				for (String field : List.of("\"ignored\":\"" + "\\u0078".repeat(stringLength) + "\"",
+						"\"" + "x".repeat(stringLength) + "\":null",
+						"\"ignored\":0." + "0".repeat(numberLength - 3) + "1",
+						"\"ignored\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays))) {
+					extra.set(field);
+					if (overflow == 0) {
+						assertThat(client.getOrder(ID).trades()).hasSize(1);
+					}
+					else {
+						expect(UpbitErrorCode.INVALID_RESPONSE, () -> client.getOrder(ID), tokens);
+					}
+					assertThat(requests).hasSize(++calls).allSatisfy(request ->
+							assertThat(request).isEqualTo("GET /v1/order?uuid=" + ID));
+				}
+			}
+		}
+	}
+
 	@ParameterizedTest
 	@CsvSource({ID + "," + ID, ID + "," + UPPER_ID, UPPER_ID + "," + ID, UPPER_ID + "," + UPPER_ID})
 	void acceptsMatchingResponseIdsAndPreservesAmountsAndFills(String requestId, String responseId) throws Exception {
@@ -1161,7 +1204,8 @@ class UpbitOrderClientTest {
 			exception.printStackTrace(new PrintWriter(trace));
 			assertThat(exception.getMessage() + exception + trace)
 					.doesNotContain(UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET, BODY_MARKER,
-							"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length");
+							"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length",
+							"StreamConstraintsException", "JsonParseException", "[Source:", "line: ", "column: ");
 			if (responseIds.length > 0) {
 				assertThat(exception.getMessage() + exception + trace).doesNotContain(responseIds);
 			}

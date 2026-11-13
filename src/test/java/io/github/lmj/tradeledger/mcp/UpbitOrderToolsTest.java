@@ -387,6 +387,44 @@ class UpbitOrderToolsTest {
 		}
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions"})
+	void bothRegisteredHandlersEnforceTokenPolicyWithoutPartialResultsOrLeaks(String name) {
+		// Add fake keys and the actual local JWT in bounded ignored fields.
+		server.ignoredBytes.set("valid".getBytes(StandardCharsets.UTF_8));
+		int calls = 0;
+		for (int overflow : List.of(0, 1)) {
+			int stringLength = 256 + overflow;
+			int numberLength = 128 + overflow;
+			int arrays = 63 + overflow; // Root object adds one to the depth.
+			// Keep policy fields distinct from withIgnoredBytes' injected "ignored" field.
+			for (String field : List.of("\"policyBoundary\":\"" + "\\u0078".repeat(stringLength) + "\"",
+					"\"" + "x".repeat(stringLength) + "\":null",
+					"\"policyBoundary\":1." + "0".repeat(numberLength - 6) + "e+00",
+					"\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays))) {
+				int end = ORDER.lastIndexOf('}');
+				server.body.set(ORDER.substring(0, end) + "," + field + ORDER.substring(end));
+				CallToolResult result = callValidTool(name);
+				if (overflow == 0) {
+					assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+					Map<String, Object> snapshot = asMap(result.structuredContent());
+					assertThat((List<?>) snapshot.get(name.equals("get_upbit_order") ? "trades" : "executions"))
+							.hasSize(2);
+					assertMatchingSuccessContent(result);
+					assertNoSecrets(result);
+				}
+				else {
+					assertSafeError(result, "INVALID_RESPONSE");
+					assertThat(result.toString()).doesNotContain(ID, "fill-1", "fill-2", "0.12345678901234567800");
+				}
+				assertThat(server.requests).hasValue(++calls);
+				assertThat(server.credentialReads).hasValue(calls);
+				assertThat(server.paths).hasSize(calls).allSatisfy(path ->
+						assertThat(path).isEqualTo("GET /v1/order?uuid=" + ID));
+			}
+		}
+	}
+
 	@Test
 	void commonHandlerDiscardsConversionDetailsWithoutAnotherQuery() {
 		// The existing HTTP mapper accepts text sides; the common model rejects unknown sides.
@@ -1221,7 +1259,8 @@ class UpbitOrderToolsTest {
 		}
 		for (String observation : observations) {
 			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "Bearer ", "eyJ",
-					"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length");
+					"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length",
+					"StreamConstraintsException", "JsonParseException", "[Source:", "line: ", "column: ");
 			for (String token : server.tokens) {
 				assertThat(observation).doesNotContain(token, token.substring(7));
 			}
