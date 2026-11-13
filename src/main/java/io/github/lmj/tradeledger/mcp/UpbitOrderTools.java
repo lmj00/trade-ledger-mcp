@@ -1,7 +1,10 @@
 package io.github.lmj.tradeledger.mcp;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
@@ -148,7 +151,8 @@ public final class UpbitOrderTools {
 	private static IllegalStateException safeFailure(RuntimeException exception) {
 		// Lazy bean creation can wrap the client's safe exception. Discard every cause
 		// before handing an error to MCP, whose handler selects the innermost message.
-		for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+		Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+		for (Throwable cause = exception; cause != null && visited.add(cause); cause = cause.getCause()) {
 			if (cause instanceof UpbitApiException safe) {
 				return new IllegalStateException("Upbit request failed: " + safe.code().name());
 			}

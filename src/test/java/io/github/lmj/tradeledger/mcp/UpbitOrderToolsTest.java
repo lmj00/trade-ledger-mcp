@@ -489,7 +489,16 @@ class UpbitOrderToolsTest {
 
 	@ParameterizedTest
 	@MethodSource("invalidClosedRequests")
+	@SuppressWarnings("unchecked")
 	void closedOrdersRejectsInvalidRequestsWithoutHttpEvenWhenKeysAreMissing(Map<String, Object> arguments) {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		assertThatThrownBy(() -> new UpbitOrderTools(provider).getUpbitClosedOrders(
+				(String) arguments.get("market"), (String) arguments.get("state"),
+				(List<String>) arguments.get("states"), (String) arguments.get("startTime"),
+				(String) arguments.get("endTime"), (Integer) arguments.get("limit"),
+				(String) arguments.get("orderBy")))
+				.hasMessage("Upbit request failed: BAD_REQUEST").hasNoCause();
+		verifyNoInteractions(provider);
 		server.keys.set(Map.of());
 		assertSafeError(callClosed(arguments), "BAD_REQUEST");
 		assertThat(server.requests).hasValue(0);
@@ -517,6 +526,8 @@ class UpbitOrderToolsTest {
 				.isInstanceOf(IllegalArgumentException.class)
 				.hasMessage("Upbit request failed: BAD_REQUEST").hasNoCause();
 		assertThatThrownBy(() -> tools.getUpbitOrder(MARKER + ACCESS + SECRET))
+				.hasMessage("Upbit request failed: INVALID_UUID").hasNoCause();
+		assertThatThrownBy(() -> tools.getUpbitOrderExecutions("", MARKER + ACCESS + SECRET))
 				.hasMessage("Upbit request failed: INVALID_UUID").hasNoCause();
 		verifyNoInteractions(provider);
 	}
@@ -546,6 +557,135 @@ class UpbitOrderToolsTest {
 				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
 		assertThatThrownBy(() -> tools.getUpbitOrderExecutions("main", ID))
 				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	@SuppressWarnings("unchecked")
+	void initializationCauseGraphsTerminateAndKeepSafeCategories(String name) {
+		String methodName = switch (name) {
+			case "get_upbit_order" -> "getUpbitOrder";
+			case "get_upbit_order_executions" -> "getUpbitOrderExecutions";
+			case "get_upbit_closed_orders" -> "getUpbitClosedOrders";
+			default -> throw new AssertionError("Unknown test tool");
+		};
+		for (String shape : List.of("cycle", "safeCycle", "chain", "safeChain")) {
+			for (boolean registered : List.of(false, true)) {
+				BoundedCause first = new BoundedCause();
+				BoundedCause second = new BoundedCause();
+				first.addSuppressed(new IllegalStateException(MARKER + ACCESS + SECRET));
+				first.next = second;
+				boolean safe = shape.startsWith("safe");
+				boolean cycle = shape.endsWith("Cycle") || shape.equals("cycle");
+				if (safe) {
+					UpbitApiException category = mock(UpbitApiException.class);
+					when(category.code()).thenReturn(UpbitErrorCode.MISSING_CREDENTIALS);
+					when(category.getCause()).thenReturn(cycle ? first : null);
+					second.next = category;
+				}
+				else {
+					second.next = cycle ? first : null;
+				}
+				String category = safe ? "MISSING_CREDENTIALS" : "INTERNAL_ERROR";
+				ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+				doThrow(first).when(provider).getObject();
+				UpbitOrderTools tools = new UpbitOrderTools(provider);
+				if (registered) {
+					AtomicReference<CallToolResult> observed = new AtomicReference<>();
+					new ApplicationContextRunner().withUserConfiguration(FailureConfiguration.class)
+							.withBean(UpbitOrderTools.class, () -> tools)
+							.withPropertyValues("spring.ai.mcp.server.type=SYNC",
+									"spring.ai.mcp.server.stdio=true")
+							.run(application -> {
+								assertThat(application).hasNotFailed();
+								CallToolResult result = call(application, name, validArguments(name));
+								observed.set(result);
+								assertSafeError(result, category);
+								assertThat(result.content()).hasSize(1).allSatisfy(content ->
+										assertThat(((TextContent) content).text())
+												.isEqualTo("Error invoking method: " + methodName
+														+ "\nUpbit request failed: " + category));
+							});
+					// Include context shutdown in the collected-log checks.
+					assertNoSecrets(observed.get());
+					assertNoFailureDetails(observed.get());
+				}
+				else {
+					assertThatThrownBy(() -> invokeValidTool(tools, name))
+							.isInstanceOf(IllegalStateException.class)
+							.hasMessage("Upbit request failed: " + category).hasNoCause()
+							.satisfies(failure -> assertThat(failure.getSuppressed()).isEmpty());
+				}
+				assertThat(first.reads).isEqualTo(1);
+				assertThat(second.reads).isEqualTo(1);
+				verify(provider).getObject();
+				verifyNoMoreInteractions(provider);
+				assertThat(server.requests).hasValue(0);
+				assertThat(server.credentialReads).hasValue(0);
+			}
+		}
+	}
+
+	private static Map<String, Object> validArguments(String name) {
+		return switch (name) {
+			case "get_upbit_order" -> Map.of("uuid", ID);
+			case "get_upbit_order_executions" -> Map.of("uuid", ID, "accountAlias", "main");
+			case "get_upbit_closed_orders" -> Map.of();
+			default -> throw new AssertionError("Unknown test tool");
+		};
+	}
+
+	private static void invokeValidTool(UpbitOrderTools tools, String name) {
+		switch (name) {
+			case "get_upbit_order" -> tools.getUpbitOrder(ID);
+			case "get_upbit_order_executions" -> tools.getUpbitOrderExecutions("main", ID);
+			case "get_upbit_closed_orders" ->
+					tools.getUpbitClosedOrders(null, null, null, null, null, null, null);
+			default -> throw new AssertionError("Unknown test tool");
+		}
+	}
+
+	private void assertNoFailureDetails(CallToolResult result) {
+		List<String> observations = new ArrayList<>(List.of(result.toString()));
+		for (ILoggingEvent event : logs.list) {
+			observations.add(event.getFormattedMessage());
+			if (event.getThrowableProxy() != null) {
+				observations.add(ThrowableProxyUtil.asString(event.getThrowableProxy()));
+			}
+		}
+		for (String observation : observations) {
+			assertThat(observation).doesNotContain(ACCESS, SECRET, MARKER, "raw-initialization-failure",
+					"BoundedCause", "Caused by:", "\tat ");
+		}
+	}
+
+	// Equal values deliberately represent distinct objects: traversal must use identity.
+	// A broken traversal fails after bounded reads instead of hanging the test worker.
+	private static final class BoundedCause extends RuntimeException {
+		private Throwable next;
+		private int reads;
+
+		BoundedCause() {
+			super("raw-initialization-failure " + MARKER + ACCESS + SECRET);
+		}
+
+		@Override
+		public synchronized Throwable getCause() {
+			if (++reads > 8) {
+				throw new AssertionError("Cause traversal exceeded its test bound");
+			}
+			return next;
+		}
+
+		@Override
+		public boolean equals(Object other) {
+			return other instanceof BoundedCause;
+		}
+
+		@Override
+		public int hashCode() {
+			return 1;
+		}
 	}
 
 	@Test
@@ -908,6 +1048,11 @@ class UpbitOrderToolsTest {
 	@ComponentScan(basePackageClasses = TradeJournalProperties.class)
 	@Import({TradeLedgerTools.class, UpbitOrderTools.class, BinanceAccountTradesTools.class})
 	static class ProbeConfiguration {
+	}
+
+	@TestConfiguration(proxyBeanMethods = false)
+	@EnableAutoConfiguration
+	static class FailureConfiguration {
 	}
 
 	@TestConfiguration(proxyBeanMethods = false)
