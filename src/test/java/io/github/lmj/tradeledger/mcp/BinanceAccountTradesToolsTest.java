@@ -200,8 +200,9 @@ class BinanceAccountTradesToolsTest {
 		}
 	}
 
-	@Test
-	void invalidOrderIdsAndTimeCombinationsNeverObtainProviderOrSendHttp() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void invalidOrderIdsAndTimeCombinationsNeverObtainProviderOrSendHttp(String name) {
 		@SuppressWarnings("unchecked")
 		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
 		var tools = new BinanceAccountTradesTools(provider);
@@ -224,9 +225,13 @@ class BinanceAccountTradesToolsTest {
 					filters.get("fromId"), filters.get("startTime"), filters.get("endTime"), filters.get("orderId")))
 					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
 					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			assertThatThrownBy(() -> tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null,
+					filters.get("fromId"), filters.get("startTime"), filters.get("endTime"), filters.get("orderId")))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
 			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
 			args.putAll(filters);
-			CallToolResult result = call(args);
+			CallToolResult result = call(context, name, args);
 			assertSafeError(result, "BAD_REQUEST");
 			assertThat(result.structuredContent()).isNull();
 		}
@@ -234,8 +239,9 @@ class BinanceAccountTradesToolsTest {
 		assertThat(server.requests).hasValue(0);
 	}
 
-	@Test
-	void registeredOrderMismatchAndFromIdViolationFailWithoutPartialContent() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void registeredOrderMismatchAndFromIdViolationFailWithoutPartialContent(String name) {
 		for (boolean withFromId : List.of(false, true)) {
 			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
 			args.put("orderId", "9223372036854775807");
@@ -248,7 +254,7 @@ class BinanceAccountTradesToolsTest {
 				for (String body : List.of("[" + fill + "]", "[" + FILL + "," + fill + "]")) {
 					server.body.set(body.replace("{", "{\"private\":\"" + MARKER + KEY + SECRET + "\","));
 					int before = server.requests.get();
-					CallToolResult result = call(args);
+					CallToolResult result = call(context, name, args);
 					assertSafeError(result, "INVALID_RESPONSE");
 					assertThat(result.structuredContent()).isNull();
 					assertThat(server.requests).hasValue(before + 1);
@@ -296,8 +302,9 @@ class BinanceAccountTradesToolsTest {
 		}
 	}
 
-	@Test
-	void invalidTimeFiltersNeverObtainLazyClientOrSendHttp() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void invalidTimeFiltersNeverObtainLazyClientOrSendHttp(String name) {
 		@SuppressWarnings("unchecked")
 		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
 		var tools = new BinanceAccountTradesTools(provider);
@@ -319,16 +326,21 @@ class BinanceAccountTradesToolsTest {
 					filters.get("fromId"), filters.get("startTime"), filters.get("endTime")))
 					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
 					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			assertThatThrownBy(() -> tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null,
+					filters.get("fromId"), filters.get("startTime"), filters.get("endTime"), filters.get("orderId")))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
 			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
 			args.putAll(filters);
-			assertSafeError(call(args), "BAD_REQUEST");
+			assertSafeError(call(context, name, args), "BAD_REQUEST");
 		}
 		verifyNoInteractions(provider);
 		assertThat(server.requests).hasValue(0);
 	}
 
-	@Test
-	void registeredTimeFiltersRejectOutOfBoundsWithoutPartialResults() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void registeredTimeFiltersRejectOutOfBoundsWithoutPartialResults(String name) {
 		for (int mode = 0; mode < 3; mode++) {
 			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
 			if (mode != 1) {
@@ -345,7 +357,7 @@ class BinanceAccountTradesToolsTest {
 						.replace("\"id\":9007199254740993", "\"id\":1");
 				for (String body : List.of("[" + outside + "]", "[" + FILL + "," + outside + "]")) {
 					server.body.set(body);
-					CallToolResult result = call(args);
+					CallToolResult result = call(context, name, args);
 					assertSafeError(result, "INVALID_RESPONSE");
 					assertThat(result.structuredContent()).isNull();
 				}
@@ -382,8 +394,96 @@ class BinanceAccountTradesToolsTest {
 				.tool().inputSchema());
 		assertThat(asMap(tools.stream().filter(spec -> spec.tool().name().equals(EXECUTIONS_NAME))
 				.findFirst().orElseThrow().tool().inputSchema().get("properties")))
-				.containsOnlyKeys("accountAlias", "symbol", "limit");
-		assertThat(commonSchema.get("properties").has("fromId")).isFalse();
+				.containsOnlyKeys("accountAlias", "symbol", "limit", "fromId", "startTime", "endTime", "orderId");
+		for (String field : List.of("fromId", "startTime", "endTime", "orderId")) {
+			assertThat(commonSchema.get("properties").get(field).get("type").asString()).isEqualTo("string");
+		}
+		assertThat(commonSchema.get("required")).isEqualTo(mapper.valueToTree(List.of("accountAlias", "symbol")));
+	}
+
+	@Test
+	void commonFilteredHandlerSendsExactFiltersOnceAndPreservesProjection() throws Exception {
+		List<Map<String, String>> filters = new ArrayList<>();
+		for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+			filters.add(Map.of("fromId", id));
+			filters.add(Map.of("orderId", id));
+			filters.add(Map.of("orderId", id, "fromId", id));
+			filters.add(Map.of("startTime", id));
+			filters.add(Map.of("endTime", id));
+			filters.add(Map.of("startTime", id, "endTime", id));
+		}
+		filters.add(Map.of("startTime", "0", "endTime", "86400000"));
+		filters.add(Map.of("startTime", "9223372036768375807", "endTime", "9223372036854775807"));
+		for (Map<String, String> filter : filters) {
+			String id = filter.getOrDefault("fromId", "9007199254740993");
+			String order = filter.getOrDefault("orderId", "9223372036854775807");
+			String time = filter.getOrDefault("startTime", filter.getOrDefault("endTime", "1499865549590"));
+			String fill = FILL.replace("\"id\":9007199254740993", "\"id\":" + id)
+					.replace("\"orderId\":9223372036854775807", "\"orderId\":" + order)
+					.replace("1499865549590", time);
+			for (boolean empty : List.of(false, true)) {
+				server.body.set(empty ? "[]" : "[" + fill + "]");
+				Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 1);
+				args.putAll(filter);
+				int before = server.requests.get();
+				CallToolResult result = call(context, EXECUTIONS_NAME, args);
+				assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+				assertThat(server.requests).hasValue(before + 1);
+				String query = "symbol=BTCUSDT&limit=1";
+				for (String field : List.of("fromId", "startTime", "endTime", "orderId")) {
+					if (filter.containsKey(field)) { query += "&" + field + "=" + filter.get(field); }
+				}
+				query += "&recvWindow=5000&timestamp=1700000000123";
+				assertSignedQuery(query);
+				Map<String, Object> response = asMap(result.structuredContent());
+				assertThat(response).containsOnlyKeys("serviceId", "accountAlias", "symbol", "queryScope", "orderId",
+						"possiblyTruncated", "executions", "fees")
+						.containsEntry("queryScope", "FILTERED_SYMBOL").containsEntry("orderId", null)
+						.containsEntry("possiblyTruncated", !empty);
+				List<?> executions = (List<?>) response.get("executions");
+				List<?> fees = (List<?>) response.get("fees");
+				assertThat(executions).hasSize(empty ? 0 : 1);
+				assertThat(fees).hasSize(empty ? 0 : 1);
+				if (!empty) {
+					assertThat(asMap(executions.getFirst())).containsEntry("executionId", id).containsEntry("orderId", order)
+							.containsEntry("price", "9007199254740993.12345678900")
+							.containsEntry("quantity", "0.02000000000000000100")
+							.containsEntry("amount", "180143985094819.87147665314740999300")
+							.containsEntry("executedAt", Instant.ofEpochMilli(Long.parseLong(time)).toString());
+					assertThat(asMap(fees.getFirst())).containsEntry("scope", "FILL").containsEntry("targetId", id)
+							.containsEntry("amount", "0.00001000000000000000").containsEntry("currency", "BNB");
+				}
+				assertMatchingSuccessContent(result);
+				assertNoSecrets(result);
+			}
+		}
+	}
+
+	@Test
+	void legacyCommonJavaCallAndOmittedRegisteredFiltersKeepRecentQuery() throws Exception {
+		server.body.set("[]");
+		var tools = new BinanceAccountTradesTools(context.getBeanProvider(BinanceAccountTradesClient.class));
+		assertThat(tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null).queryScope()).isEqualTo("RECENT_SYMBOL");
+		assertSignedQuery("symbol=BTCUSDT&limit=500&recvWindow=5000&timestamp=1700000000123");
+		CallToolResult result = call(context, EXECUTIONS_NAME, arguments(ALIAS, "BTCUSDT", null));
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(result.structuredContent())).containsEntry("queryScope", "RECENT_SYMBOL")
+				.containsEntry("orderId", null).containsEntry("possiblyTruncated", false);
+		assertSignedQuery("symbol=BTCUSDT&limit=500&recvWindow=5000&timestamp=1700000000123");
+		assertThat(server.requests).hasValue(2);
+		assertNoSecrets(result);
+	}
+
+	private void assertSignedQuery(String expectedQuery) throws Exception {
+		String path = server.paths.getLast();
+		assertThat(path).startsWith("GET /api/v3/myTrades?");
+		String rawQuery = path.substring(path.indexOf('?') + 1);
+		String[] parts = rawQuery.split("&signature=", -1);
+		assertThat(parts).hasSize(2);
+		assertThat(parts[0]).isEqualTo(expectedQuery);
+		var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+		mac.init(new javax.crypto.spec.SecretKeySpec(SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+		assertThat(parts[1]).isEqualTo(java.util.HexFormat.of().formatHex(mac.doFinal(parts[0].getBytes(StandardCharsets.UTF_8))));
 	}
 
 	@Test
@@ -416,8 +516,9 @@ class BinanceAccountTradesToolsTest {
 		assertNoSecrets(empty);
 	}
 
-	@Test
-	void rejectsInvalidFromIdBeforeLazyProviderAndHttp() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void rejectsInvalidFromIdBeforeLazyProviderAndHttp(String name) {
 		@SuppressWarnings("unchecked")
 		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
 		var tools = new BinanceAccountTradesTools(provider);
@@ -426,22 +527,26 @@ class BinanceAccountTradesToolsTest {
 			assertThatThrownBy(() -> tools.getBinanceAccountTrades(ALIAS, "BTCUSDT", null, id))
 					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
 					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
+			assertThatThrownBy(() -> tools.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null, id, null, null, null))
+					.isInstanceOf(IllegalArgumentException.class).hasMessage("Binance request failed: BAD_REQUEST")
+					.hasNoCause().satisfies(BinanceAccountTradesToolsTest::assertSafeThrowable);
 			Map<String, Object> args = arguments(ALIAS, "BTCUSDT", null);
 			args.put("fromId", id);
-			assertSafeError(call(args), "BAD_REQUEST");
+			assertSafeError(call(context, name, args), "BAD_REQUEST");
 		}
 		verifyNoInteractions(provider);
 		assertThat(server.requests).hasValue(0);
 	}
 
-	@Test
-	void registeredFromIdRejectsBelowBoundWithoutPartialResults() {
+	@ParameterizedTest
+	@ValueSource(strings = {NAME, EXECUTIONS_NAME})
+	void registeredFromIdRejectsBelowBoundWithoutPartialResults(String name) {
 		String below = FILL.replace("\"id\":9007199254740993", "\"id\":9007199254740992");
 		Map<String, Object> args = arguments(ALIAS, "BTCUSDT", 2);
 		args.put("fromId", "9007199254740993");
 		for (String body : List.of("[" + below + "]", "[" + FILL + "," + below + "]")) {
 			server.body.set(body);
-			CallToolResult result = call(args);
+			CallToolResult result = call(context, name, args);
 			assertSafeError(result, "INVALID_RESPONSE");
 			assertThat(result.structuredContent()).isNull();
 		}
@@ -782,18 +887,18 @@ class BinanceAccountTradesToolsTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(booleans = {false, true})
+	@MethodSource("commonTruncationScopes")
 	@SuppressWarnings("unchecked")
-	void commonConversionPreservesSourceTruncationRatherThanRecomputingIt(boolean truncated) {
+	void commonConversionPreservesSourceTruncationRatherThanRecomputingIt(boolean truncated, String fromId) {
 		BinanceAccountTradesClient suppliedClient = mock(BinanceAccountTradesClient.class);
 		when(suppliedClient.getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class)))
 				.thenReturn(new BinanceAccountTradesSnapshot("binance", ALIAS, "BTCUSDT", List.of(), truncated));
 		ObjectProvider<BinanceAccountTradesClient> provider = mock(ObjectProvider.class);
 		when(provider.getObject()).thenReturn(suppliedClient);
 		CommonExecutionResponse result = new BinanceAccountTradesTools(provider)
-				.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null);
+				.getBinanceAccountExecutions(ALIAS, "BTCUSDT", null, fromId, null, null, null);
 		assertThat(result.possiblyTruncated()).isEqualTo(truncated);
-		assertThat(result.queryScope()).isEqualTo("RECENT_SYMBOL");
+		assertThat(result.queryScope()).isEqualTo(fromId == null ? "RECENT_SYMBOL" : "FILTERED_SYMBOL");
 		assertThat(result.orderId()).isNull();
 		assertThat(result.executions()).isEmpty();
 		assertThat(result.fees()).isEmpty();
@@ -801,6 +906,11 @@ class BinanceAccountTradesToolsTest {
 		verify(suppliedClient).getAccountTrades(eq(ALIAS), any(BinanceAccountTradesRequest.class));
 		verifyNoMoreInteractions(provider, suppliedClient);
 		assertThat(server.requests).hasValue(0);
+	}
+
+	static Stream<Arguments> commonTruncationScopes() {
+		return Stream.of(false, true).flatMap(truncated -> Stream.of(
+				Arguments.of(truncated, null), Arguments.of(truncated, "0")));
 	}
 
 	@Test

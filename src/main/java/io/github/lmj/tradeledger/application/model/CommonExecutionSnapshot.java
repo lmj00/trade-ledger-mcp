@@ -72,6 +72,12 @@ public record CommonExecutionSnapshot(
 
 	/** Commission assets are retained verbatim per fill, without aggregation or conversion. */
 	public static CommonExecutionSnapshot fromBinance(BinanceAccountTradesSnapshot snapshot) {
+		return fromBinance(snapshot, QueryScope.RECENT_SYMBOL);
+	}
+
+	/** Scope describes the supplied result; no request or additional query is needed. */
+	public static CommonExecutionSnapshot fromBinance(BinanceAccountTradesSnapshot snapshot, QueryScope scope) {
+		require(scope == QueryScope.RECENT_SYMBOL || scope == QueryScope.FILTERED_SYMBOL);
 		require(snapshot != null);
 		requireText(snapshot.serviceId());
 		requireAlias(snapshot.accountAlias());
@@ -89,10 +95,10 @@ public record CommonExecutionSnapshot(
 			fees.add(new Fee(FeeScope.FILL, executionId, trade.commission(), Optional.of(trade.commissionAsset())));
 		}
 		return new CommonExecutionSnapshot(snapshot.serviceId(), snapshot.accountAlias(), snapshot.symbol(),
-				QueryScope.RECENT_SYMBOL, Optional.empty(), Optional.of(snapshot.possiblyTruncated()), executions, fees);
+				scope, Optional.empty(), Optional.of(snapshot.possiblyTruncated()), executions, fees);
 	}
 
-	public enum QueryScope { SINGLE_ORDER, RECENT_SYMBOL }
+	public enum QueryScope { SINGLE_ORDER, RECENT_SYMBOL, FILTERED_SYMBOL }
 
 	public enum Side { BUY, SELL }
 
