@@ -1,0 +1,21 @@
+package io.github.lmj.tradeledger.adapter.toss;
+
+/** Safe categories only; no upstream messages or private request data. */
+public enum TossErrorCode {
+	BAD_REQUEST,
+	MISSING_CREDENTIALS,
+	INVALID_CREDENTIALS,
+	UNSAFE_TRANSPORT_CONFIGURATION,
+	AUTHENTICATION_FAILED,
+	PERMISSION_DENIED,
+	ORDER_NOT_FOUND,
+	RATE_LIMITED,
+	REDIRECT_REJECTED,
+	SERVER_ERROR,
+	UNEXPECTED_STATUS,
+	NETWORK_ERROR,
+	TIMEOUT,
+	INTERRUPTED,
+	RESPONSE_TOO_LARGE,
+	INVALID_RESPONSE
+}
