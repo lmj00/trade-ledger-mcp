@@ -112,15 +112,47 @@ class BinanceAccountTradesRequestTest {
 				.map(constructor -> Arrays.asList(constructor.getParameterTypes())).toList())
 				.containsExactlyInAnyOrder(List.of(String.class), List.of(String.class, int.class),
 						List.of(String.class, int.class, String.class),
-						List.of(String.class, int.class, String.class, String.class, String.class));
+						List.of(String.class, int.class, String.class, String.class, String.class),
+						List.of(String.class, int.class, String.class, String.class, String.class, String.class));
 		assertThat(Arrays.stream(type.getDeclaredFields()).map(field -> field.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime", "orderId");
 		assertThat(Arrays.stream(type.getDeclaredFields())
 				.allMatch(field -> Modifier.isPrivate(field.getModifiers()) && Modifier.isFinal(field.getModifiers())))
 				.isTrue();
 		assertThat(Arrays.stream(type.getDeclaredMethods())
 				.filter(method -> Modifier.isPublic(method.getModifiers())).map(method -> method.getName()).toList())
-				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime", "toQueryString");
+				.containsExactlyInAnyOrder("symbol", "limit", "fromId", "startTime", "endTime", "orderId", "toQueryString");
+	}
+
+	@Test
+	void preservesOrderIdBoundariesAloneAndWithFromIdAndOmittedQueries() {
+		for (String id : List.of("0", "9007199254740993", "9223372036854775807")) {
+			for (boolean withFromId : List.of(false, true)) {
+				var request = new BinanceAccountTradesRequest("BTCUSDT", 2, withFromId ? id : null, null, null, id);
+				assertThat(request.orderId()).isEqualTo(Long.valueOf(id));
+				assertThat(request.toQueryString(123)).isEqualTo("symbol=BTCUSDT&limit=2"
+						+ (withFromId ? "&fromId=" + id : "") + "&orderId=" + id + "&recvWindow=5000&timestamp=123");
+			}
+		}
+		for (String[] filters : new String[][] {{null, null, null}, {"0", null, null},
+				{null, "0", null}, {null, null, "1"}, {null, "0", "1"}}) {
+			var legacy = new BinanceAccountTradesRequest("BTCUSDT", 2, filters[0], filters[1], filters[2]);
+			var omitted = new BinanceAccountTradesRequest("BTCUSDT", 2, filters[0], filters[1], filters[2], null);
+			assertThat(legacy.orderId()).isNull();
+			assertThat(omitted.toQueryString(123)).isEqualTo(legacy.toQueryString(123));
+		}
+	}
+
+	@Test
+	void rejectsInvalidOrderIdsAndEachTimeCombinationSafely() {
+		for (String id : List.of("", " ", "\t", "-1", "-0", "+1", "1.0", "1e3", "00", "01",
+				" 1", "1 ", "１", "١", "9223372036854775808", "1".repeat(10000), MARKER)) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, null, null, null, id));
+		}
+		for (String[] bounds : new String[][] {{"0", null}, {null, "0"}, {"0", "0"}}) {
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, null, bounds[0], bounds[1], "0"));
+			assertSafeFailure(() -> new BinanceAccountTradesRequest("BTCUSDT", 2, "0", bounds[0], bounds[1], "0"));
+		}
 	}
 
 	@Test

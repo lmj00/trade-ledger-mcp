@@ -28,7 +28,8 @@ public final class BinanceAccountTradesTools {
 			title = "Get Binance Spot account trades for one symbol",
 			description = "Read one result of Spot fills for one symbol, default 500 and maximum 1000. "
 					+ "Optional fromId is an inclusive trade ID lower bound. Optional startTime/endTime are inclusive "
-					+ "millisecond bounds (at most 24 hours apart), incompatible with fromId. Omitted filters mean recent fills. "
+					+ "millisecond bounds (at most 24 hours apart), incompatible with fromId or orderId. "
+					+ "Optional orderId selects one order, alone or with fromId. Omitted filters mean recent fills. "
 					+ "accountAlias is a non-secret local display label and does not select the authenticated account. "
 					+ "Even short or empty results do not establish complete history. "
 					+ "No pagination, retries, fee conversion, trade matching, PnL, orders or funds movement.",
@@ -47,11 +48,13 @@ public final class BinanceAccountTradesTools {
 			Integer limit,
 			@McpToolParam(description = "Optional inclusive trade ID lower bound: canonical decimal string from 0 through 9223372036854775807, without signs, spaces or leading zeroes.", required = false)
 			String fromId,
-			@McpToolParam(description = "Optional inclusive start: project policy requires canonical ASCII nonnegative int64 decimal string in milliseconds only; cannot mix with fromId.", required = false)
+			@McpToolParam(description = "Optional inclusive start: project policy requires canonical ASCII nonnegative int64 decimal string in milliseconds only; cannot mix with fromId or orderId.", required = false)
 			String startTime,
 			@McpToolParam(description = "Optional inclusive end: same project millisecond string policy as startTime; start <= end and span <= 86400000ms when both supplied.", required = false)
-			String endTime) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId, startTime, endTime);
+			String endTime,
+			@McpToolParam(description = "Optional order ID: project policy requires a canonical ASCII nonnegative int64 decimal string, at most 19 characters; allowed alone or with fromId, never with startTime/endTime.", required = false)
+			String orderId) {
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, fromId, startTime, endTime, orderId);
 		try {
 			return BinanceAccountTradesResponse.from(client.getObject().getAccountTrades(accountAlias, request));
 		}
@@ -60,7 +63,12 @@ public final class BinanceAccountTradesTools {
 		}
 	}
 
-	/** Preserve existing Java callers; only the six-argument method is registered. */
+	/** Preserve existing Java callers; only the seven-argument method is registered. */
+	public BinanceAccountTradesResponse getBinanceAccountTrades(String accountAlias, String symbol, Integer limit,
+			String fromId, String startTime, String endTime) {
+		return getBinanceAccountTrades(accountAlias, symbol, limit, fromId, startTime, endTime, null);
+	}
+
 	public BinanceAccountTradesResponse getBinanceAccountTrades(String accountAlias, String symbol, Integer limit, String fromId) {
 		return getBinanceAccountTrades(accountAlias, symbol, limit, fromId, null, null);
 	}
@@ -89,7 +97,7 @@ public final class BinanceAccountTradesTools {
 			String symbol,
 			@McpToolParam(description = "Maximum fills, 1 through 1000; defaults to 500.", required = false)
 			Integer limit) {
-		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null, null, null);
+		BinanceAccountTradesRequest request = validatedRequest(accountAlias, symbol, limit, null, null, null, null);
 		try {
 			return CommonExecutionResponse.from(CommonExecutionSnapshot.fromBinance(
 					client.getObject().getAccountTrades(accountAlias, request)));
@@ -99,14 +107,14 @@ public final class BinanceAccountTradesTools {
 		}
 	}
 
-	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId, String startTime, String endTime) {
+	private static BinanceAccountTradesRequest validatedRequest(String accountAlias, String symbol, Integer limit, String fromId, String startTime, String endTime, String orderId) {
 		try {
 			// Match the client's alias policy before obtaining the lazy client. The
-			// request model owns symbol/limit/fromId/time validation for every MCP call too.
+			// request model owns symbol/limit/orderId/fromId/time validation for every MCP call too.
 			if (!validAlias(accountAlias)) {
 				throw new IllegalArgumentException();
 			}
-			return new BinanceAccountTradesRequest(symbol, limit == null ? 500 : limit, fromId, startTime, endTime);
+			return new BinanceAccountTradesRequest(symbol, limit == null ? 500 : limit, fromId, startTime, endTime, orderId);
 		}
 		catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Binance request failed: BAD_REQUEST");

@@ -28,6 +28,33 @@ class BinanceAccountTradesMapperTest {
 	private static final String MARKER = "synthetic-private-marker";
 
 	@Test
+	void enforcesOrderMatchAndInclusiveFromIdTogetherWithoutPartialResults() {
+		for (String orderId : List.of("0", "9007199254740993", "9223372036854775807")) {
+			for (boolean withFromId : List.of(false, true)) {
+				var request = new BinanceAccountTradesRequest(SYMBOL, 2, withFromId ? "10" : null, null, null, orderId);
+				String first = raw(fill(10), "orderId", orderId);
+				String second = raw(fill(11), "orderId", orderId);
+				var result = mapper.map(ALIAS, request, array(first, second));
+				assertThat(result.trades()).extracting(Execution::orderId)
+						.containsExactly(Long.valueOf(orderId), Long.valueOf(orderId));
+				assertThat(result.possiblyTruncated()).isTrue();
+				assertThat(mapper.map(ALIAS, request, array(first)).possiblyTruncated()).isFalse();
+				assertThat(mapper.map(ALIAS, request, "[]").trades()).isEmpty();
+				String mismatch = extra(raw(fill(12), "orderId", orderId.equals("0") ? "1" : "0"),
+						"private", "\"" + MARKER + "\"");
+				assertSafeFailure(() -> mapper.map(ALIAS, request, array(mismatch)));
+				assertSafeFailure(() -> mapper.map(ALIAS, request, array(first, mismatch)));
+				assertSafeFailure(() -> mapper.map(ALIAS, request, array(first, first)));
+				if (withFromId) {
+					String below = raw(fill(9), "orderId", orderId);
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(below)));
+					assertSafeFailure(() -> mapper.map(ALIAS, request, array(first, below)));
+				}
+			}
+		}
+	}
+
+	@Test
 	void enforcesInclusiveRequestBoundWithoutChangingUnfilteredInt64Contract() {
 		for (long id : new long[] {0, 9_007_199_254_740_993L, Long.MAX_VALUE}) {
 			var request = new BinanceAccountTradesRequest(SYMBOL, 2, Long.toString(id));
