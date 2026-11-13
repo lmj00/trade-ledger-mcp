@@ -616,6 +616,50 @@ class UpbitOrderClientTest {
 		}
 	}
 
+	@ParameterizedTest
+	@ValueSource(ints = {0, 1, 20_000})
+	void boundsClosedResponseTokensWithOneGetAndNoPartialResults(int overflow) throws Exception {
+		AtomicReference<String> body = new AtomicReference<>();
+		List<String> requests = new CopyOnWriteArrayList<>();
+		List<String> tokens = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+			String token = exchange.getRequestHeaders().getFirst("Authorization");
+			tokens.add(token);
+			reply(exchange, 200, withIgnoredBytes(body.get(), "valid".getBytes(StandardCharsets.UTF_8),
+					BODY_MARKER + UpbitJwtSignerTest.ACCESS + UpbitJwtSignerTest.SECRET + token));
+		})) {
+			UpbitOrderClient client = server.client(true);
+			int calls = 0;
+			int length = 256 + overflow;
+			int arrays = 62 + overflow; // Root array and summary object count too.
+			List<String> fields = overflow > 1
+					? List.of("\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays))
+					: List.of("\"policyBoundary\":\"" + "\\u0078".repeat(length) + "\"",
+							"\"" + "\\u0078".repeat(length) + "\":null",
+							"\"policyBoundary\":{\"nested\":[{\"value\":\"" + "x".repeat(length) + "\"}]}",
+							"\"policyBoundary\":{\"" + "x".repeat(length) + "\":null}",
+							"\"policyBoundary\":1." + "0".repeat(122 + overflow) + "e+00",
+							"\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays));
+			for (String field : fields) {
+				String second = CLOSED_ORDER.replace(ID, "123e4567-e89b-12d3-a456-426614174001");
+				int end = second.lastIndexOf('}');
+				body.set("[" + CLOSED_ORDER + "," + second.substring(0, end) + "," + field + second.substring(end) + "]");
+				assertThat(body.get().length()).isLessThan(UpbitClosedOrdersMapper.MAX_JSON_LENGTH);
+				if (overflow == 0) {
+					assertThat(client.getClosedOrders(new UpbitClosedOrdersRequest()).orders())
+							.extracting(order -> order.orderId()).containsExactly(ID, "123e4567-e89b-12d3-a456-426614174001");
+				}
+				else {
+					expect(UpbitErrorCode.INVALID_RESPONSE,
+							() -> client.getClosedOrders(new UpbitClosedOrdersRequest()), tokens, ID);
+				}
+				assertThat(requests).hasSize(++calls).allSatisfy(target ->
+						assertThat(target).isEqualTo("GET /v1/orders/closed?" + CLOSED_QUERY));
+			}
+		}
+	}
+
 	@Test
 	void rejectsInvalidClosedResponsesWithoutPartialResultsOrSensitiveDiagnostics() throws Exception {
 		String second = CLOSED_ORDER.replace(ID, "123e4567-e89b-12d3-a456-426614174001");

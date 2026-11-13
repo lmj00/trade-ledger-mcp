@@ -226,6 +226,24 @@ class UpbitClosedOrdersMapperTest {
 	}
 
 	@Test
+	void boundsDepthIncludingRootArrayBeforeConstructingTheTree() {
+		assertThat(UpbitClosedOrdersMapper.MAX_NESTING_DEPTH).isEqualTo(64);
+		for (boolean objects : List.of(false, true)) {
+			String open = objects ? "{\"nested\":" : "[";
+			String close = objects ? "}" : "]";
+			// The root array and summary object already occupy two levels.
+			String atLimit = ignored(order(1, "done"), open.repeat(62) + "0" + close.repeat(62));
+			assertThat(mapper.map(array(atLimit), defaults).orders()).hasSize(1);
+			for (int levels : List.of(63, 20_000)) {
+				String excessive = ignored(order(2, "cancel"), open.repeat(levels) + "0" + close.repeat(levels));
+				String json = array(order(1, "done"), excessive);
+				assertThat(json.length()).isLessThan(UpbitClosedOrdersMapper.MAX_JSON_LENGTH);
+				reject(json);
+			}
+		}
+	}
+
+	@Test
 	void boundsUnknownPropertyNamesAndValuesToo() {
 		String json = array(order(1, "done"));
 		String atLimit = json.replace("\"market\":", "\"" + "x".repeat(256) + "\":\""
@@ -233,6 +251,28 @@ class UpbitClosedOrdersMapperTest {
 		assertThat(mapper.map(atLimit, defaults).orders()).hasSize(1);
 		reject(json.replace("\"market\":", "\"" + "x".repeat(257) + "\":0,\"market\":"));
 		reject(json.replace("\"market\":", "\"unknown\":" + "1".repeat(129) + ",\"market\":"));
+		for (String character : List.of("x", "\\u0078", "\\uD83D\\uDE00")) {
+			int units = character.equals("\\uD83D\\uDE00") ? 2 : 1;
+			String boundary = character.repeat(256 / units);
+			String excessive = boundary + "x";
+			for (boolean nested : List.of(false, true)) {
+				for (String property : List.of("\"%s\":null", "\"value\":\"%s\"")) {
+					String validFields = property.formatted(boundary);
+					String invalidFields = property.formatted(excessive);
+					if (nested) {
+						validFields = "\"unknown\":{\"nested\":[{" + validFields + "}]}";
+						invalidFields = "\"unknown\":{\"nested\":[{" + invalidFields + "}]}";
+					}
+					assertThat(mapper.map(array(withFields(order(1, "done"), validFields)), defaults).orders()).hasSize(1);
+					String invalidOrder = withFields(order(2, "cancel"), invalidFields);
+					reject(array(invalidOrder));
+					reject(array(order(1, "done"), invalidOrder));
+				}
+			}
+			assertThat(mapper.map(array(text(order(1, "done"), "side", boundary)), defaults)
+					.orders().getFirst().side()).hasSize(256);
+			reject(array(text(order(1, "done"), "side", excessive)));
+		}
 	}
 
 	@Test
@@ -250,6 +290,7 @@ class UpbitClosedOrdersMapperTest {
 				assertThat(mapper.map(atLimit, defaults).orders()).hasSize(1);
 				reject(json.replace("\"market\":", "\"secret-marker\":"
 						+ container.formatted(overLimit) + ",\"market\":"));
+				reject(array(order(1, "done"), ignored(order(2, "cancel"), container.formatted(overLimit))));
 			}
 		}
 	}
@@ -265,7 +306,8 @@ class UpbitClosedOrdersMapperTest {
 			assertThat(error.getSuppressed()).isEmpty();
 			var trace = new StringWriter();
 			error.printStackTrace(new PrintWriter(trace));
-			assertThat(trace.toString()).doesNotContain("secret-marker");
+			assertThat(trace.toString()).doesNotContain("secret-marker", "StreamConstraintsException",
+					"JsonParseException", "[Source:", "line: ", "column: ");
 		});
 	}
 
@@ -283,6 +325,15 @@ class UpbitClosedOrdersMapperTest {
 				"created_at":"2026-07-01T10:00:00+09:00","executed_volume":"0.0000000000000000000200",
 				"paid_fee":"0.0000000000000000000100","trades_count":18446744073709551616}
 				""".formatted(id(index), state);
+	}
+
+	private static String ignored(String order, String value) {
+		return withFields(order, "\"secret-marker\":" + value);
+	}
+
+	private static String withFields(String order, String fields) {
+		int end = order.lastIndexOf('}');
+		return order.substring(0, end) + "," + fields + order.substring(end);
 	}
 
 	private static String orders(int count) {

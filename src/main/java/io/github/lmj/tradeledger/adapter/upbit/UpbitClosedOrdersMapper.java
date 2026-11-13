@@ -11,22 +11,35 @@ import java.util.regex.Pattern;
 import io.github.lmj.tradeledger.application.model.ClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.ClosedOrdersSnapshot.Order;
 import tools.jackson.core.JsonToken;
+import tools.jackson.core.StreamReadConstraints;
 import tools.jackson.core.StreamReadFeature;
+import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-/** Strict, all-or-nothing JSON summary mapping; never constructs detailed fills. */
+/**
+ * Strict, all-or-nothing JSON summary mapping; never constructs detailed fills.
+ * Project policy, not Upbit transport limits: at most 1,048,576 UTF-16 code units,
+ * depth 64 including the root array, decoded strings/property names 256 code
+ * units, original number tokens 128 code units, and at most the requested limit
+ * and 1000 orders. Ignored fields are bounded before any tree is constructed.
+ */
 public final class UpbitClosedOrdersMapper {
 	// Project policy limits, not assertions about Upbit's transport limits.
 	public static final int MAX_JSON_LENGTH = 1024 * 1024; // UTF-16 code units, checked before parsing
+	public static final int MAX_NESTING_DEPTH = 64;
 	public static final int MAX_STRING_LENGTH = 256;
 	public static final int MAX_NUMBER_LENGTH = 128;
 	public static final int MAX_ORDERS = 1_000;
 	private static final Pattern UUID = Pattern.compile(
 			"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 	private static final Pattern DECIMAL = Pattern.compile("[+-]?[0-9]+(?:\\.[0-9]+)?");
-	private static final JsonMapper JSON = JsonMapper.builder()
+	private static final JsonMapper JSON = JsonMapper.builder(JsonFactory.builder()
+			.streamReadConstraints(StreamReadConstraints.builder()
+					.maxNestingDepth(MAX_NESTING_DEPTH).maxStringLength(MAX_STRING_LENGTH)
+					.maxNameLength(MAX_STRING_LENGTH).maxNumberLength(MAX_NUMBER_LENGTH).build())
+			.build())
 			.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
 			.enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
 
@@ -40,12 +53,11 @@ public final class UpbitClosedOrdersMapper {
 			throw invalid();
 		}
 		try {
-			checkNumberTokenLengths(json);
+			checkTokens(json, request.limit());
 			JsonNode root = JSON.readTree(json);
 			if (root == null || !root.isArray() || root.size() > MAX_ORDERS || root.size() > request.limit()) {
 				throw invalid();
 			}
-			checkLengths(root);
 			var orders = new ArrayList<Order>(root.size());
 			var ids = new HashSet<String>();
 			for (JsonNode node : root) {
@@ -87,34 +99,47 @@ public final class UpbitClosedOrdersMapper {
 		}
 	}
 
-	private static void checkNumberTokenLengths(String json) {
-		// Tree numbers may lose fractional zeroes or normalize exponent notation.
-		// Inspect every original token, including values in unknown nested fields.
+	private static void checkTokens(String json, int limit) {
+		// A linear token pass bounds even ignored values before tree allocation.
+		// Exact lengths complement Jackson's potentially approximate constraints;
+		// original number tokens are checked before decimal/exponent normalization.
 		try (var parser = JSON.createParser(json)) {
+			if (parser.nextToken() != JsonToken.START_ARRAY) {
+				throw invalid();
+			}
+			int depth = 1;
+			int items = 0;
 			JsonToken token;
 			while ((token = parser.nextToken()) != null) {
-				if ((token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT)
-						&& parser.getString().length() > MAX_NUMBER_LENGTH) {
+				if (depth == 0) {
 					throw invalid();
 				}
-			}
-		}
-	}
-
-	private static void checkLengths(JsonNode node) {
-		if (node.isObject()) {
-			for (var property : node.properties()) {
-				if (property.getKey().length() > MAX_STRING_LENGTH) {
-					throw invalid();
+				if (depth == 1 && token != JsonToken.END_ARRAY) {
+					if (token != JsonToken.START_OBJECT || ++items > limit || items > MAX_ORDERS) {
+						throw invalid();
+					}
+				}
+				if (token == JsonToken.START_ARRAY || token == JsonToken.START_OBJECT) {
+					if (++depth > MAX_NESTING_DEPTH) {
+						throw invalid();
+					}
+				}
+				else if (token == JsonToken.END_ARRAY || token == JsonToken.END_OBJECT) {
+					depth--;
+				}
+				else if (token == JsonToken.PROPERTY_NAME || token == JsonToken.VALUE_STRING) {
+					if (parser.getString().length() > MAX_STRING_LENGTH) {
+						throw invalid();
+					}
+				}
+				else if (token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT) {
+					if (parser.getString().length() > MAX_NUMBER_LENGTH) {
+						throw invalid();
+					}
 				}
 			}
-		}
-		if (node.isString() && node.asString().length() > MAX_STRING_LENGTH) {
-			throw invalid();
-		}
-		if (node.isArray() || node.isObject()) {
-			for (JsonNode child : node) {
-				checkLengths(child);
+			if (depth != 0) {
+				throw invalid();
 			}
 		}
 	}

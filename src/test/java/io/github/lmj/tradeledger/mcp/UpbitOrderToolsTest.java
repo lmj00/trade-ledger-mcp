@@ -992,6 +992,48 @@ class UpbitOrderToolsTest {
 				.allSatisfy(target -> assertThat(target).startsWith("GET /v1/orders/closed?"));
 	}
 
+	@ParameterizedTest
+	@ValueSource(ints = {0, 1, 20_000})
+	void closedOrdersEnforcesTokenPolicyThroughRegisteredHandler(int overflow) {
+		// Inject bounded fake keys and the actual local JWT alongside the policy fields.
+		server.ignoredBytes.set("valid".getBytes(StandardCharsets.UTF_8));
+		String first = summary(ID, "done", "9007199254740993", "0.3000");
+		String second = summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "0", "0.0000");
+		int length = 256 + overflow;
+		int arrays = 62 + overflow; // Root array and summary object count too.
+		List<String> fields = overflow > 1
+				? List.of("\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays))
+				: List.of("\"policyBoundary\":\"" + "\\u0078".repeat(length) + "\"",
+						"\"" + "\\u0078".repeat(length) + "\":null",
+						"\"policyBoundary\":{\"nested\":[{\"value\":\"" + "x".repeat(length) + "\"}]}",
+						"\"policyBoundary\":{\"" + "x".repeat(length) + "\":null}",
+						"\"policyBoundary\":1." + "0".repeat(122 + overflow) + "e+00",
+						"\"policyBoundary\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays));
+		int calls = 0;
+		for (String field : fields) {
+			int end = second.lastIndexOf('}');
+			server.body.set("[" + first + "," + second.substring(0, end) + "," + field + second.substring(end) + "]");
+			assertThat(server.body.get().length()).isLessThan(1_048_576);
+			CallToolResult result = callClosed(Map.of());
+			if (overflow == 0) {
+				assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+				Map<String, Object> response = asMap(result.structuredContent());
+				assertThat(response).containsEntry("possiblyTruncated", false);
+				assertThat((List<?>) response.get("orders")).hasSize(2);
+				assertMatchingSuccessContent(result);
+				assertNoSecrets(result);
+			}
+			else {
+				assertSafeError(result, "INVALID_RESPONSE");
+				assertThat(result.toString()).doesNotContain(ID, "0.3000", "9007199254740993");
+			}
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths).hasSize(calls).allSatisfy(target -> assertThat(target).isEqualTo(
+					"GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=100&order_by=desc"));
+		}
+	}
+
 	@Test
 	void closedOrdersRejectsResponseBeyondRequestedLimitWithoutMoreRequests() {
 		server.body.set("[" + summary(ID, "done", "1", "0.1000") + ","
