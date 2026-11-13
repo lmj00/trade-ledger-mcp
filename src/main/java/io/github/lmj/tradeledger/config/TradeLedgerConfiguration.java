@@ -34,11 +34,12 @@ class TradeLedgerConfiguration {
 				}
 				return specifications.stream().map(candidate -> {
 					if (!(candidate instanceof SyncToolSpecification specification)
-							|| !"get_upbit_order".equals(specification.tool().name())) {
+							|| !("get_upbit_order".equals(specification.tool().name())
+									|| "get_upbit_closed_orders".equals(specification.tool().name()))) {
 						return candidate;
 					}
 					// Preserve the generated schema and safe error handler. The annotation
-					// adapter supplies structuredContent only for this DTO return type.
+					// adapter supplies structuredContent only for these DTO return types.
 					return SyncToolSpecification.builder().tool(specification.tool())
 							.callHandler((exchange, request) -> {
 								CallToolResult result = specification.callHandler().apply(exchange, request);

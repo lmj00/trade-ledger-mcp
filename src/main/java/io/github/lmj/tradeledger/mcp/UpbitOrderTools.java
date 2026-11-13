@@ -1,9 +1,11 @@
 package io.github.lmj.tradeledger.mcp;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
+import io.github.lmj.tradeledger.adapter.upbit.UpbitClosedOrdersRequest;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
@@ -44,14 +46,60 @@ public final class UpbitOrderTools {
 			return UpbitOrderResponse.from(client.getObject().getOrder(uuid));
 		}
 		catch (RuntimeException exception) {
-			// Lazy bean creation can wrap the client's safe exception. Discard every cause
-			// before handing an error to MCP, whose handler selects the innermost message.
-			for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
-				if (cause instanceof UpbitApiException safe) {
-					throw new IllegalStateException("Upbit request failed: " + safe.code().name());
-				}
-			}
-			throw new IllegalStateException("Upbit request failed: INTERNAL_ERROR");
+			throw safeFailure(exception);
 		}
+	}
+
+	@McpTool(
+			name = "get_upbit_closed_orders",
+			title = "Get Upbit closed order summaries",
+			description = "Read one bounded result of done/cancel order summaries. Both time boundaries or neither; "
+					+ "at most seven days and 1000 orders. No pagination, retries, fill details, fee currency, "
+					+ "trade matching or PnL. Even short or empty results do not establish complete history.",
+			generateOutputSchema = true,
+			annotations = @McpTool.McpAnnotations(
+					readOnlyHint = true,
+					destructiveHint = false,
+					idempotentHint = true,
+					openWorldHint = true))
+	public UpbitClosedOrdersResponse getUpbitClosedOrders(
+			@McpToolParam(description = "Optional uppercase market code, for example KRW-BTC.", required = false)
+			String market,
+			@McpToolParam(description = "done or cancel; mutually exclusive with states.", required = false)
+			String state,
+			@McpToolParam(description = "Nonempty distinct done/cancel states; defaults to both.", required = false)
+			List<String> states,
+			@McpToolParam(description = "Offset ISO8601 or epoch milliseconds; requires endTime.", required = false)
+			String startTime,
+			@McpToolParam(description = "Offset ISO8601 or epoch milliseconds; requires startTime, within seven days.", required = false)
+			String endTime,
+			@McpToolParam(description = "Maximum orders, 1 through 1000; defaults to 100.", required = false)
+			Integer limit,
+			@McpToolParam(description = "asc or desc; defaults to desc.", required = false)
+			String orderBy) {
+		UpbitClosedOrdersRequest request;
+		try {
+			request = new UpbitClosedOrdersRequest(market, state, states, startTime, endTime, limit, orderBy);
+		}
+		catch (RuntimeException exception) {
+			throw new IllegalArgumentException("Upbit request failed: BAD_REQUEST");
+		}
+		try {
+			return UpbitClosedOrdersResponse.from(client.getObject().getClosedOrders(request));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	private static IllegalStateException safeFailure(RuntimeException exception) {
+		// Lazy bean creation can wrap the client's safe exception. Discard every cause
+		// before handing an error to MCP, whose handler selects the innermost message.
+		for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+			if (cause instanceof UpbitApiException safe) {
+				return new IllegalStateException("Upbit request failed: " + safe.code().name());
+			}
+		}
+		return new IllegalStateException("Upbit request failed: INTERNAL_ERROR");
 	}
 }

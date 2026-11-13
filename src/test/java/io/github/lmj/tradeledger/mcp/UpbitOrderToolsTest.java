@@ -1,6 +1,10 @@
 package io.github.lmj.tradeledger.mcp;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -10,10 +14,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -22,6 +29,8 @@ import ch.qos.logback.classic.spi.ThrowableProxyUtil;
 import ch.qos.logback.core.read.ListAppender;
 import com.sun.net.httpserver.HttpServer;
 import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
+import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
+import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
@@ -32,8 +41,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.BeanCreationException;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.ApplicationContext;
@@ -197,15 +210,219 @@ class UpbitOrderToolsTest {
 		assertThat(server.requests).hasValue(1);
 	}
 
+	@Test
+	void closedOrdersDefaultCallMakesOneGetAndPreservesEmptyArray() {
+		server.body.set("[]");
+		CallToolResult result = callClosed(Map.of());
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(result.structuredContent())).containsOnlyKeys("serviceId", "orders", "possiblyTruncated")
+				.containsEntry("serviceId", "upbit").containsEntry("orders", List.of())
+				.containsEntry("possiblyTruncated", false);
+		assertThat(server.paths).containsExactly(
+				"GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=100&order_by=desc");
+		assertThat(server.requests).hasValue(1);
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+	}
+
+	@Test
+	void closedOrdersPassesOptionsAndNormalizesAnExactlySevenDayInterval() {
+		server.body.set("[]");
+		CallToolResult result = callClosed(Map.of("market", "KRW-BTC", "state", "cancel",
+				"startTime", "2026-07-01T10:00:00+09:00", "endTime", "1783472400000",
+				"limit", 1000, "orderBy", "asc"));
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(server.paths).containsExactly("GET /v1/orders/closed?market=KRW-BTC&state=cancel"
+				+ "&start_time=2026-07-01T01%3A00%3A00Z&end_time=2026-07-08T01%3A00%3A00Z"
+				+ "&limit=1000&order_by=asc");
+		assertThat(server.requests).hasValue(1);
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+	}
+
+	@Test
+	void closedOrdersPassesStatesWithoutAddingDefaultState() {
+		server.body.set("[]");
+		CallToolResult result = callClosed(Map.of("states", List.of("cancel")));
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(server.paths).containsExactly(
+				"GET /v1/orders/closed?states%5B%5D=cancel&limit=100&order_by=desc");
+		assertThat(server.requests).hasValue(1);
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+	}
+
+	@ParameterizedTest
+	@MethodSource("invalidClosedRequests")
+	void closedOrdersRejectsInvalidRequestsWithoutHttpEvenWhenKeysAreMissing(Map<String, Object> arguments) {
+		server.keys.set(Map.of());
+		assertSafeError(callClosed(arguments), "BAD_REQUEST");
+		assertThat(server.requests).hasValue(0);
+	}
+
+	static Stream<Map<String, Object>> invalidClosedRequests() {
+		return Stream.of(Map.of("state", "done", "states", List.of("cancel")),
+				Map.of("state", "wait"), Map.of("states", List.of("done", "wait")),
+				Map.of("states", List.of()), Map.of("states", List.of("done", "done")),
+				Map.of("market", MARKER + ACCESS + SECRET), Map.of("market", "krw-btc"),
+				Map.of("orderBy", MARKER + ACCESS + SECRET), Map.of("limit", 0), Map.of("limit", 1001),
+				Map.of("startTime", "2026-07-01T00:00:00Z"), Map.of("endTime", "2026-07-02T00:00:00Z"),
+				Map.of("startTime", "2026-07-02T00:00:00Z", "endTime", "2026-07-01T00:00:00Z"),
+				Map.of("startTime", "2026-07-01T00:00:00Z", "endTime", "2026-07-08T00:00:00.001Z"),
+				Map.of("startTime", MARKER + ACCESS + SECRET, "endTime", "2026-07-08T00:00:00Z"));
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void validationPrecedesLazyClientCreationAndDropsInputAndCauses() {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		UpbitOrderTools tools = new UpbitOrderTools(provider);
+		assertThatThrownBy(() -> tools.getUpbitClosedOrders(MARKER + ACCESS + SECRET,
+				null, null, null, null, null, null))
+				.isInstanceOf(IllegalArgumentException.class)
+				.hasMessage("Upbit request failed: BAD_REQUEST").hasNoCause();
+		assertThatThrownBy(() -> tools.getUpbitOrder(MARKER + ACCESS + SECRET))
+				.hasMessage("Upbit request failed: INVALID_UUID").hasNoCause();
+		verifyNoInteractions(provider);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void lazyInitializationFailuresExposeOnlyExistingSafeCategories() throws ReflectiveOperationException {
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		UpbitOrderTools tools = new UpbitOrderTools(provider);
+		var constructor = UpbitApiException.class.getDeclaredConstructor(UpbitErrorCode.class);
+		constructor.setAccessible(true);
+		for (UpbitErrorCode code : List.of(UpbitErrorCode.UNSAFE_TRANSPORT_CONFIGURATION,
+				UpbitErrorCode.MISSING_CREDENTIALS)) {
+			doThrow(new BeanCreationException(MARKER + ACCESS + SECRET,
+					constructor.newInstance(code))).when(provider).getObject();
+			assertThatThrownBy(() -> tools.getUpbitClosedOrders(null, null, null, null, null, null, null))
+					.hasMessage("Upbit request failed: " + code.name()).hasNoCause();
+			assertThatThrownBy(() -> tools.getUpbitOrder(ID))
+					.hasMessage("Upbit request failed: " + code.name()).hasNoCause();
+		}
+		doThrow(new IllegalStateException(MARKER + ACCESS + SECRET)).when(provider).getObject();
+		assertThatThrownBy(() -> tools.getUpbitClosedOrders(null, null, null, null, null, null, null))
+				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
+		assertThatThrownBy(() -> tools.getUpbitOrder(ID))
+				.hasMessage("Upbit request failed: INTERNAL_ERROR").hasNoCause();
+	}
+
+	@Test
+	void closedOrdersPreservesDoneAndFilledAndUnfilledCancelSummariesWithExactCounts() {
+		server.body.set("[" + summary(ID, "done", "9007199254740993", "0.3000") + ","
+				+ summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "9223372036854775808", "0.1000")
+				+ "," + summary("123e4567-e89b-12d3-a456-426614174002", "cancel", "0", "0.0000") + "]");
+		CallToolResult result = callClosed(Map.of());
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		Map<String, Object> response = asMap(result.structuredContent());
+		assertThat(response).containsEntry("serviceId", "upbit").containsEntry("possiblyTruncated", false);
+		assertThat(response.get("orders")).isInstanceOf(List.class);
+		List<?> orders = (List<?>) response.get("orders");
+		assertThat(orders).hasSize(3);
+		for (int index = 0; index < orders.size(); index++) {
+			assertThat(asMap(orders.get(index)))
+					.containsOnlyKeys("orderId", "market", "side", "orderType", "state", "createdAt",
+							"executedVolume", "paidFee", "tradesCount")
+					.containsEntry("orderId", "123e4567-e89b-12d3-a456-42661417400" + index)
+					.containsEntry("market", "KRW-BTC").containsEntry("side", "bid")
+					.containsEntry("orderType", "limit").containsEntry("state", index == 0 ? "done" : "cancel")
+					.containsEntry("createdAt", "2026-07-01T01:00:00Z")
+					.containsEntry("executedVolume", List.of("0.3000", "0.1000", "0.0000").get(index))
+					.containsEntry("paidFee", "0.12345678901234567800")
+					.containsEntry("tradesCount", List.of("9007199254740993", "9223372036854775808", "0").get(index));
+		}
+		assertThat(server.requests).hasValue(1);
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {1, 1000})
+	void closedOrdersMarksResultsAtEitherAllowedLimitAsPossiblyTruncated(int limit) {
+		String body = java.util.stream.IntStream.range(0, limit)
+				.mapToObj(index -> summary("123e4567-e89b-12d3-a456-" + String.format(java.util.Locale.ROOT, "%012d", index),
+						"done", "1", "0.1000")).collect(java.util.stream.Collectors.joining(",", "[", "]"));
+		server.body.set(body);
+		CallToolResult result = callClosed(Map.of("limit", limit));
+		assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+		assertThat(asMap(result.structuredContent())).containsEntry("possiblyTruncated", true);
+		assertThat((List<?>) asMap(result.structuredContent()).get("orders")).hasSize(limit);
+		assertThat(server.requests).hasValue(1);
+		assertMatchingSuccessContent(result);
+		assertNoSecrets(result);
+	}
+
+	@Test
+	void closedOrdersRejectsResponseBeyondRequestedLimitWithoutMoreRequests() {
+		server.body.set("[" + summary(ID, "done", "1", "0.1000") + ","
+				+ summary("123e4567-e89b-12d3-a456-426614174001", "cancel", "0", "0.0000") + "]");
+		assertSafeError(callClosed(Map.of("limit", 1)), "INVALID_RESPONSE");
+		assertThat(server.requests).hasValue(1);
+	}
+
+	@Test
+	void closedOrdersRejectsMissingKeysWithoutHttp() {
+		server.keys.set(Map.of());
+		assertSafeError(callClosed(Map.of()), "MISSING_CREDENTIALS");
+		assertThat(server.requests).hasValue(0);
+	}
+
+	@ParameterizedTest
+	@CsvSource({"400,BAD_REQUEST", "401,AUTHENTICATION_FAILED", "403,PERMISSION_DENIED",
+			"404,ORDER_NOT_FOUND", "418,IP_BLOCKED", "429,RATE_LIMITED", "500,SERVER_ERROR",
+			"302,REDIRECT_REJECTED", "200,INVALID_RESPONSE", "-1,NETWORK_ERROR"})
+	void closedOrdersDiscardsHttpParserAndNetworkDetailsWithoutRetrying(int status, String category) {
+		server.status.set(status);
+		server.body.set(MARKER);
+		assertSafeError(callClosed(Map.of()), category);
+		assertThat(server.requests).hasValue(1);
+	}
+
+	@Test
+	void closedOrdersRecognizesPermissionWithinAuthenticationResponse() {
+		server.status.set(401);
+		server.body.set("{\"error\":{\"name\":\"out_of_scope\",\"message\":\"" + MARKER + "\"}}");
+		assertSafeError(callClosed(Map.of()), "PERMISSION_DENIED");
+		assertThat(server.requests).hasValue(1);
+	}
+
+	@Test
+	void closedOrdersBoundsFullBodyWaitAndDoesNotRetry() {
+		server.status.set(-2); // Send headers, then hold the body until the request has timed out.
+		try {
+			assertSafeError(callClosed(Map.of()), "TIMEOUT");
+			assertThat(server.requests).hasValue(1);
+		}
+		finally {
+			server.releaseBody.countDown();
+		}
+	}
+
+	private static String summary(String uuid, String state, String count, String volume) {
+		return "{\"uuid\":\"" + uuid + "\",\"market\":\"KRW-BTC\",\"side\":\"bid\","
+				+ "\"ord_type\":\"limit\",\"state\":\"" + state + "\",\"created_at\":\"2026-07-01T10:00:00+09:00\","
+				+ "\"executed_volume\":\"" + volume + "\",\"paid_fee\":\"0.12345678901234567800\","
+				+ "\"trades_count\":" + count + "}";
+	}
+
+	private CallToolResult callClosed(Map<String, Object> arguments) {
+		return call("get_upbit_closed_orders", arguments);
+	}
+
 	private CallToolResult call(String uuid) {
+		return call("get_upbit_order", Map.of("uuid", uuid));
+	}
+
+	private CallToolResult call(String name, Map<String, Object> arguments) {
 		Object specs = context.getBean("toolSpecs");
 		assertThat(specs).isInstanceOf(List.class);
 		SyncToolSpecification tool = ((List<?>) specs).stream()
 				.filter(SyncToolSpecification.class::isInstance).map(SyncToolSpecification.class::cast)
-				.filter(specification -> specification.tool().name().equals("get_upbit_order"))
+				.filter(specification -> specification.tool().name().equals(name))
 				.findFirst().orElseThrow();
-		return tool.callHandler().apply(null, CallToolRequest.builder("get_upbit_order")
-				.arguments(Map.of("uuid", uuid)).build());
+		return tool.callHandler().apply(null, CallToolRequest.builder(name).arguments(arguments).build());
 	}
 
 	private void assertSafeError(CallToolResult result, String category) {
@@ -285,8 +502,7 @@ class UpbitOrderToolsTest {
 			constructor.setAccessible(true);
 			UpbitOrderClient client = constructor.newInstance(server.uri(),
 					(Supplier<Map<String, String>>) server.keys::get);
-			// The existing client has no public close hook. Keep cleanup in this local
-			// fixture rather than exposing transport controls through the MCP API.
+			// Retain the owned transport for the existing after-context termination assertion.
 			var transport = UpbitOrderClient.class.getDeclaredField("http");
 			transport.setAccessible(true);
 			server.transport = (HttpClient) transport.get(client);
@@ -301,6 +517,7 @@ class UpbitOrderToolsTest {
 		final AtomicInteger requests = new AtomicInteger();
 		final List<String> tokens = new CopyOnWriteArrayList<>();
 		final List<String> paths = new CopyOnWriteArrayList<>();
+		final CountDownLatch releaseBody = new CountDownLatch(1);
 		private final HttpServer http;
 		private HttpClient transport;
 
@@ -315,8 +532,18 @@ class UpbitOrderToolsTest {
 					if (status.get() == -1) {
 						return;
 					}
+					if (status.get() == -2) {
+						exchange.sendResponseHeaders(200, 100);
+						try {
+							releaseBody.await(12, TimeUnit.SECONDS);
+						}
+						catch (InterruptedException exception) {
+							Thread.currentThread().interrupt();
+						}
+						return;
+					}
 					String payload = body.get();
-					if (!payload.contains("\"uuid\"")) {
+					if (!payload.contains("\"uuid\"") && !payload.stripLeading().startsWith("[")) {
 						// Preserve valid permission JSON while putting secrets in an ignored field;
 						// malformed bodies carry the same markers as raw text.
 						String secrets = ACCESS + SECRET + token;

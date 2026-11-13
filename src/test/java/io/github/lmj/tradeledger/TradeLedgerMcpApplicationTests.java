@@ -51,9 +51,10 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndSingleReadOnlyOrderLookup() {
+	void registersOnlyTwoCalculationToolsAndTwoReadOnlyOrderLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
-				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order");
+				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
+						"get_upbit_closed_orders");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -67,6 +68,29 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
 		assertThat(asMap(specification.tool().outputSchema().get("properties")))
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
+	}
+
+	@Test
+	void closedOrdersSchemaExposesOnlySevenOptionalQueryParameters() {
+		SyncToolSpecification specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_upbit_closed_orders"))
+				.findFirst().orElseThrow();
+		Map<String, Object> properties = asMap(specification.tool().inputSchema().get("properties"));
+		assertThat(properties).containsOnlyKeys("market", "state", "states", "startTime", "endTime",
+				"limit", "orderBy");
+		Object required = specification.tool().inputSchema().get("required");
+		assertThat(required == null || List.of().equals(required)).isTrue();
+		assertThat(asMap(properties.get("states"))).containsEntry("type", "array");
+		assertThat(asMap(properties.get("limit"))).containsEntry("type", "integer");
+		for (String name : List.of("market", "state", "startTime", "endTime", "orderBy")) {
+			assertThat(asMap(properties.get(name))).containsEntry("type", "string");
+		}
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		assertThat(asMap(specification.tool().outputSchema().get("properties")))
+				.containsOnlyKeys("serviceId", "orders", "possiblyTruncated");
 	}
 
 	@Test
