@@ -9,11 +9,17 @@ import java.util.regex.Pattern;
 
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitClosedOrdersRequest;
+import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
 import io.github.lmj.tradeledger.application.model.CommonExecutionSnapshot;
+import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
+import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
+import io.modelcontextprotocol.spec.McpSchema.TextContent;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -25,6 +31,55 @@ public final class UpbitOrderTools {
 
 	public UpbitOrderTools(ObjectProvider<UpbitOrderClient> client) {
 		this.client = Objects.requireNonNull(client, "Upbit client provider must not be null");
+	}
+
+	@Bean
+	static BeanPostProcessor upbitToolErrorBoundary() {
+		// Run after tool registration, without instantiating the lazy client. Keep the
+		// generated tool definitions (including both schemas) and successful results.
+		return new BeanPostProcessor() {
+			@Override
+			public Object postProcessAfterInitialization(Object bean, String beanName) {
+				if (!"toolSpecs".equals(beanName) || !(bean instanceof List<?> specifications)) {
+					return bean;
+				}
+				return specifications.stream().map(entry -> {
+					if (!(entry instanceof SyncToolSpecification specification)) {
+						return entry;
+					}
+					String method = switch (specification.tool().name()) {
+						case "get_upbit_order" -> "getUpbitOrder";
+						case "get_upbit_order_executions" -> "getUpbitOrderExecutions";
+						case "get_upbit_closed_orders" -> "getUpbitClosedOrders";
+						default -> null;
+					};
+					if (method == null) {
+						return entry;
+					}
+					return new SyncToolSpecification(specification.tool(), (exchange, request) ->
+							normalizeError(specification.callHandler().apply(exchange, request), method));
+				}).toList();
+			}
+		};
+	}
+
+	private static CallToolResult normalizeError(CallToolResult result, String method) {
+		if (!Boolean.TRUE.equals(result.isError())) {
+			return result;
+		}
+		String message = "Upbit request failed: INTERNAL_ERROR";
+		if (result.content().size() == 1 && result.content().getFirst() instanceof TextContent text) {
+			// Match complete known messages, never forward arbitrary framework diagnostics.
+			for (UpbitErrorCode code : UpbitErrorCode.values()) {
+				String safe = "Upbit request failed: " + code.name();
+				if (text.text().equals(safe)
+						|| text.text().equals("Error invoking method: " + method + "\n" + safe)) {
+					message = safe;
+					break;
+				}
+			}
+		}
+		return CallToolResult.builder().isError(true).addTextContent(message).build();
 	}
 
 	@McpTool(
@@ -150,7 +205,7 @@ public final class UpbitOrderTools {
 
 	private static IllegalStateException safeFailure(RuntimeException exception) {
 		// Lazy bean creation can wrap the client's safe exception. Discard every cause
-		// before handing an error to MCP, whose handler selects the innermost message.
+		// before MCP adds its invocation prefix; the registration boundary removes it.
 		Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
 		for (Throwable cause = exception; cause != null && visited.add(cause); cause = cause.getCause()) {
 			if (cause instanceof UpbitApiException safe) {

@@ -22,8 +22,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -40,6 +43,7 @@ import io.github.lmj.tradeledger.TradeLedgerMcpApplication;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitApiException;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
+import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClientTest.StalledResponse;
 import io.github.lmj.tradeledger.application.model.OrderExecutionSnapshot;
 import io.github.lmj.tradeledger.config.TradeJournalProperties;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
@@ -895,12 +899,6 @@ class UpbitOrderToolsTest {
 	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
 	@SuppressWarnings("unchecked")
 	void initializationCauseGraphsTerminateAndKeepSafeCategories(String name) {
-		String methodName = switch (name) {
-			case "get_upbit_order" -> "getUpbitOrder";
-			case "get_upbit_order_executions" -> "getUpbitOrderExecutions";
-			case "get_upbit_closed_orders" -> "getUpbitClosedOrders";
-			default -> throw new AssertionError("Unknown test tool");
-		};
 		for (String shape : List.of("cycle", "safeCycle", "chain", "safeChain")) {
 			for (boolean registered : List.of(false, true)) {
 				BoundedCause first = new BoundedCause();
@@ -935,8 +933,7 @@ class UpbitOrderToolsTest {
 								assertSafeError(result, category);
 								assertThat(result.content()).hasSize(1).allSatisfy(content ->
 										assertThat(((TextContent) content).text())
-												.isEqualTo("Error invoking method: " + methodName
-														+ "\nUpbit request failed: " + category));
+												.isEqualTo("Upbit request failed: " + category));
 							});
 					// Include context shutdown in the collected-log checks.
 					assertNoSecrets(observed.get());
@@ -1232,6 +1229,183 @@ class UpbitOrderToolsTest {
 		}
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void errorBoundaryPreservesDefinitionsSuccessAndOtherToolsAndDiscardsUnknownDiagnostics(String name) {
+		List<?> originals = (List<?>) context.getBean("toolSpecs");
+		var boundary = UpbitOrderTools.upbitToolErrorBoundary();
+		List<?> wrapped = (List<?>) boundary.postProcessAfterInitialization(originals, "toolSpecs");
+		assertThat(wrapped).hasSameSizeAs(originals);
+		for (int index = 0; index < originals.size(); index++) {
+			SyncToolSpecification original = (SyncToolSpecification) originals.get(index);
+			SyncToolSpecification replacement = (SyncToolSpecification) wrapped.get(index);
+			assertThat(replacement.tool()).isSameAs(original.tool());
+			if (!original.tool().name().startsWith("get_upbit_")) {
+				assertThat(replacement).isSameAs(original);
+			}
+		}
+		assertThat(boundary.postProcessAfterInitialization(originals, "unrelatedBean")).isSameAs(originals);
+		SyncToolSpecification definition = originals.stream().map(SyncToolSpecification.class::cast)
+				.filter(specification -> specification.tool().name().equals(name)).findFirst().orElseThrow();
+		CallToolRequest request = CallToolRequest.builder(name).arguments(validArguments(name)).build();
+		CallToolResult success = CallToolResult.builder().isError(false).addTextContent("success")
+				.structuredContent(Map.of("value", "preserved")).build();
+		AtomicReference<CallToolResult> response = new AtomicReference<>(success);
+		AtomicInteger calls = new AtomicInteger();
+		SyncToolSpecification handler = new SyncToolSpecification(definition.tool(), (exchange, received) -> {
+			assertThat(received).isSameAs(request);
+			calls.incrementAndGet();
+			return response.get();
+		});
+		List<?> processed = (List<?>) boundary.postProcessAfterInitialization(List.of(handler), "toolSpecs");
+		SyncToolSpecification registered = (SyncToolSpecification) processed.getFirst();
+		assertThat(registered.callHandler().apply(null, request)).isSameAs(success);
+		String method = switch (name) {
+			case "get_upbit_order" -> "getUpbitOrder";
+			case "get_upbit_order_executions" -> "getUpbitOrderExecutions";
+			case "get_upbit_closed_orders" -> "getUpbitClosedOrders";
+			default -> throw new AssertionError("Unknown tool");
+		};
+		for (String diagnostic : List.of("Error invoking method: " + method
+				+ "\nUpbit request failed: NETWORK_ERROR", "Upbit request failed: NETWORK_ERROR",
+				"Error invoking method: " + method + "\nUpbit request failed: NETWORK_ERROR\n" + MARKER)) {
+			response.set(CallToolResult.builder().isError(true).addTextContent(diagnostic)
+					.structuredContent(Map.of("private", MARKER)).build());
+			CallToolResult result = registered.callHandler().apply(null, request);
+			assertSafeError(result, diagnostic.contains(MARKER) ? "INTERNAL_ERROR" : "NETWORK_ERROR");
+		}
+		assertThat(calls).hasValue(4);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void registeredHandlerReturnsExactSafeErrorWhenPendingClientIsClosed(String name) {
+		AtomicReference<LocalUpbit> retained = new AtomicReference<>();
+		AtomicReference<CallToolResult> observed = new AtomicReference<>();
+		shutdownRunner().run(application -> {
+			LocalUpbit local = application.getBean(LocalUpbit.class);
+			retained.set(local);
+			assertThat(application.getBeanFactory().containsSingleton("localUpbitClient")).isFalse();
+			assertThat(local.credentialReads).hasValue(0);
+			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+				try {
+					Future<CallToolResult> query = executor.submit(() -> call(application, name, shutdownArguments(name)));
+					local.stalled.awaitReceived();
+					assertThat(query.isDone()).isFalse();
+					assertThat(local.clientCreations).hasValue(1);
+					UpbitOrderClient client = application.getBean("localUpbitClient", UpbitOrderClient.class);
+					long deadline = local.stalled.beginObservation();
+					Future<?> closing = executor.submit(client::close);
+					closing.get(shutdownRemaining(deadline), TimeUnit.NANOSECONDS);
+					CallToolResult result = query.get(shutdownRemaining(deadline), TimeUnit.NANOSECONDS);
+					observed.set(result);
+					local.stalled.assertConnectionClosed(deadline);
+					assertThat(local.transport.isTerminated()).isTrue();
+					assertThat(System.nanoTime()).isLessThan(deadline);
+					assertThat(local.closed).isFalse();
+					local.stalled.assertSingleRequest(name.equals("get_upbit_closed_orders"));
+					local.stalled.assertNoAdditionalConnection();
+					assertShutdownError(result, local);
+				}
+				finally {
+					local.stalled.cancelTransport();
+				}
+			}
+		});
+		assertShutdownError(observed.get(), retained.get());
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
+	void contextCloseCancelsPendingHandlerAndOwnedTransportBeforeLocalServerCleanup(String name) {
+		AtomicReference<LocalUpbit> retained = new AtomicReference<>();
+		AtomicReference<CallToolResult> result = new AtomicReference<>();
+		shutdownRunner().run(application -> {
+			LocalUpbit local = application.getBean(LocalUpbit.class);
+			retained.set(local);
+			assertThat(application.getBeanFactory().containsSingleton("localUpbitClient")).isFalse();
+			assertThat(local.credentialReads).hasValue(0);
+			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+				try {
+					Future<CallToolResult> query = executor.submit(() -> call(application, name, shutdownArguments(name)));
+					local.stalled.awaitReceived();
+					assertThat(query.isDone()).isFalse();
+					long deadline = local.stalled.beginObservation();
+					CompletableFuture<Void> witnessed = new CompletableFuture<>();
+					// Spring destroys the dependent client before LocalUpbit. Observe before
+					// LocalUpbit's own fallback transport/server cleanup can affect the outcome.
+					local.beforeClose = () -> {
+						try {
+							result.set(query.get(shutdownRemaining(deadline), TimeUnit.NANOSECONDS));
+							assertThat(local.transport.isTerminated()).isTrue();
+							local.stalled.assertConnectionClosed(deadline);
+							assertThat(System.nanoTime()).isLessThan(deadline);
+							assertThat(local.closed).isFalse();
+							local.stalled.assertSingleRequest(name.equals("get_upbit_closed_orders"));
+							local.stalled.assertNoAdditionalConnection();
+							assertShutdownError(result.get(), local);
+							assertThat(System.nanoTime()).isLessThan(deadline);
+							witnessed.complete(null);
+						}
+						catch (Exception | AssertionError failure) {
+							// Spring may log destruction failures: propagate this observation to
+							// the test caller rather than letting cleanup obscure a failed assertion.
+							witnessed.completeExceptionally(failure);
+						}
+					};
+					Future<?> closing = executor.submit(application::close);
+					closing.get(shutdownRemaining(deadline), TimeUnit.NANOSECONDS);
+					witnessed.get(shutdownRemaining(deadline), TimeUnit.NANOSECONDS);
+					assertThat(System.nanoTime()).isLessThan(deadline);
+				}
+				finally {
+					local.stalled.cancelTransport();
+				}
+			}
+		});
+		assertThat(retained.get().closed).isTrue();
+		assertShutdownError(result.get(), retained.get()); // Include context-shutdown logs too.
+	}
+
+	private static ApplicationContextRunner shutdownRunner() {
+		return new ApplicationContextRunner()
+				.withUserConfiguration(ProbeConfiguration.class, ShutdownLocalConfiguration.class)
+				.withPropertyValues("trade-ledger.journal.root=src/test/resources/journals",
+						"spring.ai.mcp.server.type=SYNC", "spring.ai.mcp.server.stdio=true",
+						"logging.console.enabled=false", "spring.main.banner-mode=off");
+	}
+
+	private static Map<String, Object> shutdownArguments(String name) {
+		return switch (name) {
+			case "get_upbit_closed_orders" -> Map.of();
+			case "get_upbit_order_executions" -> Map.of("accountAlias", "main", "uuid", ID);
+			default -> Map.of("uuid", ID);
+		};
+	}
+
+	private static long shutdownRemaining(long deadline) {
+		long nanos = deadline - System.nanoTime();
+		assertThat(nanos).as("Shutdown observation must finish within three seconds").isPositive();
+		return nanos;
+	}
+
+	private void assertShutdownError(CallToolResult result, LocalUpbit local) {
+		assertThat(result.isError()).isTrue();
+		assertThat(result.structuredContent()).isNull();
+		assertThat(result.content()).hasSize(1).first().isInstanceOfSatisfying(TextContent.class,
+				text -> assertThat(text.text()).isEqualTo("Upbit request failed: NETWORK_ERROR"));
+		assertNoSecrets(result, local);
+		List<String> observations = new ArrayList<>(List.of(result.content().toString()));
+		for (ILoggingEvent event : logs.list) {
+			observations.add(event.getFormattedMessage());
+			if (event.getThrowableProxy() != null) {
+				observations.add(ThrowableProxyUtil.asString(event.getThrowableProxy()));
+			}
+		}
+		assertThat(observations).allSatisfy(observation -> assertThat(observation)
+				.doesNotContain("Exception", "Caused by:", "\tat ", "java.net.", "Connection reset"));
+	}
+
 	private static String summary(String uuid, String state, String count, String volume) {
 		return "{\"uuid\":\"" + uuid + "\",\"market\":\"KRW-BTC\",\"side\":\"bid\","
 				+ "\"ord_type\":\"limit\",\"state\":\"" + state + "\",\"created_at\":\"2026-07-01T10:00:00+09:00\","
@@ -1439,13 +1613,17 @@ class UpbitOrderToolsTest {
 	private void assertSafeError(CallToolResult result, String category) {
 		assertThat(result.isError()).isTrue();
 		assertThat(result.structuredContent()).isNull();
-		assertThat(result.content()).isNotEmpty().allSatisfy(content ->
+		assertThat(result.content()).hasSize(1).allSatisfy(content ->
 				assertThat(content).isInstanceOfSatisfying(TextContent.class, text ->
-						assertThat(text.text()).contains("Upbit request failed: " + category)));
+						assertThat(text.text()).isEqualTo("Upbit request failed: " + category)));
 		assertNoSecrets(result);
 	}
 
 	private void assertNoSecrets(CallToolResult result) {
+		assertNoSecrets(result, server);
+	}
+
+	private void assertNoSecrets(CallToolResult result, LocalUpbit local) {
 		List<String> observations = new ArrayList<>(List.of(
 				result.content().toString(), String.valueOf(result.structuredContent())));
 		for (ILoggingEvent event : logs.list) {
@@ -1459,7 +1637,9 @@ class UpbitOrderToolsTest {
 					"StreamReadException", "Duplicate Object property",
 					"MalformedInputException", "UnmappableCharacterException", "CharacterCodingException", "Input length",
 					"StreamConstraintsException", "JsonParseException", "[Source:", "line: ", "column: ");
-			for (String token : server.tokens) {
+			List<String> tokens = new ArrayList<>(local.tokens);
+			if (local.stalled != null) { tokens.addAll(local.stalled.tokens); }
+			for (String token : tokens) {
 				assertThat(observation).doesNotContain(token, token.substring(7));
 			}
 		}
@@ -1554,6 +1734,25 @@ class UpbitOrderToolsTest {
 		}
 	}
 
+	@TestConfiguration(proxyBeanMethods = false)
+	static class ShutdownLocalConfiguration extends LocalConfiguration {
+		@Override
+		@Bean(destroyMethod = "close")
+		LocalUpbit localUpbit() throws IOException {
+			return new LocalUpbit(new StalledResponse(MARKER, ACCESS, SECRET));
+		}
+
+		@Override
+		@Bean
+		@Primary
+		@Lazy
+		UpbitOrderClient localUpbitClient(LocalUpbit server) throws ReflectiveOperationException {
+			UpbitOrderClient client = super.localUpbitClient(server);
+			server.stalled.observeClient(client);
+			return client;
+		}
+	}
+
 	static final class LocalUpbit implements AutoCloseable {
 		final AtomicReference<Map<String, String>> keys = new AtomicReference<>(KEYS);
 		final AtomicInteger status = new AtomicInteger(200);
@@ -1567,10 +1766,18 @@ class UpbitOrderToolsTest {
 		final List<String> headers = new CopyOnWriteArrayList<>();
 		final CountDownLatch releaseBody = new CountDownLatch(1);
 		private final HttpServer http;
+		private final StalledResponse stalled;
 		private HttpClient transport;
 		private boolean closed;
+		private Runnable beforeClose = () -> { };
+
+		LocalUpbit(StalledResponse stalled) {
+			this.stalled = stalled;
+			this.http = null;
+		}
 
 		LocalUpbit() throws IOException {
+			stalled = null;
 			http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
 			http.createContext("/", exchange -> {
 				requests.incrementAndGet();
@@ -1618,19 +1825,26 @@ class UpbitOrderToolsTest {
 		}
 
 		URI uri() {
+			if (stalled != null) { return stalled.uri(); }
 			return URI.create("http://127.0.0.1:" + http.getAddress().getPort() + "/v1/order");
 		}
 
 		@Override
-		public void close() {
+		public void close() throws Exception {
 			try {
+				beforeClose.run();
 				if (transport != null) {
 					transport.close();
 				}
 			}
 			finally {
-				http.stop(0);
-				closed = true;
+				try {
+					if (stalled != null) { stalled.close(); }
+				}
+				finally {
+					if (http != null) { http.stop(0); }
+					closed = true;
+				}
 			}
 		}
 	}
