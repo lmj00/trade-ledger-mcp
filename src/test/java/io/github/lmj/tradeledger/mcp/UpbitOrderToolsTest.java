@@ -13,6 +13,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -61,6 +63,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -72,6 +75,7 @@ import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.PriorityOrdered;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestContext;
 import org.springframework.test.context.TestExecutionListeners;
@@ -750,6 +754,289 @@ class UpbitOrderToolsTest {
 	}
 
 	@Test
+	void registeredAnnotationAdapterBaselineReportsConversionErrorsLogsAndClientAccess() {
+		// Reconstruct the adapter side of the old boundary using the actual toolSpecs,
+		// not Java method calls or a second annotation registration implementation.
+		// This is a reproducible baseline probe, not a historical pre-change run.
+		new ApplicationContextRunner()
+				.withUserConfiguration(ProbeConfiguration.class, ProbeLocalConfiguration.class,
+						RawAdapterObservationConfiguration.class)
+					.withPropertyValues("trade-ledger.journal.root=src/test/resources/journals",
+						"spring.ai.mcp.server.type=SYNC", "spring.ai.mcp.server.stdio=true",
+						"logging.console.enabled=false", "spring.main.banner-mode=off")
+				.run(application -> {
+					assertThat(application).hasNotFailed();
+					LocalUpbit local = application.getBean(LocalUpbit.class);
+					RawAdapterCapture capture = application.getBean(RawAdapterCapture.class);
+					assertThat(local.clientCreations).hasValue(0);
+					assertThat(local.credentialReads).hasValue(0);
+					assertThat(local.requests).hasValue(0);
+					JsonMapper mapper = JsonMapper.builder().build();
+					List<RawRejection> probes = new ArrayList<>();
+					for (Object value : List.of(1, true, List.of("probe"), Map.of("probe", "value"))) {
+						for (String name : List.of("get_upbit_order", "get_upbit_order_executions")) {
+							probes.add(new RawRejection(name, Map.of("uuid", value, "accountAlias", "probe"), "INVALID_UUID"));
+						}
+						probes.add(new RawRejection("get_upbit_order_executions",
+								Map.of("uuid", ID, "accountAlias", value), "BAD_REQUEST"));
+					}
+					for (Object limit : List.of("1", 1.0d, 4294967297L, Map.of("probe", List.of("value")))) {
+						probes.add(new RawRejection("get_upbit_closed_orders", Map.of("limit", limit), "BAD_REQUEST"));
+					}
+					probes.add(new RawRejection("get_upbit_closed_orders", Map.of("states", List.of(1)), "BAD_REQUEST"));
+					probes.add(new RawRejection("get_upbit_closed_orders", Map.of("startTime", 1782867600000L), "BAD_REQUEST"));
+					int index = 0;
+					for (RawRejection probe : probes) {
+						// Exercise JSON -> Map before both handlers, just as the transport does.
+						Map<String, Object> arguments = asMap(mapper.readValue(mapper.writeValueAsString(probe.arguments()), Map.class));
+						CallToolRequest request = CallToolRequest.builder(probe.name()).arguments(arguments).build();
+						SyncToolSpecification adapter = capture.tool(probe.name());
+						SyncToolSpecification guarded = registeredTool(application, probe.name());
+						assertThat(guarded).isNotSameAs(adapter);
+						assertThat(guarded.tool()).isSameAs(adapter.tool());
+						local.body.set(probe.name().equals("get_upbit_closed_orders") ? "[]" : ORDER);
+						int creations = local.clientCreations.get();
+						int reads = local.credentialReads.get();
+						int sends = local.requests.get();
+						logs.list.clear();
+						CallToolResult baseline = null;
+						RuntimeException thrown = null;
+						try {
+							baseline = adapter.callHandler().apply(null, request);
+							assertThat(baseline).isNotNull();
+						}
+						catch (RuntimeException failure) {
+							thrown = failure;
+						}
+						String outcome = thrown != null ? "thrown"
+								: Boolean.TRUE.equals(baseline.isError()) ? "error" : "success";
+						List<String> diagnostics = new ArrayList<>();
+						if (baseline != null) { diagnostics.add(baseline.content().toString()); }
+						if (thrown != null) { diagnostics.add(String.valueOf(thrown.getMessage())); }
+						for (ILoggingEvent event : logs.list) {
+							diagnostics.add(event.getFormattedMessage());
+							if (event.getThrowableProxy() != null) {
+								diagnostics.add(ThrowableProxyUtil.asString(event.getThrowableProxy()));
+							}
+						}
+						boolean conversionDiagnostic = diagnostics.stream().anyMatch(text ->
+								text.contains("convert") || text.contains("deserialize"));
+						boolean invocationDiagnostic = diagnostics.stream().anyMatch(text -> text.contains("Error invoking"));
+						int logEvents = logs.list.size();
+						boolean loggedCause = logs.list.stream().anyMatch(event -> event.getThrowableProxy() != null);
+						int baselineCreations = local.clientCreations.get() - creations;
+						int baselineReads = local.credentialReads.get() - reads;
+						int baselineSends = local.requests.get() - sends;
+						// Keep baseline diagnostics out of assertions on the protected path.
+						// Only fixed labels, booleans and counters are emitted as evidence.
+						logs.list.clear();
+						assertSafeError(guarded.callHandler().apply(null, request), probe.code());
+						assertThat(local.clientCreations).hasValue(creations + baselineCreations);
+						assertThat(local.credentialReads).hasValue(reads + baselineReads);
+						assertThat(local.requests).hasValue(sends + baselineSends);
+						assertNoInvocationDiagnostics();
+						System.out.printf("UPBIT_RAW_ADAPTER_BASELINE tool=%s case=%d outcome=%s conversionDiagnostic=%s invocationDiagnostic=%s "
+								+ "logEvents=%d loggedCause=%s clientCreations=%d credentialReads=%d httpRequests=%d "
+								+ "guardedCode=%s guardedClientCreations=0 guardedCredentialReads=0 guardedHttpRequests=0%n",
+								probe.name(), ++index, outcome, conversionDiagnostic, invocationDiagnostic, logEvents, loggedCause,
+								baselineCreations, baselineReads, baselineSends, probe.code());
+					}
+				});
+	}
+
+	@Test
+	void rawTypesAreRejectedBeforeAnnotationHandlerAndRegisteredClientAccess() {
+		server.keys.set(Map.of());
+		int creations = server.clientCreations.get();
+		for (RawRejection rejection : rawRejections()) {
+			assertSafeError(call(rejection.name(), rejection.arguments()), rejection.code());
+			assertRejectedBeforeAnnotationHandler(rejection);
+		}
+		assertThat(server.clientCreations).hasValue(creations);
+		assertThat(server.credentialReads).hasValue(0);
+		assertThat(server.requests).hasValue(0);
+		assertNoInvocationDiagnostics();
+	}
+
+	@Test
+	void closedOrdersOmittedNullAndEmptyArgumentsAndFieldsHaveIdenticalDefaults() {
+		server.body.set("[]");
+		String name = "get_upbit_closed_orders";
+		Map<String, Object> nullFields = new java.util.LinkedHashMap<>();
+		for (String field : List.of("market", "state", "states", "startTime", "endTime", "limit", "orderBy")) {
+			nullFields.put(field, null);
+		}
+		List<CallToolRequest> requests = List.of(CallToolRequest.builder(name).build(),
+				CallToolRequest.builder(name).arguments(null).build(),
+				CallToolRequest.builder(name).arguments(Map.of()).build(),
+				CallToolRequest.builder(name).arguments(nullFields).build(),
+				CallToolRequest.builder(name).arguments(asMap(JsonMapper.builder().build().readValue(
+						"{\"market\":null,\"state\":null,\"states\":null,\"startTime\":null,\"endTime\":null,\"limit\":null,\"orderBy\":null}",
+						Map.class))).build(),
+				CallToolRequest.builder(name).arguments(Map.of("limit", 100)).build());
+		Object expected = null;
+		int count = 0;
+		for (CallToolRequest request : requests) {
+			CallToolResult result = registeredTool(context, name).callHandler().apply(null, request);
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			if (expected == null) { expected = result.structuredContent(); }
+			assertThat(result.structuredContent()).isEqualTo(expected);
+			assertMatchingSuccessContent(result);
+			assertNoSecrets(result);
+			assertThat(server.requests).hasValue(++count);
+			assertThat(server.credentialReads).hasValue(count);
+		}
+		assertThat(server.paths).hasSize(count).allSatisfy(path -> assertThat(path).isEqualTo(
+				"GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=100&order_by=desc"));
+	}
+
+	@Test
+	void closedOrdersAcceptsOnlyIntegralRepresentationsWithoutChangingTheRequest() {
+		server.body.set("[]");
+		List<Object> limits = List.of((byte) 1, (byte) 100, Byte.MAX_VALUE,
+				(short) 1, (short) 100, (short) 1000, 1, 100, 1000, 1L, 100L, 1000L,
+				BigInteger.ONE, BigInteger.valueOf(100), BigInteger.valueOf(1000));
+		int calls = 0;
+		for (Object limit : limits) {
+			CallToolResult result = callClosed(Map.of("limit", limit));
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			assertMatchingSuccessContent(result);
+			assertNoSecrets(result);
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths.getLast()).isEqualTo(
+					"GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit=" + limit + "&order_by=desc");
+		}
+		for (String json : List.of("{\"limit\":1}", "{\"limit\":100}", "{\"limit\":1000}")) {
+			Map<String, Object> arguments = asMap(JsonMapper.builder().build().readValue(json, Map.class));
+			CallToolResult result = callClosed(arguments);
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			assertMatchingSuccessContent(result);
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths.getLast()).isEqualTo(
+					"GET /v1/orders/closed?states%5B%5D=done&states%5B%5D=cancel&limit="
+							+ arguments.get("limit") + "&order_by=desc");
+		}
+	}
+
+	@Test
+	void closedOrdersPreservesBothExplicitStatesOrders() {
+		server.body.set("[]");
+		int calls = 0;
+		for (List<String> states : List.of(List.of("done", "cancel"), List.of("cancel", "done"))) {
+			CallToolResult result = callClosed(Map.of("states", states));
+			assertThat(result.isError()).isNotEqualTo(Boolean.TRUE);
+			assertMatchingSuccessContent(result);
+			assertThat(server.requests).hasValue(++calls);
+			assertThat(server.credentialReads).hasValue(calls);
+			assertThat(server.paths.getLast()).isEqualTo("GET /v1/orders/closed?states%5B%5D=" + states.getFirst()
+					+ "&states%5B%5D=" + states.getLast() + "&limit=100&order_by=desc");
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private void assertRejectedBeforeAnnotationHandler(RawRejection rejection) {
+		SyncToolSpecification definition = registeredTool(context, rejection.name());
+		AtomicInteger annotationCalls = new AtomicInteger();
+		AtomicInteger providerCalls = new AtomicInteger();
+		ObjectProvider<UpbitOrderClient> provider = mock(ObjectProvider.class);
+		when(provider.getObject()).thenAnswer(invocation -> {
+			providerCalls.incrementAndGet();
+			throw new AssertionError("Rejected input reached provider");
+		});
+		SyncToolSpecification handler = new SyncToolSpecification(definition.tool(), (exchange, request) -> {
+			annotationCalls.incrementAndGet();
+			provider.getObject();
+			throw new AssertionError("Rejected input reached annotation handler");
+		});
+		List<?> wrapped = (List<?>) UpbitOrderTools.upbitToolErrorBoundary()
+				.postProcessAfterInitialization(List.of(handler), "toolSpecs");
+		CallToolResult result = ((SyncToolSpecification) wrapped.getFirst()).callHandler().apply(null,
+				CallToolRequest.builder(rejection.name()).arguments(rejection.arguments()).build());
+		assertSafeError(result, rejection.code());
+		assertThat(annotationCalls).hasValue(0);
+		assertThat(providerCalls).hasValue(0);
+		verifyNoInteractions(provider);
+	}
+
+	private record RawRejection(String name, Map<String, Object> arguments, String code) { }
+
+	private static List<RawRejection> rawRejections() {
+		List<RawRejection> cases = new ArrayList<>();
+		String secret = MARKER + ACCESS + SECRET + " Bearer eyJsynthetic.signature";
+		List<Object> wrongTypes = List.of(1, true, List.of(secret), new Object[] {secret}, Map.of(secret, List.of(secret)));
+		for (String name : List.of("get_upbit_order", "get_upbit_order_executions")) {
+			cases.add(new RawRejection(name, null, "INVALID_UUID"));
+			cases.add(new RawRejection(name, Map.of(), "INVALID_UUID"));
+			for (Object uuid : Stream.concat(Stream.of((Object) null, secret), wrongTypes.stream()).toList()) {
+				Map<String, Object> args = new java.util.LinkedHashMap<>();
+				args.put("uuid", uuid);
+				args.put("accountAlias", Map.of(secret, secret));
+				cases.add(new RawRejection(name, args, "INVALID_UUID"));
+			}
+		}
+		cases.add(new RawRejection("get_upbit_order_executions", Map.of("uuid", ID), "BAD_REQUEST"));
+		for (Object alias : Stream.concat(Stream.of((Object) null), wrongTypes.stream()).toList()) {
+			Map<String, Object> args = new java.util.LinkedHashMap<>();
+			args.put("uuid", ID);
+			args.put("accountAlias", alias);
+			cases.add(new RawRejection("get_upbit_order_executions", args, "BAD_REQUEST"));
+		}
+		for (String field : List.of("market", "state", "startTime", "endTime", "orderBy")) {
+			for (Object value : wrongTypes) {
+				cases.add(new RawRejection("get_upbit_closed_orders", Map.of(field, value), "BAD_REQUEST"));
+			}
+		}
+		for (Object states : List.of(secret, 1, true, Map.of(secret, secret), new String[] {"done"}, List.of(List.of(secret)),
+				java.util.Arrays.asList((Object) null), List.of(1), List.of(true), List.of(Map.of(secret, secret)),
+				java.util.Arrays.asList("done", null), List.of("done", 1), List.of("done", Map.of(secret, secret)),
+				List.of("done", "cancel", secret))) {
+			cases.add(new RawRejection("get_upbit_closed_orders", Map.of("states", states), "BAD_REQUEST"));
+		}
+		// A hostile oversized list must be rejected by size, without reading any element.
+		List<String> oversized = new java.util.AbstractList<>() {
+			@Override public int size() { return 3; }
+			@Override public String get(int index) { throw new AssertionError("Oversized states were traversed"); }
+		};
+		cases.add(new RawRejection("get_upbit_closed_orders", Map.of("states", oversized), "BAD_REQUEST"));
+		for (Object limit : List.of((byte) 0, (byte) -1, (short) 0, (short) -1, (short) 1001,
+				0, -1, 1001, 0L, -1L, 1001L, BigInteger.ZERO, BigInteger.valueOf(-1), BigInteger.valueOf(1001),
+				4294967297L, Long.MAX_VALUE, Long.MIN_VALUE,
+				new BigInteger("9223372036854775808"), new BigInteger("-9223372036854775809"),
+				new BigInteger("18446744073709551617"), "1", secret, true, List.of(1), Map.of(secret, secret),
+				1.0f, 1.0d, new BigDecimal("1.0"))) {
+			cases.add(new RawRejection("get_upbit_closed_orders", Map.of("limit", limit), "BAD_REQUEST"));
+		}
+		JsonMapper mapper = JsonMapper.builder().build();
+		for (Object alias : wrongTypes) {
+			String json = mapper.writeValueAsString(Map.of("uuid", ID, "accountAlias", alias));
+			cases.add(new RawRejection("get_upbit_order_executions", asMap(mapper.readValue(json, Map.class)), "BAD_REQUEST"));
+		}
+		for (String field : List.of("market", "state", "startTime", "endTime", "orderBy", "states", "limit")) {
+			String json = mapper.writeValueAsString(Map.of(field, Map.of(secret, List.of(secret))));
+			cases.add(new RawRejection("get_upbit_closed_orders", asMap(mapper.readValue(json, Map.class)), "BAD_REQUEST"));
+		}
+		for (String json : List.of("{\"uuid\":1}", "{\"uuid\":true}", "{\"uuid\":[]}", "{\"uuid\":{}}")) {
+			for (String name : List.of("get_upbit_order", "get_upbit_order_executions")) {
+				cases.add(new RawRejection(name, asMap(mapper.readValue(json, Map.class)), "INVALID_UUID"));
+			}
+		}
+		for (String json : List.of("{\"limit\":1.0}", "{\"limit\":4294967297}", "{\"limit\":9223372036854775808}",
+				"{\"states\":[null]}", "{\"states\":[1]}", "{\"states\":[[\"done\"]]}", "{\"startTime\":1782867600000}")) {
+			cases.add(new RawRejection("get_upbit_closed_orders", asMap(mapper.readValue(json, Map.class)), "BAD_REQUEST"));
+		}
+		return cases;
+	}
+
+	private void assertNoInvocationDiagnostics() {
+		for (ILoggingEvent event : logs.list) {
+			assertThat(event.getFormattedMessage()).doesNotContain("Error invoking", "Failed to convert", "Cannot deserialize");
+			assertThat(event.getThrowableProxy()).isNull();
+		}
+	}
+
+	@Test
 	void closedOrdersPassesOptionsAndNormalizesAnExactlySevenDayInterval() {
 		server.body.set("[]");
 		CallToolResult result = callClosed(Map.of("market", "KRW-BTC", "state", "cancel",
@@ -1233,6 +1520,9 @@ class UpbitOrderToolsTest {
 	@ValueSource(strings = {"get_upbit_order", "get_upbit_order_executions", "get_upbit_closed_orders"})
 	void errorBoundaryPreservesDefinitionsSuccessAndOtherToolsAndDiscardsUnknownDiagnostics(String name) {
 		List<?> originals = (List<?>) context.getBean("toolSpecs");
+		assertThat(originals).hasSize(10);
+		assertThat(originals.stream().map(SyncToolSpecification.class::cast)
+				.map(specification -> specification.tool().name()).toList()).doesNotHaveDuplicates();
 		var boundary = UpbitOrderTools.upbitToolErrorBoundary();
 		List<?> wrapped = (List<?>) boundary.postProcessAfterInitialization(originals, "toolSpecs");
 		assertThat(wrapped).hasSameSizeAs(originals);
@@ -1240,6 +1530,10 @@ class UpbitOrderToolsTest {
 			SyncToolSpecification original = (SyncToolSpecification) originals.get(index);
 			SyncToolSpecification replacement = (SyncToolSpecification) wrapped.get(index);
 			assertThat(replacement.tool()).isSameAs(original.tool());
+			assertThat(replacement.tool().name()).isEqualTo(original.tool().name());
+			assertThat(replacement.tool().inputSchema()).isSameAs(original.tool().inputSchema());
+			assertThat(replacement.tool().outputSchema()).isSameAs(original.tool().outputSchema());
+			assertThat(replacement.tool().annotations()).isSameAs(original.tool().annotations());
 			if (!original.tool().name().startsWith("get_upbit_")) {
 				assertThat(replacement).isSameAs(original);
 			}
@@ -1275,6 +1569,27 @@ class UpbitOrderToolsTest {
 			assertSafeError(result, diagnostic.contains(MARKER) ? "INTERNAL_ERROR" : "NETWORK_ERROR");
 		}
 		assertThat(calls).hasValue(4);
+	}
+
+	@Test
+	void defaultClosedOrdersBoundaryPreservesRequestMetadataAndSuccess() {
+		String name = "get_upbit_closed_orders";
+		Map<String, Object> metadata = Map.of("progressToken", "local-progress");
+		CallToolRequest request = CallToolRequest.builder(name).meta(metadata).build();
+		CallToolResult success = CallToolResult.builder().addTextContent("success").build();
+		AtomicInteger calls = new AtomicInteger();
+		SyncToolSpecification handler = new SyncToolSpecification(registeredTool(context, name).tool(), (exchange, received) -> {
+			assertThat(received.name()).isEqualTo(name);
+			assertThat(received.arguments()).isEmpty();
+			assertThat(received.meta()).isSameAs(metadata);
+			calls.incrementAndGet();
+			return success;
+		});
+		List<?> wrapped = (List<?>) UpbitOrderTools.upbitToolErrorBoundary()
+				.postProcessAfterInitialization(List.of(handler), "toolSpecs");
+		assertThat(((SyncToolSpecification) wrapped.getFirst()).callHandler().apply(null, request)).isSameAs(success);
+		assertThat(calls).hasValue(1);
+		assertThat(request.arguments()).isNull();
 	}
 
 	@ParameterizedTest
@@ -1433,13 +1748,17 @@ class UpbitOrderToolsTest {
 	}
 
 	private static CallToolResult call(ApplicationContext application, String name, Map<String, Object> arguments) {
+		return registeredTool(application, name).callHandler().apply(null,
+				CallToolRequest.builder(name).arguments(arguments).build());
+	}
+
+	private static SyncToolSpecification registeredTool(ApplicationContext application, String name) {
 		Object specs = application.getBean("toolSpecs");
 		assertThat(specs).isInstanceOf(List.class);
-		SyncToolSpecification tool = ((List<?>) specs).stream()
+		return ((List<?>) specs).stream()
 				.filter(SyncToolSpecification.class::isInstance).map(SyncToolSpecification.class::cast)
 				.filter(specification -> specification.tool().name().equals(name))
 				.findFirst().orElseThrow();
-		return tool.callHandler().apply(null, CallToolRequest.builder(name).arguments(arguments).build());
 	}
 
 	@Test
@@ -1553,6 +1872,9 @@ class UpbitOrderToolsTest {
 							}
 							for (Map<String, Object> invalid : invalidClosedRequests().toList()) {
 								fixture.assertSafeError(fixture.callClosed(invalid), "BAD_REQUEST");
+							}
+							for (RawRejection rejection : rawRejections()) {
+								fixture.assertSafeError(fixture.call(rejection.name(), rejection.arguments()), rejection.code());
 							}
 							assertThat(local.clientCreations).hasValue(creations);
 							local.body.set(MARKER); // An accidental send would echo fake keys and the JWT too.
@@ -1692,6 +2014,37 @@ class UpbitOrderToolsTest {
 	@TestConfiguration(proxyBeanMethods = false)
 	@EnableAutoConfiguration
 	static class FailureConfiguration {
+	}
+
+	@TestConfiguration(proxyBeanMethods = false)
+	static class RawAdapterObservationConfiguration {
+		@Bean
+		static RawAdapterCapture rawAdapterCapture() {
+			return new RawAdapterCapture();
+		}
+	}
+
+	static final class RawAdapterCapture implements BeanPostProcessor, PriorityOrdered {
+		private List<?> specifications = List.of();
+
+		@Override
+		public int getOrder() {
+			return HIGHEST_PRECEDENCE;
+		}
+
+		@Override
+		public Object postProcessAfterInitialization(Object bean, String beanName) {
+			if ("toolSpecs".equals(beanName) && bean instanceof List<?> tools) {
+				specifications = List.copyOf(tools);
+			}
+			return bean; // Observe the framework's registrations without replacing them.
+		}
+
+		SyncToolSpecification tool(String name) {
+			return specifications.stream().filter(SyncToolSpecification.class::isInstance)
+					.map(SyncToolSpecification.class::cast)
+					.filter(specification -> specification.tool().name().equals(name)).findFirst().orElseThrow();
+		}
 	}
 
 	@TestConfiguration(proxyBeanMethods = false)
