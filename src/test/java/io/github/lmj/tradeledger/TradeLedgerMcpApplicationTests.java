@@ -66,11 +66,11 @@ class TradeLedgerMcpApplicationTests {
 	}
 
 	@Test
-	void registersOnlyTwoCalculationToolsAndSevenReadOnlyLookups() {
+	void registersOnlyTwoCalculationToolsAndEightReadOnlyLookups() {
 		assertThat(toolSpecifications()).extracting(specification -> specification.tool().name())
 				.containsExactlyInAnyOrder("summarize_journal", "analyze_trades", "get_upbit_order",
 						"get_upbit_closed_orders", "get_binance_account_trades", "get_upbit_order_executions",
-						"get_binance_account_executions", "get_toss_order", "get_toss_closed_orders");
+						"get_binance_account_executions", "get_toss_order", "get_toss_closed_orders", "get_toss_transactions");
 		SyncToolSpecification specification = toolSpecifications().stream()
 				.filter(candidate -> candidate.tool().name().equals("get_upbit_order"))
 				.findFirst().orElseThrow();
@@ -84,6 +84,44 @@ class TradeLedgerMcpApplicationTests {
 		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
 		assertThat(asMap(specification.tool().outputSchema().get("properties")))
 				.containsKeys("orderId", "executedVolume", "paidFee", "trades");
+	}
+
+	@Test
+	void tossTransactionsSchemaHasOnlyOptionalFiltersAndAllSeventeenRowFields() {
+		var specification = toolSpecifications().stream()
+				.filter(candidate -> candidate.tool().name().equals("get_toss_transactions")).findFirst().orElseThrow();
+		Map<String, Object> input = asMap(specification.tool().inputSchema().get("properties"));
+		assertThat(input).containsOnlyKeys("from", "to", "cursor", "limit");
+		for (String field : List.of("from", "to", "cursor")) {
+			assertThat(asMap(input.get(field))).containsEntry("type", "string");
+		}
+		assertThat(asMap(input.get("limit"))).containsEntry("type", "integer");
+		Object required = specification.tool().inputSchema().get("required");
+		assertThat(required == null || List.of().equals(required)).isTrue();
+		assertThat(specification.tool().annotations().readOnlyHint()).isTrue();
+		assertThat(specification.tool().annotations().destructiveHint()).isFalse();
+		assertThat(specification.tool().annotations().idempotentHint()).isTrue();
+		assertThat(specification.tool().annotations().openWorldHint()).isTrue();
+		Map<String, Object> output = asMap(specification.tool().outputSchema().get("properties"));
+		assertThat(output).containsOnlyKeys("serviceId", "transactions", "nextCursor", "hasNext");
+		assertThat(asMap(output.get("serviceId"))).containsEntry("type", "string");
+		assertThat(asMap(output.get("hasNext"))).containsEntry("type", "boolean");
+		assertNullableType(output.get("nextCursor"), "string");
+		assertThat(asMap(output.get("transactions"))).containsEntry("type", "array");
+		Map<String, Object> row = asMap(asMap(asMap(output.get("transactions")).get("items")).get("properties"));
+		assertThat(row).containsOnlyKeys("transactionType", "marketCountry", "currency", "symbol", "assetClass",
+				"isinCode", "quantity", "filledPrice", "amount", "commission", "tax", "netAmount", "exchangeRate",
+				"settlementDate", "settled", "transactionTime", "isCancellation");
+		for (String field : List.of("symbol", "assetClass", "isinCode", "quantity", "filledPrice", "amount",
+				"netAmount", "exchangeRate", "transactionTime")) {
+			assertNullableType(row.get(field), "string");
+		}
+		for (String field : List.of("transactionType", "marketCountry", "currency", "commission", "tax", "settlementDate")) {
+			assertThat(asMap(row.get(field))).containsEntry("type", "string");
+		}
+		for (String field : List.of("settled", "isCancellation")) {
+			assertThat(asMap(row.get(field))).containsEntry("type", "boolean");
+		}
 	}
 
 	@Test
