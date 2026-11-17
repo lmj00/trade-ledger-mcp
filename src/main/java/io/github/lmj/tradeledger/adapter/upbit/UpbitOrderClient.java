@@ -116,6 +116,8 @@ public final class UpbitOrderClient implements AutoCloseable {
 	/** Release the owned HTTP client and its connection/worker resources. */
 	@Override
 	public void close() {
+		// Cancel in-flight exchanges before waiting for the owned transport to terminate.
+		http.shutdownNow();
 		http.close();
 	}
 

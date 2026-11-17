@@ -2,18 +2,31 @@ package io.github.lmj.tradeledger.adapter.upbit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.mock;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -22,11 +35,16 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -41,7 +59,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import tools.jackson.databind.json.JsonMapper;
 
-class UpbitOrderClientTest {
+public class UpbitOrderClientTest {
 
 	private static final String ID = "123e4567-e89b-12d3-a456-426614174000";
 	private static final String UPPER_ID = "123E4567-E89B-12D3-A456-426614174000";
@@ -1232,6 +1250,339 @@ class UpbitOrderClientTest {
 		assertThat(cancelled).isTrue();
 		assertThatThrownBy(() -> subscriber.getBody().toCompletableFuture().join())
 				.hasCauseInstanceOf(UpbitApiException.class);
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void closeCancelsIncompleteBodyQueryAndConnectionBeforeCleanup(boolean closed) throws Exception {
+		try (StalledResponse peer = new StalledResponse();
+				var executor = Executors.newVirtualThreadPerTaskExecutor();
+				UpbitOrderClient client = new UpbitOrderClient(peer.uri(), () -> KEYS)) {
+			peer.observeClient(client);
+			try {
+				Future<?> query = executor.submit(() -> expect(UpbitErrorCode.NETWORK_ERROR,
+						() -> get(client, closed), peer.tokens));
+				peer.awaitReceived();
+				assertThat(query.isDone()).isFalse();
+				long deadline = peer.beginObservation();
+				Future<?> closing = executor.submit(client::close);
+				closing.get(remaining(deadline), TimeUnit.NANOSECONDS);
+				query.get(remaining(deadline), TimeUnit.NANOSECONDS);
+				peer.assertConnectionClosed(deadline);
+				assertThat(peer.transport.isTerminated()).isTrue();
+				assertThat(System.nanoTime()).isLessThan(deadline);
+				peer.reportObservation("shutdownNow", closed, closing, query, deadline);
+				executor.submit(client::close).get(remaining(deadline), TimeUnit.NANOSECONDS);
+				expect(UpbitErrorCode.NETWORK_ERROR, () -> get(client, closed), peer.tokens);
+				// Closing either query path must also prevent sends through the other path.
+				expect(UpbitErrorCode.NETWORK_ERROR, () -> get(client, !closed), peer.tokens);
+				peer.assertSingleRequest(closed);
+				peer.assertNoAdditionalConnection();
+			}
+			finally {
+				peer.cancelTransport();
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void orderlyCloseWithoutCancellationLeavesCallerQueryAndConnectionPending(boolean closed) throws Exception {
+		try (StalledResponse peer = new StalledResponse();
+				var executor = Executors.newVirtualThreadPerTaskExecutor();
+				UpbitOrderClient client = new UpbitOrderClient(peer.uri(), () -> KEYS)) {
+			peer.observeClient(client);
+			// Reproduce the original close(): withhold cancellation, retain the real JDK close().
+			doNothing().when(peer.observed).shutdownNow();
+			CountDownLatch orderlyCloseEntered = new CountDownLatch(1);
+			doAnswer(invocation -> {
+				orderlyCloseEntered.countDown();
+				peer.transport.close();
+				return null;
+			}).when(peer.observed).close();
+			try {
+				Future<?> query = executor.submit(() -> expect(UpbitErrorCode.NETWORK_ERROR,
+						() -> get(client, closed), peer.tokens));
+				peer.awaitReceived();
+				long deadline = peer.beginObservation();
+				Future<?> closing = executor.submit(client::close);
+				assertThat(orderlyCloseEntered.await(remaining(deadline), TimeUnit.NANOSECONDS)).isTrue();
+				assertThatThrownBy(() -> closing.get(remaining(deadline), TimeUnit.NANOSECONDS))
+						.isInstanceOf(TimeoutException.class);
+				assertThat(closing.isDone()).isFalse();
+				assertThat(query.isDone()).isFalse();
+				assertThat(peer.connection.get(1, TimeUnit.NANOSECONDS)).isFalse();
+				assertThat(peer.transport.isTerminated()).isFalse();
+				assertThat(peer.accepted.get().isClosed()).isFalse();
+				peer.assertSingleRequest(closed);
+				peer.reportObservation("orderly", closed, closing, query, deadline);
+				peer.cancelTransport();
+				closing.get(3, TimeUnit.SECONDS);
+				query.get(3, TimeUnit.SECONDS);
+			}
+			finally {
+				peer.cancelTransport();
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(booleans = {false, true})
+	void userInterruptPreservesInterruptedCategoryAndFlagAndCancelsConnection(boolean closed) throws Exception {
+		try (StalledResponse peer = new StalledResponse();
+				var executor = Executors.newVirtualThreadPerTaskExecutor();
+				UpbitOrderClient client = new UpbitOrderClient(peer.uri(), () -> KEYS)) {
+			peer.observeClient(client);
+			AtomicReference<Thread> caller = new AtomicReference<>();
+			try {
+				Future<?> query = executor.submit(() -> {
+					caller.set(Thread.currentThread());
+					expect(UpbitErrorCode.INTERRUPTED, () -> get(client, closed), peer.tokens);
+					assertThat(Thread.currentThread().isInterrupted()).isTrue();
+				});
+				peer.awaitReceived();
+				long deadline = peer.beginObservation();
+				caller.get().interrupt();
+				query.get(remaining(deadline), TimeUnit.NANOSECONDS);
+				peer.assertConnectionClosed(deadline);
+				assertThat(System.nanoTime()).isLessThan(deadline);
+				peer.assertSingleRequest(closed);
+			}
+			finally {
+				peer.cancelTransport();
+			}
+		}
+	}
+
+	@Test
+	void peerClosureDetectorRequiresRemoteEofAndRejectsLocalShutdownDataAndIoErrors() throws Exception {
+		try (ServerSocket listener = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"));
+				Socket remote = new Socket("127.0.0.1", listener.getLocalPort());
+				Socket local = listener.accept()) {
+			local.setSoTimeout(50);
+			assertThat(StalledResponse.peerClosed(local, local.getInputStream())).isFalse();
+			remote.getOutputStream().write('X');
+			remote.getOutputStream().flush();
+			assertThatThrownBy(() -> StalledResponse.peerClosed(local, local.getInputStream()))
+					.isInstanceOf(AssertionError.class);
+			for (IOException failure : List.of(new IOException("unexpected I/O"),
+					new SocketException("Connection reset"), new SocketException("Socket closed"))) {
+				assertThatThrownBy(() -> StalledResponse.peerClosed(local, new InputStream() {
+					@Override
+					public int read() throws IOException { throw failure; }
+				})).isSameAs(failure);
+			}
+			Thread.currentThread().interrupt();
+			try {
+				assertThatThrownBy(() -> StalledResponse.peerClosed(local, local.getInputStream()))
+						.isInstanceOf(InterruptedIOException.class);
+			}
+			finally { Thread.interrupted(); }
+			remote.shutdownOutput();
+			assertThat(StalledResponse.peerClosed(local, local.getInputStream())).isTrue();
+			InputStream input = local.getInputStream();
+			local.shutdownInput();
+			assertThatThrownBy(() -> StalledResponse.peerClosed(local, input))
+					.isInstanceOf(IOException.class).hasMessage("Local input is closed");
+			local.close();
+			assertThatThrownBy(() -> StalledResponse.peerClosed(local, InputStream.nullInputStream()))
+					.isInstanceOf(IOException.class).hasMessage("Local input is closed");
+		}
+	}
+
+	private static long remaining(long deadline) {
+		return Math.max(1, deadline - System.nanoTime());
+	}
+
+	/** Real loopback transport, also used by registered MCP handler shutdown regressions. */
+	public static final class StalledResponse implements AutoCloseable {
+		private final ServerSocket listener;
+		private final ExecutorService receiver = Executors.newVirtualThreadPerTaskExecutor();
+		private final CountDownLatch headersReceived = new CountDownLatch(1);
+		private final CountDownLatch bodyReceived = new CountDownLatch(1);
+		private final CountDownLatch observePeer = new CountDownLatch(1);
+		private final CountDownLatch bodyReleased = new CountDownLatch(1);
+		private final AtomicReference<Socket> accepted = new AtomicReference<>();
+		private final List<String> requests = new CopyOnWriteArrayList<>();
+		public final List<String> tokens = new CopyOnWriteArrayList<>();
+		private final CompletableFuture<Boolean> connection = new CompletableFuture<>();
+		private HttpClient transport;
+		private HttpClient observed;
+
+		public StalledResponse() throws IOException {
+			this(BODY_MARKER, UpbitJwtSignerTest.ACCESS, UpbitJwtSignerTest.SECRET);
+		}
+
+		public StalledResponse(String marker, String access, String secret) throws IOException {
+			listener = new ServerSocket(0, 4, java.net.InetAddress.getByName("127.0.0.1"));
+			receiver.submit(() -> {
+				try (Socket socket = listener.accept()) {
+					accepted.set(socket);
+					socket.setSoTimeout(3000);
+					var input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+					requests.add(input.readLine());
+					String line;
+					while ((line = input.readLine()) != null && !line.isEmpty()) {
+						if (line.regionMatches(true, 0, "Authorization: ", 0, 15)) {
+							tokens.add(line.substring(15));
+						}
+					}
+					String prefix = requests.getFirst().contains("/orders/closed?")
+							? "[" + CLOSED_ORDER + ",{\"private\":\""
+							: ORDER.stripTrailing().replaceFirst("}\\z", "") + ",\"private\":\"";
+					// A complete first summary must never escape as a partial closed-orders result.
+					prefix += marker + access + secret
+							+ tokens.getFirst() + "\"";
+					byte[] bytes = prefix.getBytes(StandardCharsets.UTF_8);
+					var output = socket.getOutputStream();
+					output.write(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+							+ Integer.toHexString(bytes.length) + "\r\n").getBytes(StandardCharsets.US_ASCII));
+					output.write(bytes);
+					output.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+					output.flush(); // No terminating chunk: the bounded subscriber remains pending.
+					observePeer.await();
+					socket.setSoTimeout(2500);
+					connection.complete(peerClosed(socket, input));
+					// Even a negative observation must leave the socket open until explicit cleanup.
+					bodyReleased.await();
+				}
+				catch (Exception | AssertionError failure) {
+					connection.completeExceptionally(failure);
+					throw failure;
+				}
+				return null;
+			});
+		}
+
+		public URI uri() {
+			return URI.create("http://127.0.0.1:" + listener.getLocalPort() + "/v1/order");
+		}
+
+		public void observeClient(UpbitOrderClient client) throws ReflectiveOperationException {
+			var field = UpbitOrderClient.class.getDeclaredField("http");
+			field.setAccessible(true);
+			transport = (HttpClient) field.get(client);
+			observed = mock(HttpClient.class, delegatesTo(transport));
+			// Observe delivery to the existing subscriber, preserving real transport and cancellation.
+			doAnswer(invocation -> {
+				HttpRequest request = invocation.getArgument(0);
+				HttpResponse.BodyHandler<byte[]> handler = invocation.getArgument(1);
+				return transport.sendAsync(request, info -> {
+					HttpResponse.BodySubscriber<byte[]> delegate = handler.apply(info);
+					headersReceived.countDown();
+					return new HttpResponse.BodySubscriber<byte[]>() {
+						@Override
+						public CompletionStage<byte[]> getBody() { return delegate.getBody(); }
+						@Override
+						public void onSubscribe(Flow.Subscription subscription) { delegate.onSubscribe(subscription); }
+						@Override
+						public void onNext(List<ByteBuffer> buffers) {
+							boolean nonempty = buffers.stream().anyMatch(ByteBuffer::hasRemaining);
+							delegate.onNext(buffers);
+							if (nonempty) { bodyReceived.countDown(); }
+						}
+						@Override
+						public void onError(Throwable failure) { delegate.onError(failure); }
+						@Override
+						public void onComplete() { delegate.onComplete(); }
+					};
+				});
+			}).when(observed).sendAsync(any(HttpRequest.class),
+					org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<byte[]>>any());
+			field.set(client, observed);
+		}
+
+		public void awaitReceived() throws InterruptedException {
+			assertThat(headersReceived.await(3, TimeUnit.SECONDS)).as("Response headers delivered").isTrue();
+			assertThat(bodyReceived.await(3, TimeUnit.SECONDS)).as("Incomplete body delivered").isTrue();
+		}
+
+		public long beginObservation() {
+			long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+			observePeer.countDown();
+			return deadline;
+		}
+
+		public void assertConnectionClosed(long deadline) throws Exception {
+			assertThat(connection.get(remaining(deadline), TimeUnit.NANOSECONDS)).as("Remote EOF before cleanup").isTrue();
+		}
+
+		public void assertSingleRequest(boolean closed) {
+			assertThat(requests).containsExactly("GET " + requestTarget(closed) + " HTTP/1.1");
+			assertThat(tokens).hasSize(1);
+		}
+
+		public void assertNoAdditionalConnection() throws IOException {
+			listener.setSoTimeout(100);
+			assertThatThrownBy(() -> {
+				try (Socket unexpected = listener.accept()) {
+					throw new AssertionError("Unexpected additional connection");
+				}
+			}).isInstanceOf(SocketTimeoutException.class);
+		}
+
+		private void reportObservation(String mode, boolean closed, Future<?> closing, Future<?> query, long deadline) {
+			System.out.printf("UPBIT_CLOSE_OBSERVATION path=%s mode=%s closeDone=%s queryDone=%s "
+					+ "remoteEof=%s transportTerminated=%s elapsedMs=%d%n", closed ? "closed" : "order", mode,
+					closing.isDone(), query.isDone(), connection.join(), transport.isTerminated(),
+					TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - deadline + Duration.ofSeconds(3).toNanos()));
+		}
+
+		static boolean peerClosed(Socket socket, java.io.Reader input) throws IOException {
+			return peerClosed(socket, new InputStream() {
+				@Override
+				public int read() throws IOException { return input.read(); }
+			});
+		}
+
+		static boolean peerClosed(Socket socket, InputStream input) throws IOException {
+			checkObserver(socket);
+			int value;
+			try { value = input.read(); }
+			catch (SocketTimeoutException timeout) {
+				checkObserver(socket);
+				return false;
+			}
+			checkObserver(socket);
+			assertThat(value).as("Only remote EOF establishes connection closure").isEqualTo(-1);
+			return true; // Resets and every other I/O error propagate; none count as success.
+		}
+
+		private static void checkObserver(Socket socket) throws IOException {
+			if (Thread.currentThread().isInterrupted()) { throw new InterruptedIOException("Observer interrupted"); }
+			if (socket.isClosed() || socket.isInputShutdown()) { throw new IOException("Local input is closed"); }
+		}
+
+		public void cancelTransport() {
+			if (transport != null) {
+				transport.shutdownNow();
+				transport.close();
+			}
+		}
+
+		@Override
+		public void close() throws Exception {
+			try {
+				cancelTransport();
+			}
+			finally {
+				bodyReleased.countDown();
+				observePeer.countDown();
+				try {
+					Socket socket = accepted.get();
+					if (socket != null) { socket.close(); }
+				}
+				finally {
+					try {
+						listener.close();
+					}
+					finally {
+						receiver.shutdownNow();
+						receiver.close();
+					}
+				}
+			}
+		}
 	}
 
 	@ParameterizedTest
