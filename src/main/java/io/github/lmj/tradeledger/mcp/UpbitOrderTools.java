@@ -1,8 +1,10 @@
 package io.github.lmj.tradeledger.mcp;
 
+import java.math.BigInteger;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -13,6 +15,7 @@ import io.github.lmj.tradeledger.adapter.upbit.UpbitErrorCode;
 import io.github.lmj.tradeledger.adapter.upbit.UpbitOrderClient;
 import io.github.lmj.tradeledger.application.model.CommonExecutionSnapshot;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
+import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.TextContent;
 import org.springframework.ai.mcp.annotation.McpTool;
@@ -56,11 +59,76 @@ public final class UpbitOrderTools {
 					if (method == null) {
 						return entry;
 					}
-					return new SyncToolSpecification(specification.tool(), (exchange, request) ->
-							normalizeError(specification.callHandler().apply(exchange, request), method));
+					return new SyncToolSpecification(specification.tool(), (exchange, request) -> {
+						UpbitErrorCode invalid = rawArgumentError(method, request.arguments());
+						if (invalid != null) {
+							// Do not let the annotation adapter coerce input or log conversion diagnostics.
+							return CallToolResult.builder().isError(true)
+									.addTextContent("Upbit request failed: " + invalid.name()).build();
+						}
+						if (request.arguments() == null) {
+							// Only the all-optional closed-orders tool can reach this default query.
+							request = CallToolRequest.builder(request.name()).arguments(Map.of())
+									.meta(request.meta()).build();
+						}
+						return normalizeError(specification.callHandler().apply(exchange, request), method);
+					});
 				}).toList();
 			}
 		};
+	}
+
+	private static UpbitErrorCode rawArgumentError(String method, Map<String, Object> arguments) {
+		Map<String, Object> values = arguments == null ? Map.of() : arguments;
+		if (!"getUpbitClosedOrders".equals(method)) {
+			// Preserve UUID precedence even if accountAlias would fail adapter conversion.
+			if (!(values.get("uuid") instanceof String uuid) || !UUID.matcher(uuid).matches()) {
+				return UpbitErrorCode.INVALID_UUID;
+			}
+			if ("getUpbitOrderExecutions".equals(method)
+					&& !(values.get("accountAlias") instanceof String)) {
+				return UpbitErrorCode.BAD_REQUEST;
+			}
+			return null;
+		}
+		for (String field : List.of("market", "state", "startTime", "endTime", "orderBy")) {
+			Object value = values.get(field);
+			if (value != null && !(value instanceof String)) {
+				return UpbitErrorCode.BAD_REQUEST;
+			}
+		}
+		Object states = values.get("states");
+		if (states != null) {
+			// Bound the collection before inspecting elements; never coerce them to text.
+			if (!(states instanceof List<?> list) || list.size() > 2) {
+				return UpbitErrorCode.BAD_REQUEST;
+			}
+			for (Object state : list) {
+				if (!(state instanceof String)) {
+					return UpbitErrorCode.BAD_REQUEST;
+				}
+			}
+		}
+		Object limit = values.get("limit");
+		if (limit != null) {
+			// Project policy: reject floating-point/decimal representations, including 1.0.
+			// Check before the adapter narrows to Integer, so large integers cannot wrap.
+			if (limit instanceof BigInteger integer) {
+				if (integer.compareTo(BigInteger.ONE) < 0 || integer.compareTo(BigInteger.valueOf(1000)) > 0) {
+					return UpbitErrorCode.BAD_REQUEST;
+				}
+			}
+			else if (limit instanceof Byte || limit instanceof Short || limit instanceof Integer || limit instanceof Long) {
+				long integer = ((Number) limit).longValue();
+				if (integer < 1 || integer > 1000) {
+					return UpbitErrorCode.BAD_REQUEST;
+				}
+			}
+			else {
+				return UpbitErrorCode.BAD_REQUEST;
+			}
+		}
+		return null;
 	}
 
 	private static CallToolResult normalizeError(CallToolResult result, String method) {
