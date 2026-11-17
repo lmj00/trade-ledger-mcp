@@ -25,9 +25,10 @@ import java.util.function.Supplier;
 
 import io.github.lmj.tradeledger.application.model.TossClosedOrdersSnapshot;
 import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
+import io.github.lmj.tradeledger.application.model.TossTransactionsSnapshot;
 
 /**
- * One read-only GET for an order or one CLOSED page at the fixed Toss origin.
+ * One read-only GET for an order, one CLOSED page or one transactions page at the fixed Toss origin.
  * Reads externally issued TOSS_ACCESS_TOKEN and TOSS_ACCOUNT_SEQ per call.
  * No token issuance/refresh, account discovery, redirects, retries or pagination.
  *
@@ -48,6 +49,7 @@ public final class TossOrderClient implements AutoCloseable {
 	private final Supplier<Map<String, String>> environment;
 	private final HttpClient http;
 	private final TossOrderMapper mapper = new TossOrderMapper();
+	private final TossTransactionsMapper transactionsMapper = new TossTransactionsMapper();
 
 	public TossOrderClient() {
 		this(ENDPOINT, System::getenv, false);
@@ -136,6 +138,25 @@ public final class TossOrderClient implements AutoCloseable {
 		String json = send(authenticatedRequest(uri));
 		try {
 			return mapper.mapClosedOrders(request, json);
+		}
+		catch (RuntimeException exception) {
+			throw new TossApiException(TossErrorCode.INVALID_RESPONSE);
+		}
+	}
+
+	/** Retrieves one settlement-ledger page, without order linkage or automatic traversal. */
+	public TossTransactionsSnapshot getTransactions(TossTransactionsRequest request) {
+		if (request == null) {
+			throw new TossApiException(TossErrorCode.BAD_REQUEST);
+		}
+		StringBuilder query = new StringBuilder("limit=").append(request.limit());
+		appendQuery(query, "from", request.from());
+		appendQuery(query, "to", request.to());
+		appendQuery(query, "cursor", request.cursor());
+		URI uri = endpoint.resolve("/api/v1/transactions?" + query);
+		String json = send(authenticatedRequest(uri));
+		try {
+			return transactionsMapper.map(request, json);
 		}
 		catch (RuntimeException exception) {
 			throw new TossApiException(TossErrorCode.INVALID_RESPONSE);

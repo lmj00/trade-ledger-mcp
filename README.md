@@ -508,7 +508,7 @@ CSV 파일을 읽지 않고 요청의 `trades`를 분석합니다. 요청당 **1
 | --- | --- | --- | --- | --- | --- |
 | 업비트 | 단건·종료 주문 조회·인증·호출 제한 공식 규격 참조. 종료 주문의 단독 경계와 7일 기본 동작 안내 | 두 조회 경로와 MCP 연결 반영. 매수·매도 매칭·실현손익 미구현 | 어댑터·등록 MCP 핸들러 모의 테스트 존재 | 미검증 | 최신 공식 주문조회 권한·default 공유 한도 확인, 조회 전용 실계정 원본과 UUID·종료 주문 요약·체결·주문 수수료 대조. 페이지 규격과 수수료 통화·시간대가 보존된 비식별 분할 체결 예시 |
 | 바이낸스 | 현물 계정 체결 규격·공식 문서 참조 | 단일 symbol의 거래소별·공통 체결 MCP 응답, 문자열 ID·금액, 지연 생성과 종료 연결 반영 | 두 등록 핸들러의 입력·단일 전송·안전한 오류와 공통 응답 회귀 테스트 존재 | 미검증 | 현물 규격·조회 전용 권한·서명·HTTP 오류 계약을 모의 결과와 대조하고 MCP 연결 검토. 파생상품·파일 내보내기 방식은 별도 확인, 수수료 자산·시간대·부분 청산 예시 필요 |
-| 토스증권 | 공식 OpenAPI 1.2.28의 주문·누적 체결 요약·종료 주문 목록·결제 거래내역 계약 참조 | 단건·종료 주문의 HTTP·Spring·MCP 연결과 별도 순수 결제 거래내역 한 페이지 매퍼 반영. 거래내역 전송·도구 연결은 미구현 | 합성 요청·모델·매퍼, 기존 주문 로컬 HTTP·등록 핸들러·독립 JVM 테스트 존재 | 실계정·조회 전용 권한 분리 미검증 | 아래 계약·운영 설정·남은 확인 참조. 실제 결제 내역 및 비용 귀속은 별도 대조 필요 |
+| 토스증권 | 공식 OpenAPI 1.2.28의 주문·누적 체결 요약·종료 주문 목록·결제 거래내역 계약 참조 | 단건·종료 주문의 HTTP·Spring·MCP 연결과 결제 거래내역 한 페이지의 기존 HTTP 클라이언트·매퍼 연결 반영. 거래내역 MCP 도구는 미연결 | 합성 요청·모델·매퍼, 세 HTTP 조회의 로컬 서버·독립 JVM 보호 검사와 기존 주문 등록 핸들러 테스트 존재 | 실계정·조회 전용 권한 분리 미검증 | 아래 계약·운영 설정·남은 확인 참조. 실제 결제 내역 및 비용 귀속은 별도 대조 필요 |
 
 ### 토스증권 단건 주문 요약 계약
 
@@ -592,9 +592,9 @@ JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.re
 
 연결 제한은 **3초**, 본문 완료까지 요청 전체 제한은 **10초**, 실제 수신 본문 상한은 **1 MiB(1,048,576바이트)**입니다. 고정 길이·chunked 본문 모두 상한 초과 시 부분 반환 없이 `RESPONSE_TOO_LARGE`로 실패하며, 지연·끝나지 않는 본문은 `TIMEOUT`으로 종료합니다. 잘못된 UTF-8 또는 매퍼가 거부한 성공 JSON은 `INVALID_RESPONSE`입니다. 리다이렉트·자동 재시도·추가 조회·페이지 순회는 없습니다. 대기를 중단하면 구독과 미완료 요청을 취소하고 인터럽트 플래그를 보존합니다. Spring은 생성된 토스 클라이언트의 `close()`를 컨텍스트 종료 시 호출하여 소유 HTTP 연결과 작업 자원을 종료합니다. 클라이언트를 직접 사용하는 소유자는 try-with-resources 또는 `close()`로 종료해야 합니다.
 
-HTTP 400·401·403·404·429는 각각 `BAD_REQUEST`·`AUTHENTICATION_FAILED`·`PERMISSION_DENIED`·`ORDER_NOT_FOUND`·`RATE_LIMITED`, 3xx는 `REDIRECT_REJECTED`, 5xx는 `SERVER_ERROR`, 나머지 비정상 상태는 `UNEXPECTED_STATUS`입니다. 비정상 상태의 본문을 파싱하거나 헤더 메시지로 원인을 추정하지 않습니다. 네트워크·시간초과·인터럽트는 `NETWORK_ERROR`·`TIMEOUT`·`INTERRUPTED`로 구분합니다. [TossApiException](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossApiException.java)은 `Toss request failed: <범주>`만 전달하며 원문·인증정보·주문 ID·파서 진단·cause·suppressed 예외를 남기지 않습니다.
+세 HTTP 조회에 같은 전송 보호와 상태 분류를 적용합니다. HTTP 400·401·403·404·429는 각각 `BAD_REQUEST`·`AUTHENTICATION_FAILED`·`PERMISSION_DENIED`·`ORDER_NOT_FOUND`·`RATE_LIMITED`, 3xx는 `REDIRECT_REJECTED`, 5xx는 `SERVER_ERROR`, 나머지 비정상 상태는 `UNEXPECTED_STATUS`입니다. 거래내역 조회의 404에도 기존 호환 코드 `ORDER_NOT_FOUND`를 유지하며 이 명칭은 해당 거래내역에 대응하는 주문 부재를 입증하지 않습니다. 비정상 상태의 본문을 파싱하거나 헤더 메시지로 원인을 추정하지 않습니다. 네트워크·시간초과·인터럽트는 `NETWORK_ERROR`·`TIMEOUT`·`INTERRUPTED`로 구분합니다. [TossApiException](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossApiException.java)은 `Toss request failed: <범주>`만 전달하며 원문·인증정보·주문 ID·cursor·파서 진단·cause·suppressed 예외를 남기지 않습니다.
 
-[TossOrderClientTest](src/test/java/io/github/lmj/tradeledger/adapter/toss/TossOrderClientTest.java)는 로컬 합성 응답으로 국내 완료·해외 부분 체결·무체결 거부·체결이 남은 취소 주문을 기존 매퍼까지 연결합니다. raw path·헤더 보존, 환경 검증, 독립 JVM 시작 설정, 본문 제한·시간초과, 최초·재사용 연결의 단일 전송, 인터럽트·취소·자원 종료와 오류·로그 비노출 검사도 포함합니다. 패키지 내부 테스트 주입은 고정 `/api/v1/orders/` 접두 경로와 리터럴 loopback HTTP(`127.0.0.1` 또는 `[::1]`)만 허용하며 userinfo·query·fragment·다른 호스트·경로를 거부합니다. 이 테스트의 존재는 실행 통과나 실계정 검증을 뜻하지 않습니다.
+[TossOrderClientTest](src/test/java/io/github/lmj/tradeledger/adapter/toss/TossOrderClientTest.java)는 로컬 합성 응답으로 국내 완료·해외 부분 체결·무체결 거부·체결이 남은 취소 주문과 별도 결제 거래내역 페이지를 각각 기존 매퍼까지 연결합니다. 세 조회에 raw path·헤더 보존, 환경 검증, 독립 JVM 시작 설정, 본문 제한·시간초과, 최초·재사용 연결의 단일 전송, 인터럽트·취소·자원 종료와 오류·로그 비노출 검사를 적용합니다. 패키지 내부 테스트 주입은 고정 `/api/v1/orders/` 접두 경로와 리터럴 loopback HTTP(`127.0.0.1` 또는 `[::1]`)만 허용하며 userinfo·query·fragment·다른 호스트·경로를 거부합니다. 목록과 거래내역의 고정 경로는 이 검증된 origin에서 내부적으로 만듭니다. 이 테스트의 존재는 실행 통과나 실계정 검증을 뜻하지 않습니다.
 
 ### `get_toss_order`: 지연 생성과 누적 체결 요약
 
@@ -675,9 +675,27 @@ MCP 초기화 후 기본 조회 예시입니다.
 
 자동 페이지 순회·기간 분할·상세 추가 조회, 결제 거래내역·개별 체결·공통 체결·완결 Trade·손익 생성, 비용·통화 합산·배분·환산과 실제 주문·취소·자금 이동은 수행하지 않습니다. 실계정·조회 전용 권한 분리·전체 내역 대조는 미검증입니다. [TossClosedOrdersResponseTest](src/test/java/io/github/lmj/tradeledger/mcp/TossClosedOrdersResponseTest.java)와 기존 TossOrderToolsTest는 순수 페이지 투영, 등록 핸들러·로컬 HTTP·독립 JVM 검사를 포함합니다. 테스트 소스의 존재는 실행 통과를 뜻하지 않습니다.
 
-### 결제 거래내역 한 페이지: 순수 요청·모델·제한 매퍼
+### 결제 거래내역 한 페이지: 기존 HTTP 클라이언트·매퍼
 
-공식 근거는 [OpenAPI JSON](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)의 `GET /api/v1/transactions` (`getTransactions`), `Transaction`·`PaginatedTransactionResponse`입니다. 참조 계약은 문서 버전 1.2.28이며 `latest`는 바뀔 수 있습니다. 지원 흐름은 **검증된 TossTransactionsRequest + 합성 성공 JSON → TossTransactionsMapper.map(request, json) → 불변 TossTransactionsSnapshot**입니다. 인증정보·환경 조회·HTTP·Spring·MCP 연결은 없고 등록 도구는 기존 아홉 개입니다. 기존 주문 매퍼·공통 체결 모델과 독립적이며 새 의존성이나 공통 파서 계층을 추가하지 않습니다.
+공식 근거는 [OpenAPI JSON](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)의 `GET /api/v1/transactions` (`getTransactions`), `Transaction`·`PaginatedTransactionResponse`입니다. 참조 계약은 문서 버전 1.2.28이며 `latest`는 바뀔 수 있습니다. 지원 흐름은 **검증된 TossTransactionsRequest → TossOrderClient.getTransactions(request)의 기존 환경 인증·제한 전송 → TossTransactionsMapper.map(request, json) → 불변 TossTransactionsSnapshot**입니다. 거래내역 MCP 도구는 미연결이며 등록 도구는 기존 아홉 개입니다. 기존 주문·공통 체결 모델로 변환하지 않으며 새 클라이언트·의존성·공통 전송 또는 파서 계층을 추가하지 않습니다.
+
+`getTransactions(request)`는 검증된 기존 endpoint와 같은 origin의 고정 `https://openapi.tossinvest.com/api/v1/transactions`에 본문 없는 GET을 호출당 정확히 한 번 보냅니다. limit은 항상, from·to·cursor는 지정된 값만 각각 한 번 전송하고 `transactionTypes`·`symbol`·`status`는 보내지 않습니다. 목적지·인증정보는 조회 인자로 받지 않습니다. null 요청은 환경 조회·전송 없이 `BAD_REQUEST`입니다. cursor는 기존 `appendQuery`의 UTF-8 퍼센트 인코딩을 거치므로 앞뒤 공백·`%2F`·`=`·`+`·`/`·`&`·`?`·`#`·한글·정상 surrogate 쌍이 값으로 보존되고 경로·fragment·추가 인자가 되지 않습니다.
+
+Java 21 사용 예시입니다. 위 '토스 HTTP 운영 설정과 제한'의 두 JVM 시작 옵션과 `TOSS_ACCESS_TOKEN`·`TOSS_ACCOUNT_SEQ` 환경변수가 필요합니다. 각 호출에서 인증정보를 다시 읽고 기존 Bearer·X-Tossinvest-Account·Accept 헤더를 적용합니다. 호출자가 클라이언트를 소유하고 종료합니다.
+
+```java
+import io.github.lmj.tradeledger.adapter.toss.TossOrderClient;
+import io.github.lmj.tradeledger.adapter.toss.TossTransactionsRequest;
+import io.github.lmj.tradeledger.application.model.TossTransactionsSnapshot;
+
+try (var client = new TossOrderClient()) {
+    TossTransactionsSnapshot page = client.getTransactions(new TossTransactionsRequest());
+    // 날짜 필터가 필요하면 new TossTransactionsRequest("2026-09-01", "2026-10-01", null, 20)
+    // 후속 조회는 호출자가 같은 계좌·필터와 응답의 nextCursor를 그대로 사용해 명시적으로 수행합니다.
+}
+```
+
+자동 페이지 순회·기간 분할·상세 추가 조회·재시도·토큰 발급·갱신은 수행하지 않습니다. 전송 오류는 기존 안전한 범주, 매퍼가 거부한 200 응답은 원문·파서 진단·원인 그래프 없는 `INVALID_RESPONSE`로 반환하고 부분 페이지를 제공하지 않습니다. 실제 서비스 호출·실계정 대조·조회 전용 권한 분리는 미검증입니다.
 
 [TossTransactionsRequest](src/main/java/io/github/lmj/tradeledger/adapter/toss/TossTransactionsRequest.java)는 선택적 `from`·`to`·`cursor`·`limit`만 받습니다. `transactionTypes`를 보내지 않는 전체 유형 조회 계약입니다. limit은 생략·null이면 20, 범위는 1~100입니다. from·to는 독립적으로 생략하는 엄격한 `YYYY-MM-DD`이며 둘 다 있으면 from ≤ to입니다. 윤년·동일 날짜·미래 날짜를 허용하며 생략된 경계를 생성하지 않습니다. 필터는 **양끝 포함 KST 결제일** 기준이고 미결제에는 예상 결제일을 적용합니다. 오늘을 to로 지정하면 예상 결제일이 미래인 미결제가 제외될 수 있습니다.
 
@@ -702,7 +720,7 @@ cursor는 trim·디코딩·생성 없이 보존합니다. **256 UTF-16 코드 �
 
 국내 미결제 합산 한 건이 결제 후 여러 행으로 바뀔 수 있고 미국 주식·옵션·채권의 제공 단위도 다릅니다. 거래내역을 개별 체결로 간주하지 않습니다. 금액 재계산·환산·잔액 변화 추정·주문 연결·개별 체결·공통 체결·Trade·손익 생성, 자동 페이지 수집과 주문·취소·자금 이동은 지원하지 않습니다. 국내 합산 미결제·결제 완료, 미국 주식·옵션·채권, 현금·환전·배당·증권 입출고·취소 내역은 합성 fixture로만 검사하며 **실계정 결제 거래내역 대조는 미검증**입니다.
 
-대응하는 네 테스트 클래스는 요청 경계, 17개 필드와 9개 nullable 계약, 페이지·불변성·반복 행, 자원 경계와 오류 비노출을 검사합니다. 기존 전체 회귀와 함께 Java 21 및 준비된 Gradle·의존성 캐시에서 다음 명령으로 재현합니다. 실행별 결과는 프로젝트 문서에 기록하지 않습니다.
+대응하는 네 요청·모델·매퍼 테스트 클래스는 요청 경계, 17개 필드와 9개 nullable 계약, 페이지·불변성·반복 행, 자원 경계와 오류 비노출을 검사합니다. TossOrderClientTest는 이 계약을 로컬 HTTP 응답에 연결하고 빈·짧은 다음 페이지, 100건·요청 limit, 누락 필드·손상된 마지막 항목·중복 키·후행 JSON·잘못된 UTF-8과 기존 전송 보호 검사를 포함합니다. 기존 전체 회귀와 함께 Java 21 및 준비된 Gradle·의존성 캐시에서 다음 명령으로 재현합니다. 실행별 결과는 프로젝트 문서에 기록하지 않습니다.
 
 ```bash
 JAVA_TOOL_OPTIONS='-Djdk.httpclient.disableRetryConnect=true -Djdk.httpclient.redirects.retrylimit=1' \

@@ -12,6 +12,9 @@ import java.io.StringWriter;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.ByteBuffer;
@@ -51,6 +54,8 @@ import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 
 import io.github.lmj.tradeledger.application.model.TossOrderSnapshot;
+import io.github.lmj.tradeledger.application.model.TossTransactionSnapshot;
+import io.github.lmj.tradeledger.application.model.TossTransactionsSnapshot;
 
 @ExtendWith(OutputCaptureExtension.class)
 class TossOrderClientTest {
@@ -88,12 +93,249 @@ class TossOrderClientTest {
 	}
 
 	@Test
-	void publicApiAcceptsOnlyTheRequestAndHasNoConfigurableDestination() {
+	void publicApiAcceptsOnlyTheRequestAndHasNoConfigurableDestination() throws Exception {
 		assertThat(TossOrderClient.class.getConstructors()).hasSize(1);
 		assertThat(TossOrderClient.class.getConstructors()[0].getParameterCount()).isZero();
 		assertThat(java.util.Arrays.stream(TossOrderClient.class.getDeclaredMethods())
 				.filter(method -> java.lang.reflect.Modifier.isPublic(method.getModifiers()))
-				.map(java.lang.reflect.Method::getName)).containsExactlyInAnyOrder("getOrder", "getClosedOrders", "close");
+				.map(java.lang.reflect.Method::getName))
+				.containsExactlyInAnyOrder("getOrder", "getClosedOrders", "getTransactions", "close");
+		assertThat(TossOrderClient.class.getMethod("getTransactions", TossTransactionsRequest.class).getReturnType())
+				.isEqualTo(TossTransactionsSnapshot.class);
+	}
+
+	@Test
+	void transactionsSendOnlySpecifiedQueryOnceWithoutCreatingDates() throws Exception {
+		List<URI> uris = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			uris.add(exchange.getRequestURI());
+			assertThat(exchange.getRequestMethod()).isEqualTo("GET");
+			assertThat(exchange.getRequestBody().readAllBytes()).isEmpty();
+			assertThat(exchange.getRequestHeaders().get("Accept")).containsExactly("application/json");
+			assertThat(exchange.getRequestHeaders().get("Authorization")).containsExactly("Bearer " + TOKEN);
+			assertThat(exchange.getRequestHeaders().get("X-Tossinvest-Account")).containsExactly(ACCOUNT);
+			reply(exchange, 200, transactionsPage(null, false));
+		})) {
+			record QueryCase(TossTransactionsRequest request, String raw) { }
+			List<QueryCase> cases = List.of(
+					new QueryCase(new TossTransactionsRequest(), "limit=20"),
+					new QueryCase(new TossTransactionsRequest(null, null, null, null), "limit=20"),
+					new QueryCase(new TossTransactionsRequest(null, null, null, 1), "limit=1"),
+					new QueryCase(new TossTransactionsRequest(null, null, null, 100), "limit=100"),
+					new QueryCase(new TossTransactionsRequest("2024-02-29", null, null, null), "limit=20&from=2024-02-29"),
+					new QueryCase(new TossTransactionsRequest(null, "9999-12-31", null, null), "limit=20&to=9999-12-31"),
+					new QueryCase(new TossTransactionsRequest("9999-12-31", "9999-12-31", null, null),
+							"limit=20&from=9999-12-31&to=9999-12-31"),
+					new QueryCase(new TossTransactionsRequest("2026-09-01", "2026-10-01", CURSOR, 100),
+							"limit=100&from=2026-09-01&to=2026-10-01&cursor=" + RAW_CURSOR));
+			var client = server.client();
+			for (QueryCase entry : cases) {
+				int before = uris.size();
+				var result = client.getTransactions(entry.request());
+				assertThat(result.transactions()).isEmpty();
+				assertThat(result.nextCursor()).isNull();
+				assertThat(result.hasNext()).isFalse();
+				assertThat(uris).hasSize(before + 1);
+				URI uri = uris.getLast();
+				assertThat(uri.getRawPath()).isEqualTo("/api/v1/transactions");
+				assertThat(uri.getRawQuery()).isEqualTo(entry.raw());
+				assertThat(uri.getRawFragment()).isNull();
+			}
+		}
+	}
+
+	@Test
+	void transactionsPreserveOpaqueCursorAsOneUtf8QueryValue() throws Exception {
+		List<URI> uris = new CopyOnWriteArrayList<>();
+		try (LocalServer server = new LocalServer(exchange -> {
+			uris.add(exchange.getRequestURI());
+			reply(exchange, 200, transactionsPage(null, false));
+		})) {
+			var client = server.client();
+			Map<String, String> cases = Map.ofEntries(Map.entry(CURSOR, RAW_CURSOR),
+					Map.entry("%2F", "%252F"), Map.entry("/", "%2F"), Map.entry("+", "%2B"),
+					Map.entry("=", "%3D"), Map.entry(" x ", "%20x%20"),
+					Map.entry("한😀", "%ED%95%9C%F0%9F%98%80"),
+					Map.entry("&status=OPEN?limit=1#fragment", "%26status%3DOPEN%3Flimit%3D1%23fragment"),
+					Map.entry("x".repeat(256), "x".repeat(256)),
+					Map.entry("😀".repeat(128), "%F0%9F%98%80".repeat(128)));
+			for (var entry : cases.entrySet()) {
+				int before = uris.size();
+				client.getTransactions(new TossTransactionsRequest(null, null, entry.getKey(), null));
+				assertThat(uris).hasSize(before + 1);
+				URI uri = uris.getLast();
+				assertThat(uri.getRawPath()).isEqualTo("/api/v1/transactions");
+				assertThat(uri.getRawFragment()).isNull();
+				assertThat(uri.getRawQuery()).isEqualTo("limit=20&cursor=" + entry.getValue());
+				String[] pairs = uri.getRawQuery().split("&");
+				assertThat(pairs).hasSize(2);
+				assertThat(URLDecoder.decode(pairs[1].substring("cursor=".length()), StandardCharsets.UTF_8))
+						.isEqualTo(entry.getKey());
+			}
+		}
+	}
+
+	@Test
+	void transactionsMapAllFieldsAndSyntheticProductsWithoutRecalculationOrDeduplication() throws Exception {
+		String domestic = transaction("005930");
+		String unsettled = domestic.replace("\"filledPrice\":\"71000.0000\"", "\"filledPrice\":null")
+				.replace("\"transactionTime\":\"2026-09-30T06:30:00.123456789+09:00\"", "\"transactionTime\":null")
+				.replace("\"settled\":true", "\"settled\":false");
+		String stock = domestic.replace("\"symbol\":\"005930\"", "\"symbol\":\"AAPL\"")
+				.replace("KR7005930003", "US0378331005")
+				.replace("\"KR\"", "\"US\"").replace("KRW", "USD")
+				.replace("71000.0000", "0.1234567890123456789000")
+				.replace("710000.00", "0.3703703670370370367000")
+				.replace("\"exchangeRate\":null", "\"exchangeRate\":\"1386.0000\"")
+				.replace("2026-09-30T06:30:00.123456789+09:00", "2026-07-01T09:30:00-04:00");
+		String option = stock.replace("\"AAPL\"", "\"AAPL261218C00150000\"").replace("STOCK", "OPTION")
+				.replace("\"isinCode\":\"US0378331005\"", "\"isinCode\":null");
+		String bond = stock.replace("\"symbol\":\"AAPL\"", "\"symbol\":null").replace("STOCK", "BOND")
+				.replace("US0378331005", "US912810TV08");
+		List<String> rows = new ArrayList<>(List.of(unsettled, domestic, stock, option, bond, domestic));
+		String cash = domestic;
+		List<String> nullable = List.of("symbol", "assetClass", "isinCode", "quantity", "filledPrice",
+				"amount", "netAmount", "exchangeRate", "transactionTime");
+		for (String field : nullable) {
+			cash = cash.replaceAll("\"" + field + "\":(?:\"[^\"]*\"|null)", "\"" + field + "\":null");
+		}
+		List<String> types = List.of("DEPOSIT", "WITHDRAWAL", "EXCHANGE_IN", "EXCHANGE_OUT", "DIVIDEND",
+				"INTEREST", "FEE", "SECURITIES_TRANSFER_IN", "SECURITIES_TRANSFER_OUT", " Future_Code 한😀 ");
+		for (String type : types) {
+			rows.add(cash.replace("SELL", type));
+		}
+		rows.add(domestic.replace("\"isCancellation\":false", "\"isCancellation\":true"));
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, transactionsPage("\"" + CURSOR + "\"", true, rows.toArray(String[]::new)));
+		})) {
+			var result = server.client().getTransactions(new TossTransactionsRequest());
+			assertThat(calls).hasValue(1);
+			assertThat(result.nextCursor()).isEqualTo(CURSOR);
+			assertThat(result.hasNext()).isTrue();
+			var actual = result.transactions();
+			assertThat(actual).hasSize(rows.size());
+			assertThat(actual.get(1)).isEqualTo(new TossTransactionSnapshot("SELL", "KR", "KRW", "005930", "STOCK",
+					"KR7005930003", "10.00", "71000.0000", "710000.00", "1420.00", "12.30", "707159.9900", null,
+					LocalDate.of(2026, 9, 30), true, Instant.parse("2026-09-29T21:30:00.123456789Z"), false));
+			assertThat(actual.get(0)).isEqualTo(new TossTransactionSnapshot("SELL", "KR", "KRW", "005930", "STOCK",
+					"KR7005930003", "10.00", null, "710000.00", "1420.00", "12.30", "707159.9900", null,
+					LocalDate.of(2026, 9, 30), false, null, false));
+			assertThat(actual.get(2)).isEqualTo(new TossTransactionSnapshot("SELL", "US", "USD", "AAPL", "STOCK",
+					"US0378331005", "10.00", "0.1234567890123456789000", "0.3703703670370370367000", "1420.00",
+					"12.30", "707159.9900", "1386.0000", LocalDate.of(2026, 9, 30), true,
+					Instant.parse("2026-07-01T13:30:00Z"), false));
+			assertThat(actual.get(3).assetClass()).isEqualTo("OPTION");
+			assertThat(actual.get(3).symbol()).isEqualTo("AAPL261218C00150000");
+			assertThat(actual.get(3).isinCode()).isNull();
+			assertThat(actual.get(4).assetClass()).isEqualTo("BOND");
+			assertThat(actual.get(4).symbol()).isNull();
+			assertThat(actual.get(4).isinCode()).isEqualTo("US912810TV08");
+			assertThat(actual.get(5)).isEqualTo(actual.get(1));
+			for (int i = 0; i < types.size(); i++) {
+				assertThat(actual.get(6 + i)).isEqualTo(new TossTransactionSnapshot(types.get(i), "KR", "KRW", null,
+						null, null, null, null, null, "1420.00", "12.30", null, null,
+						LocalDate.of(2026, 9, 30), true, null, false));
+			}
+			assertThat(actual.getLast().isCancellation()).isTrue();
+			assertThat(actual.getLast().commission()).isEqualTo("1420.00");
+			assertThat(actual.getLast().tax()).isEqualTo("12.30");
+			assertThatThrownBy(() -> actual.add(actual.getFirst())).isInstanceOf(UnsupportedOperationException.class);
+			assertThatThrownBy(() -> actual.set(0, actual.getLast())).isInstanceOf(UnsupportedOperationException.class);
+		}
+	}
+
+	@Test
+	void transactionsPreserveEmptyAndShortNextPagesWithoutAutomaticallyFollowingCursor() throws Exception {
+		AtomicReference<String> json = new AtomicReference<>(transactionsPage("\"" + CURSOR + "\"", true));
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, json.get());
+		})) {
+			var client = server.client();
+			var empty = client.getTransactions(new TossTransactionsRequest());
+			assertThat(empty.transactions()).isEmpty();
+			assertThat(empty.nextCursor()).isEqualTo(CURSOR);
+			assertThat(empty.hasNext()).isTrue();
+			assertThat(calls).hasValue(1);
+			json.set(transactionsPage("\"" + CURSOR + "\"", true, transaction("AAPL")));
+			var shortPage = client.getTransactions(new TossTransactionsRequest(null, null, empty.nextCursor(), null));
+			assertThat(shortPage.transactions()).hasSize(1);
+			assertThat(shortPage.nextCursor()).isEqualTo(CURSOR);
+			assertThat(shortPage.hasNext()).isTrue();
+			assertThat(calls).hasValue(2);
+			json.set(transactionsPage(null, false));
+			var last = client.getTransactions(new TossTransactionsRequest(null, null, shortPage.nextCursor(), null));
+			assertThat(last.transactions()).isEmpty();
+			assertThat(last.nextCursor()).isNull();
+			assertThat(last.hasNext()).isFalse();
+			assertThat(calls).hasValue(3);
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"1", "20", "100"})
+	void transactionsEnforceRequestLimitWithoutTruncatingOrRemovingEqualRows(int limit) throws Exception {
+		String[] rows = java.util.Collections.nCopies(limit, transaction("005930")).toArray(String[]::new);
+		AtomicReference<String> json = new AtomicReference<>(transactionsPage(null, false, rows));
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			reply(exchange, 200, json.get());
+		})) {
+			var client = server.client();
+			var request = new TossTransactionsRequest(null, null, null, limit == 20 ? null : limit);
+			assertThat(client.getTransactions(request).transactions()).hasSize(limit).allSatisfy(
+					row -> assertThat(row.symbol()).isEqualTo("005930"));
+			String[] excessive = java.util.Collections.nCopies(limit + 1, transaction("005930")).toArray(String[]::new);
+			json.set(transactionsPage(null, false, excessive));
+			expect(TossErrorCode.INVALID_RESPONSE, () -> client.getTransactions(request));
+			assertThat(calls).hasValue(2);
+		}
+	}
+
+	@Test
+	void invalidTransactionsMetadataFieldsFinalRowJsonAndUtf8NeverReturnPartialResults() throws Exception {
+		String row = transaction("005930");
+		String valid = transactionsPage(null, false, row);
+		List<String> invalid = new ArrayList<>(List.of("null", "[]", "{}", "{\"error\":\"" + PRIVATE + "\"}",
+				transactionsPage(null, true, row), transactionsPage("\"next\"", false, row),
+				transactionsPage("\" \"", true, row), valid.replace("\"hasNext\":false", "\"hasNext\":0"),
+				valid.replace("\"nextCursor\":null,", ""), valid.replace(",\"hasNext\":false", ""),
+				valid.replace("\"transactions\":[", "\"transactions\":[null,"),
+				valid.replace("\"tax\":", "\"tax\":null,\"tax\":"),
+				valid.replace("\"result\":", "\"error\":null,\"result\":"),
+				transactionsPage("\"" + CURSOR + "\"", true, row,
+						transaction(PRIVATE).replace("\"tax\":\"12.30\"", "\"tax\":false")),
+				valid + " {}", valid + PRIVATE, valid.substring(0, valid.length() - 1)));
+		for (String field : List.of("transactionType", "marketCountry", "currency", "symbol", "assetClass", "isinCode",
+				"quantity", "filledPrice", "amount", "commission", "tax", "netAmount", "exchangeRate", "settlementDate",
+				"settled", "transactionTime", "isCancellation")) {
+			String missing = row.replaceAll("\"" + field + "\":(?:\"[^\"]*\"|null|true|false),?", "")
+					.replace(",}", "}");
+			invalid.add(transactionsPage(null, false, row, missing));
+		}
+		AtomicReference<byte[]> body = new AtomicReference<>();
+		AtomicInteger calls = new AtomicInteger();
+		try (LocalServer server = new LocalServer(exchange -> {
+			calls.incrementAndGet();
+			exchange.sendResponseHeaders(200, body.get().length);
+			try (var stream = exchange.getResponseBody()) { stream.write(body.get()); }
+		})) {
+			var client = server.client();
+			for (String json : invalid) {
+				body.set(json.getBytes(StandardCharsets.UTF_8));
+				expect(TossErrorCode.INVALID_RESPONSE, () -> client.getTransactions(new TossTransactionsRequest()));
+			}
+			for (byte[] utf8 : List.of(new byte[] {(byte) 0xc3, 0x28},
+					new byte[] {(byte) 0xed, (byte) 0xa0, (byte) 0x80}, new byte[] {(byte) 0xf0, (byte) 0x9f})) {
+				body.set(utf8);
+				expect(TossErrorCode.INVALID_RESPONSE, () -> client.getTransactions(new TossTransactionsRequest()));
+			}
+			assertThat(calls).hasValue(invalid.size() + 3);
+		}
 	}
 
 	@Test
@@ -326,6 +568,7 @@ class TossOrderClientTest {
 			var client = server.client(() -> { reads.incrementAndGet(); return KEYS; });
 			expect(TossErrorCode.BAD_REQUEST, () -> client.getOrder(null));
 			expect(TossErrorCode.BAD_REQUEST, () -> client.getClosedOrders(null));
+			expect(TossErrorCode.BAD_REQUEST, () -> client.getTransactions(null));
 			for (String id : List.of("\ud800", "\udc00", "x\ud800y", "\ud800\ud800", "😀\udc00")) {
 				expect(TossErrorCode.BAD_REQUEST, () -> client.getOrder(new TossOrderRequest(id)));
 			}
@@ -532,7 +775,7 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true", "TRANSACTIONS,false", "TRANSACTIONS,true"})
 	void boundsActualFixedAndChunkedUtf8BytesAtExactlyOneMiB(Lookup lookup, boolean chunked) throws Exception {
 		AtomicInteger size = new AtomicInteger(TossOrderClient.MAX_RESPONSE_BYTES);
 		AtomicInteger calls = new AtomicInteger();
@@ -553,7 +796,7 @@ class TossOrderClientTest {
 			}
 		})) {
 			var client = server.client();
-			assertThat(lookup.get(client, "한😀").orderId()).isEqualTo("한😀");
+			lookup.assertSuccess(lookup.get(client, "한😀"), "한😀");
 			size.incrementAndGet();
 			expect(TossErrorCode.RESPONSE_TOO_LARGE, () -> lookup.get(client, "한😀"));
 			assertThat(calls).hasValue(2);
@@ -585,6 +828,100 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
+	@CsvSource({"false", "true"})
+	void peerClosureDistinguishesOrderlyEofFromObservedAbortiveReset(boolean abortive) throws Exception {
+		try (ServerSocket server = loopbackSocket();
+				Socket peer = new Socket(server.getInetAddress(), server.getLocalPort());
+				Socket receiver = server.accept()) {
+			receiver.setSoTimeout(3000);
+			if (abortive) { peer.setSoLinger(true, 0); }
+			peer.close();
+			assertThat(assertPeerClosed(receiver, reader(receiver)))
+					.isEqualTo(abortive ? PeerClosure.RESET : PeerClosure.EOF);
+		}
+		ReadObservation reset = observeAbortivePeerClose();
+		assertThat(reset.remoteReset()).as("SO_LINGER=0 control: %s", reset.diagnostic()).isTrue();
+		assertThat(reset.read()).isNull();
+		assertThat(reset.exceptionType()).isEqualTo(SocketException.class.getName());
+	}
+
+	@Test
+	void peerClosureRejectsAnOpenConnectionAndUnexpectedData() throws Exception {
+		try (ServerSocket server = loopbackSocket();
+				Socket peer = new Socket(server.getInetAddress(), server.getLocalPort());
+				Socket receiver = server.accept()) {
+			receiver.setSoTimeout(200);
+			assertThatThrownBy(() -> assertPeerClosed(receiver, reader(receiver)))
+					.isInstanceOf(AssertionError.class).hasMessageContaining(SocketTimeoutException.class.getName());
+			peer.getOutputStream().write('X');
+			peer.getOutputStream().flush();
+			assertThatThrownBy(() -> assertPeerClosed(receiver, reader(receiver)))
+					.isInstanceOf(AssertionError.class).hasMessageContaining("read=88");
+		}
+	}
+
+	@ParameterizedTest
+	@CsvSource({"close", "shutdownInput", "interrupt"})
+	void peerClosureRejectsLocalChangesDuringRead(String change) throws Exception {
+		try (ServerSocket server = loopbackSocket();
+				Socket peer = new Socket(server.getInetAddress(), server.getLocalPort());
+				Socket receiver = server.accept()) {
+			receiver.setSoTimeout(3000);
+			CountDownLatch reading = new CountDownLatch(1);
+			var input = new BufferedReader(reader(receiver)) {
+				@Override
+				public int read() throws IOException {
+					reading.countDown();
+					return super.read();
+				}
+			};
+			AtomicReference<Throwable> failure = new AtomicReference<>();
+			Thread receiving = Thread.ofVirtual().start(() -> {
+				try {
+					assertThatThrownBy(() -> assertPeerClosed(receiver, input))
+							.isInstanceOf(AssertionError.class).hasMessageContaining("Receiver changed locally");
+				}
+				catch (Throwable exception) { failure.set(exception); }
+			});
+			try {
+				assertThat(reading.await(3, TimeUnit.SECONDS)).isTrue();
+				switch (change) {
+					case "close" -> receiver.close();
+					case "shutdownInput" -> receiver.shutdownInput();
+					case "interrupt" -> receiving.interrupt();
+					default -> throw new AssertionError("Unknown local change");
+				}
+				receiving.join(3000);
+				assertThat(receiving.isAlive()).isFalse();
+				assertThat(failure.get()).isNull();
+			}
+			finally {
+				receiving.interrupt();
+				receiver.close();
+				receiving.join(3000);
+			}
+		}
+	}
+
+	@Test
+	void peerClosureRejectsUnrecognizedIoErrorsWithoutExposingMessages() throws Exception {
+		try (ServerSocket server = loopbackSocket();
+				Socket peer = new Socket(server.getInetAddress(), server.getLocalPort());
+				Socket receiver = server.accept()) {
+			for (IOException error : List.of(new IOException(PRIVATE), new SocketException(PRIVATE),
+					new java.io.InterruptedIOException("Connection reset"))) {
+				var input = new BufferedReader(reader(receiver)) {
+					@Override
+					public int read() throws IOException { throw error; }
+				};
+				assertThatThrownBy(() -> assertPeerClosed(receiver, input))
+						.isInstanceOf(AssertionError.class).hasMessageContaining(error.getClass().getName())
+						.hasMessageNotContaining(PRIVATE).hasNoCause();
+			}
+		}
+	}
+
+	@ParameterizedTest
 	@EnumSource(Lookup.class)
 	void oversizedChunkClosesActualConnectionBeforeClientClose(Lookup lookup) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
@@ -601,7 +938,7 @@ class TossOrderClientTest {
 					stream.write((Integer.toHexString(length) + "\r\n").getBytes(StandardCharsets.US_ASCII));
 					stream.write(" ".repeat(length).getBytes(StandardCharsets.US_ASCII));
 					stream.flush(); // Deliberately leave the response unfinished.
-					assertThat(input.read()).isEqualTo(-1);
+					assertPeerClosed(socket, input);
 				}
 				return null;
 			});
@@ -612,7 +949,7 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true", "TRANSACTIONS,false", "TRANSACTIONS,true"})
 	void wholeBodyDeadlineClosesDelayedOrUnfinishedStream(Lookup lookup, boolean partialBody) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -625,7 +962,7 @@ class TossOrderClientTest {
 					socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
 							+ (partialBody ? "1\r\n{\r\n" : "")).getBytes(StandardCharsets.US_ASCII));
 					socket.getOutputStream().flush();
-					assertThat(input.read()).isEqualTo(-1);
+					assertPeerClosed(socket, input);
 				}
 				return null;
 			});
@@ -640,7 +977,7 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true", "TRANSACTIONS,false", "TRANSACTIONS,true"})
 	void neverResendsOnDisconnectBeforeHeadersOnFreshOrReusedConnection(Lookup lookup, boolean reused) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -668,7 +1005,7 @@ class TossOrderClientTest {
 			});
 			try (var client = new TossOrderClient(uri(server), () -> KEYS)) {
 				if (reused) {
-					assertThat(lookup.get(client).orderId()).isEqualTo(ID);
+					lookup.assertSuccess(lookup.get(client), ID);
 					assertThat(calls).hasValue(1);
 				}
 				int before = calls.get();
@@ -681,7 +1018,7 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true", "TRANSACTIONS,false", "TRANSACTIONS,true"})
 	void interruptOrClientCloseCancelsWaitAndActualConnection(Lookup lookup, boolean closeClient) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		CountDownLatch headers = new CountDownLatch(1);
@@ -696,7 +1033,7 @@ class TossOrderClientTest {
 							.getBytes(StandardCharsets.US_ASCII));
 					socket.getOutputStream().flush();
 					headers.countDown();
-					assertThat(input.read()).isEqualTo(-1);
+					assertPeerClosed(socket, input);
 				}
 				return null;
 			});
@@ -719,7 +1056,70 @@ class TossOrderClientTest {
 				receiver.get(3, TimeUnit.SECONDS);
 				assertThat(calls).hasValue(1);
 			}
-			finally { worker.interrupt(); }
+			finally {
+				worker.interrupt();
+				try { worker.join(3000); }
+				finally {
+					server.close();
+					receiver.cancel(true);
+				}
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@EnumSource(Lookup.class)
+	void withholdingCancellationLeavesTheWorkerAndConnectionOpen(Lookup lookup) throws Exception {
+		AtomicInteger calls = new AtomicInteger();
+		CountDownLatch headers = new CountDownLatch(1);
+		CountDownLatch closureRejected = new CountDownLatch(1);
+		CountDownLatch releasePeer = new CountDownLatch(1);
+		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
+				var client = new TossOrderClient(uri(server), () -> KEYS)) {
+			var receiver = executor.submit(() -> {
+				try (var socket = server.accept()) {
+					socket.setSoTimeout(3000);
+					var input = reader(socket);
+					readRequest(input, calls, lookup);
+					socket.getOutputStream().write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n"
+							.getBytes(StandardCharsets.US_ASCII));
+					socket.getOutputStream().flush();
+					socket.setSoTimeout(200);
+					headers.countDown();
+					assertThatThrownBy(() -> assertPeerClosed(socket, input))
+							.isInstanceOf(AssertionError.class).hasMessageContaining(SocketTimeoutException.class.getName());
+					closureRejected.countDown();
+					// Keep the peer open until after the test has checked the still-running worker.
+					assertThat(releasePeer.await(3, TimeUnit.SECONDS)).isTrue();
+				}
+				return null;
+			});
+			AtomicReference<Throwable> failure = new AtomicReference<>();
+			Thread worker = Thread.ofVirtual().start(() -> {
+				try {
+					expect(TossErrorCode.INTERRUPTED, () -> lookup.get(client));
+					assertThat(Thread.currentThread().isInterrupted()).isTrue();
+				}
+				catch (Throwable exception) { failure.set(exception); }
+			});
+			try {
+				assertThat(headers.await(3, TimeUnit.SECONDS)).isTrue();
+				assertThat(closureRejected.await(3, TimeUnit.SECONDS)).isTrue();
+				assertThat(worker.isAlive()).as("No cancellation signal was delivered").isTrue();
+				assertThat(calls).hasValue(1);
+			}
+			finally {
+				worker.interrupt();
+				try { worker.join(3000); }
+				finally {
+					releasePeer.countDown();
+					server.close();
+					try { receiver.get(3, TimeUnit.SECONDS); }
+					finally { receiver.cancel(true); }
+				}
+			}
+			assertThat(worker.isAlive()).isFalse();
+			assertThat(failure.get()).isNull();
 		}
 	}
 
@@ -734,7 +1134,7 @@ class TossOrderClientTest {
 	}
 
 	@ParameterizedTest
-	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true"})
+	@CsvSource({"ORDER,false", "ORDER,true", "CLOSED,false", "CLOSED,true", "TRANSACTIONS,false", "TRANSACTIONS,true"})
 	void disconnectDuringFixedOrChunkedBodyIsSanitizedWithoutResending(Lookup lookup, boolean chunked) throws Exception {
 		AtomicInteger calls = new AtomicInteger();
 		try (ServerSocket server = loopbackSocket(); var executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -763,6 +1163,7 @@ class TossOrderClientTest {
 		for (String endpoint : List.of("https://openapi.tossinvest.com" + PATH, "http://example.com" + PATH,
 				"http://localhost" + PATH, "https://127.0.0.1" + PATH, "http://127.0.0.2" + PATH,
 				"http://127.0.0.1/other/", "http://127.0.0.1/api/v1/orders", "http://127.0.0.1" + PATH + "id",
+				"http://127.0.0.1/api/v1/transactions", "http://127.0.0.1/api/v1/transactions/",
 				"http://127.0.0.1/api/v1/%6Frders/", "http://127.0.0.1" + PATH + "?a=1",
 				"http://127.0.0.1" + PATH + "#x", "http://user@127.0.0.1" + PATH)) {
 			expect(TossErrorCode.BAD_REQUEST, () -> new TossOrderClient(URI.create(endpoint), () -> KEYS));
@@ -865,7 +1266,8 @@ class TossOrderClientTest {
 				Supplier<Map<String, String>> environment = () -> { reads.incrementAndGet(); return KEYS; };
 				if (mode.equals("success")) {
 					try (var client = new TossOrderClient(endpoint, environment)) {
-						if (!lookup.get(client).orderId().equals(ID) || reads.get() != 1) { throw new AssertionError(); }
+						lookup.assertSuccess(lookup.get(client), ID);
+						if (reads.get() != 1) { throw new AssertionError(); }
 					}
 					System.out.println("SUCCESS");
 					return;
@@ -924,19 +1326,48 @@ class TossOrderClientTest {
 	}
 
 	private enum Lookup {
-		ORDER, CLOSED;
+		ORDER, CLOSED, TRANSACTIONS;
 
-		TossOrderSnapshot get(TossOrderClient client) { return get(client, ID); }
+		Object get(TossOrderClient client) { return get(client, ID); }
 
-		TossOrderSnapshot get(TossOrderClient client, String id) {
-			return this == ORDER ? client.getOrder(new TossOrderRequest(id))
-					: client.getClosedOrders(new TossClosedOrdersRequest(null, null, null, CURSOR, null)).orders().getFirst();
+		Object get(TossOrderClient client, String value) {
+			return switch (this) {
+				case ORDER -> client.getOrder(new TossOrderRequest(value));
+				case CLOSED -> client.getClosedOrders(new TossClosedOrdersRequest(null, null, null, CURSOR, null))
+						.orders().getFirst();
+				case TRANSACTIONS -> client.getTransactions(new TossTransactionsRequest(null, null, CURSOR, null));
+			};
 		}
 
-		String response(String id) { return this == ORDER ? fixture(id) : page(null, false, fixture(id)); }
+		void assertSuccess(Object result, String value) {
+			if (this == TRANSACTIONS) {
+				assertThat(result).isInstanceOfSatisfying(TossTransactionsSnapshot.class, page -> {
+					// The marker is a synthetic symbol, never an order or generated transaction ID.
+					assertThat(page.transactions()).extracting(TossTransactionSnapshot::symbol).containsExactly(value);
+					assertThat(page.nextCursor()).isNull();
+					assertThat(page.hasNext()).isFalse();
+				});
+			}
+			else {
+				assertThat(result).isInstanceOfSatisfying(TossOrderSnapshot.class,
+						order -> assertThat(order.orderId()).isEqualTo(value));
+			}
+		}
+
+		String response(String value) {
+			return switch (this) {
+				case ORDER -> fixture(value);
+				case CLOSED -> page(null, false, fixture(value));
+				case TRANSACTIONS -> transactionsPage(null, false, transaction(value));
+			};
+		}
 
 		String target() {
-			return this == ORDER ? PATH + RAW_ID : "/api/v1/orders?status=CLOSED&limit=20&cursor=" + RAW_CURSOR;
+			return switch (this) {
+				case ORDER -> PATH + RAW_ID;
+				case CLOSED -> "/api/v1/orders?status=CLOSED&limit=20&cursor=" + RAW_CURSOR;
+				case TRANSACTIONS -> "/api/v1/transactions?limit=20&cursor=" + RAW_CURSOR;
+			};
 		}
 	}
 
@@ -945,6 +1376,21 @@ class TossOrderClientTest {
 				.map(json -> json.substring("{\"result\":".length(), json.length() - 1)).toList();
 		return "{\"result\":{\"orders\":[" + String.join(",", orders) + "],\"nextCursor\":"
 				+ cursorJson + ",\"hasNext\":" + hasNext + "}}";
+	}
+
+	private static String transactionsPage(String cursorJson, boolean hasNext, String... rows) {
+		return "{\"result\":{\"transactions\":[" + String.join(",", rows) + "],\"nextCursor\":"
+				+ cursorJson + ",\"hasNext\":" + hasNext + "}}";
+	}
+
+	private static String transaction(String symbol) {
+		return """
+				{"transactionType":"SELL","marketCountry":"KR","currency":"KRW","symbol":"%s",
+				"assetClass":"STOCK","isinCode":"KR7005930003","quantity":"10.00","filledPrice":"71000.0000",
+				"amount":"710000.00","commission":"1420.00","tax":"12.30","netAmount":"707159.9900","exchangeRate":null,
+				"settlementDate":"2026-09-30","settled":true,"transactionTime":"2026-09-30T06:30:00.123456789+09:00",
+				"isCancellation":false}
+				""".formatted(symbol.replace("\\", "\\\\").replace("\"", "\\\"")).replace("\n", "");
 	}
 
 	private static Map<String, String> credentials(String token, String account) {
@@ -963,6 +1409,71 @@ class TossOrderClientTest {
 
 	private static BufferedReader reader(java.net.Socket socket) throws IOException {
 		return new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+	}
+
+	private enum PeerClosure { EOF, RESET }
+
+	private record ReceiverState(boolean closed, boolean inputShutdown, boolean interrupted, Thread.State threadState) {
+		static ReceiverState capture(Socket socket) {
+			return new ReceiverState(socket.isClosed(), socket.isInputShutdown(),
+					Thread.currentThread().isInterrupted(), Thread.currentThread().getState());
+		}
+
+		boolean intact() { return !closed && !inputShutdown && !interrupted; }
+	}
+
+	private record ReadObservation(Integer read, String exceptionType, boolean resetSignature,
+			ReceiverState before, ReceiverState after) {
+		boolean remoteReset() { return before.intact() && after.intact() && resetSignature; }
+
+		String diagnostic() {
+			// Never include request/response contents or arbitrary exception messages/causes.
+			return "read=" + (read == null ? "unavailable" : read) + "; exception=" + exceptionType
+					+ "; resetSignature=" + resetSignature + "; before=" + before + "; after=" + after;
+		}
+	}
+
+	private static ReadObservation observePeerRead(Socket socket, BufferedReader input) {
+		ReceiverState before = ReceiverState.capture(socket);
+		if (!before.intact()) {
+			return new ReadObservation(null, "not-read", false, before, ReceiverState.capture(socket));
+		}
+		try {
+			return new ReadObservation(input.read(), "none", false, before, ReceiverState.capture(socket));
+		}
+		catch (IOException exception) {
+			// This narrow signature is platform dependent, not a general SocketException contract.
+			boolean reset = exception.getClass() == SocketException.class
+					&& "Connection reset".equals(exception.getMessage());
+			return new ReadObservation(null, exception.getClass().getName(), reset, before, ReceiverState.capture(socket));
+		}
+	}
+
+	private static ReadObservation observeAbortivePeerClose() throws IOException {
+		try (ServerSocket server = loopbackSocket();
+				Socket peer = new Socket(server.getInetAddress(), server.getLocalPort());
+				Socket receiver = server.accept()) {
+			receiver.setSoTimeout(3000);
+			peer.setSoLinger(true, 0);
+			peer.close();
+			return observePeerRead(receiver, reader(receiver));
+		}
+	}
+
+	private static PeerClosure assertPeerClosed(Socket socket, BufferedReader input) throws IOException {
+		ReadObservation observed = observePeerRead(socket, input);
+		assertThat(observed.before().intact() && observed.after().intact())
+				.as("Receiver changed locally: %s", observed.diagnostic()).isTrue();
+		if (observed.remoteReset()) {
+			// Require an actual matching abortive-close observation in this JVM before accepting reset.
+			// This is a local control, not a reproduction of the original CI failure.
+			ReadObservation control = observeAbortivePeerClose();
+			assertThat(control.remoteReset())
+					.as("Unconfirmed reset: observed=%s; control=%s", observed.diagnostic(), control.diagnostic()).isTrue();
+			return PeerClosure.RESET;
+		}
+		assertThat(observed.read()).as("Peer closure not confirmed: %s", observed.diagnostic()).isEqualTo(-1);
+		return PeerClosure.EOF;
 	}
 
 	private static boolean readRequest(BufferedReader input, AtomicInteger calls, Lookup lookup) throws IOException {
