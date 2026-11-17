@@ -46,13 +46,15 @@ class TradeLedgerConfiguration {
 									|| "get_binance_account_trades".equals(specification.tool().name())
 									|| "get_binance_account_executions".equals(specification.tool().name())
 									|| "get_toss_order".equals(specification.tool().name())
-									|| "get_toss_closed_orders".equals(specification.tool().name()))) {
+									|| "get_toss_closed_orders".equals(specification.tool().name())
+									|| "get_toss_transactions".equals(specification.tool().name()))) {
 						return candidate;
 					}
 					String service = "get_binance_account_trades".equals(specification.tool().name())
 								|| "get_binance_account_executions".equals(specification.tool().name())
 							? "Binance" : ("get_toss_order".equals(specification.tool().name())
-									|| "get_toss_closed_orders".equals(specification.tool().name())) ? "Toss" : "Upbit";
+									|| "get_toss_closed_orders".equals(specification.tool().name())
+									|| "get_toss_transactions".equals(specification.tool().name())) ? "Toss" : "Upbit";
 					// Preserve the generated schemas and the existing safe error handlers.
 					// The annotation adapter supplies structuredContent for these DTOs.
 					return SyncToolSpecification.builder().tool(specification.tool())
@@ -64,8 +66,11 @@ class TradeLedgerConfiguration {
 									return tossErrorResult("BAD_REQUEST");
 								}
 								CallToolRequest validatedRequest = request;
-								if ("get_toss_closed_orders".equals(specification.tool().name())) {
-									if (!validTossClosedOrdersTypes(request.arguments())) {
+								if ("get_toss_closed_orders".equals(specification.tool().name())
+										|| "get_toss_transactions".equals(specification.tool().name())) {
+									List<String> fields = "get_toss_closed_orders".equals(specification.tool().name())
+											? List.of("symbol", "from", "to", "cursor") : List.of("from", "to", "cursor");
+									if (!validTossPageTypes(request.arguments(), fields)) {
 										return tossErrorResult("BAD_REQUEST");
 									}
 									if (request.arguments() == null) {
@@ -114,9 +119,9 @@ class TradeLedgerConfiguration {
 				.content(List.of(new TextContent("Toss request failed: " + category))).build();
 	}
 
-	private static boolean validTossClosedOrdersTypes(Map<String, Object> arguments) {
+	private static boolean validTossPageTypes(Map<String, Object> arguments, List<String> stringFields) {
 		if (arguments == null) { return true; }
-		for (String field : List.of("symbol", "from", "to", "cursor")) {
+		for (String field : stringFields) {
 			Object value = arguments.get(field);
 			if (value != null && !(value instanceof String)) { return false; }
 		}

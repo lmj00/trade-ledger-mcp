@@ -9,6 +9,7 @@ import io.github.lmj.tradeledger.adapter.toss.TossApiException;
 import io.github.lmj.tradeledger.adapter.toss.TossClosedOrdersRequest;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderClient;
 import io.github.lmj.tradeledger.adapter.toss.TossOrderRequest;
+import io.github.lmj.tradeledger.adapter.toss.TossTransactionsRequest;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.beans.factory.ObjectProvider;
@@ -95,6 +96,43 @@ public final class TossOrderTools {
 		}
 		try {
 			return TossClosedOrdersResponse.from(client.getObject().getClosedOrders(request));
+		}
+		catch (RuntimeException exception) {
+			throw safeFailure(exception);
+		}
+	}
+
+	@McpTool(
+			name = "get_toss_transactions",
+			title = "Get one Toss settlement transactions page",
+			description = "Read one all-types settlement ledger page using server-side credentials. "
+					+ "Dates independently filter inclusive KST settlement dates (expected dates for unsettled rows). "
+					+ "One GET, no retries, automatic pagination, order or individual fill conversion, PnL, "
+					+ "order placement, cancellation or funds movement.",
+			generateOutputSchema = true,
+			annotations = @McpTool.McpAnnotations(
+					readOnlyHint = true,
+					destructiveHint = false,
+					idempotentHint = true,
+					openWorldHint = true))
+	public TossTransactionsResponse getTossTransactions(
+			@McpToolParam(description = "Optional inclusive KST settlement start date, strict YYYY-MM-DD; independently usable.", required = false)
+			String from,
+			@McpToolParam(description = "Optional inclusive KST settlement end date, strict YYYY-MM-DD; independently usable, from <= to when both given.", required = false)
+			String to,
+			@McpToolParam(description = "Optional opaque cursor, at most 256 UTF-16 units; preserved without trimming or decoding.", required = false)
+			String cursor,
+			@McpToolParam(description = "Maximum transactions in this page, 1 through 100; omitted or null defaults to 20.", required = false)
+			Integer limit) {
+		TossTransactionsRequest request;
+		try {
+			request = new TossTransactionsRequest(from, to, cursor, limit);
+		}
+		catch (RuntimeException exception) {
+			throw new IllegalArgumentException("Toss request failed: BAD_REQUEST");
+		}
+		try {
+			return TossTransactionsResponse.from(client.getObject().getTransactions(request));
 		}
 		catch (RuntimeException exception) {
 			throw safeFailure(exception);
